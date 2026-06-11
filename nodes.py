@@ -29,10 +29,15 @@ randomizer line is identical to a normal lora line.
 import json
 import os
 import re
+import math
 
 import folder_paths
 import comfy.utils
 import comfy.sd
+
+import numpy as np
+import torch
+from PIL import Image, ImageDraw, ImageFont
 
 
 _LORA_SD_CACHE: dict = {}
@@ -210,6 +215,49 @@ def _build_metadata(applied) -> str:
     return ", ".join(parts) if parts else "no_lora"
 
 
+# ---------------------------------------------------------------------------
+# Plotter sweep helpers
+# ---------------------------------------------------------------------------
+
+def _apply_one(model, clip, name, model_s, clip_s):
+    """Apply a SINGLE lora to a base (model, clip). Returns (model, clip) or None.
+
+    Unlike _apply_stack this never accumulates — each sweep cell starts from the
+    untouched base model/clip, exactly like the original LoRA Plot Node.
+    """
+    path = folder_paths.get_full_path("loras", name)
+    if path is None:
+        print(f"[FantasticLoraPlotter] WARNING: lora not found, skipping: {name}")
+        return None
+    model_s = max(-10.0, min(10.0, float(model_s)))
+    clip_s  = max(-10.0, min(10.0, float(clip_s)))
+    return comfy.sd.load_lora_for_models(model, clip, _load_lora_sd(path), model_s, clip_s)
+
+
+def _parse_plot_config(lora_data: str):
+    """Read plotter-only fields from the payload.
+
+    Returns (mode, global_strengths) where mode is "perline" | "global" and
+    global_strengths is a list of floats (blanks already dropped by the frontend).
+    """
+    mode, gstr = "perline", []
+    try:
+        data = json.loads(lora_data) if lora_data else {}
+    except (ValueError, TypeError):
+        data = {}
+    if isinstance(data, dict):
+        if data.get("plotMode") == "global":
+            mode = "global"
+        gs = data.get("globalStrengths")
+        if isinstance(gs, list):
+            for v in gs:
+                try:
+                    gstr.append(float(v))
+                except (ValueError, TypeError):
+                    pass
+    return mode, gstr
+
+
 _LORA_DATA_INPUT = (
     "STRING",
     {"default": "{}", "multiline": False,
@@ -288,15 +336,29 @@ class FantasticLoraLoaderMulti:
 # Node: Fantastic Lora Plotter  (step 1 — loader stage)
 # ---------------------------------------------------------------------------
 #
-# Combines the Multi-Model loader's stack + multi-model paths with the LoRA
-# Plot Node's `metadata` output. Defaults to a single model path (the frontend
-# starts extra_model_count at 0 and does NOT auto-add a pair for this node).
+# ---------------------------------------------------------------------------
+# Node: Fantastic Lora Plotter  (step 2 — sweep)
+# ---------------------------------------------------------------------------
+#
+# Emits LISTS (OUTPUT_IS_LIST): one model/clip/metadata cell per generation.
+# ComfyUI runs the downstream graph once per cell, so a grid fills one cell
+# each. Each enabled lora line is applied ALONE to the base model (never
+# stacked), matching the original LoRA Plot Node.
+#
+# Two strength modes (set in the node UI, stored in lora_data):
+#   * per-line  — each enabled lora is ONE cell at its own strength.
+#                 2 loras -> 2 cells.
+#   * global    — per-line strengths are ignored; every enabled lora is swept
+#                 across the global strength list. 2 loras x 3 strengths -> 6
+#                 cells, ordered lora-major (lora1 @ each strength, then lora2).
 #
 # Output order is deliberate: metadata sits at a FIXED index (2) BEFORE the
 # dynamic MODEL 2-5 slots, because the frontend strips/re-adds those extra
 # model outputs at the end of the list. Keeping metadata ahead of them means
-# ComfyUI's slot-index → return-value mapping stays aligned no matter how many
-# model paths the user adds.
+# ComfyUI's slot-index -> return-value mapping stays aligned no matter how many
+# model paths the user adds. Extra MODEL 2-5 outputs are parallel sweep lists
+# (same lora/strength per cell, applied to that base model); unconnected extra
+# paths emit an empty list.
 
 class FantasticLoraPlotter:
     @classmethod
@@ -314,38 +376,472 @@ class FantasticLoraPlotter:
 
     RETURN_TYPES = ("MODEL", "CLIP", "STRING", "MODEL", "MODEL", "MODEL", "MODEL")
     RETURN_NAMES = ("MODEL", "CLIP", "metadata", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
+    OUTPUT_IS_LIST = (True, True, True, True, True, True, True)
     FUNCTION = "load"
     CATEGORY = "loaders"
     TITLE = "Fantastic Lora Plotter"
 
     @classmethod
     def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
+        # plotMode / globalStrengths live inside lora_data, and the frontend
+        # bakes auto-roll picks into it too, so this re-triggers on any change.
         return lora_data
 
     def load(self, model, lora_data, clip=None,
              model_2=None, model_3=None, model_4=None, model_5=None):
-        # Primary path patches model (+ CLIP if connected) and reports what was
-        # applied so metadata reflects the real picks.
-        primary_m, patched_clip, applied = _apply_stack_collect(model, clip, lora_data)
+        entries, _enabled = _parse_payload(lora_data)
+        mode, global_strengths = _parse_plot_config(lora_data)
 
-        # Extra paths: patch only the model tensor (shared CLIP patched once).
-        extras = []
-        for m in (model_2, model_3, model_4, model_5):
-            extras.append(_apply_stack(m, None, lora_data)[0] if m is not None else None)
+        # Only enabled, concretely-named lines become cells. Randomizer lines
+        # already carry a baked name from the frontend at queue time.
+        lines = [e for e in entries
+                 if e["on"] and e["name"] and e["name"] not in ("None", "NONE")]
 
-        metadata = _build_metadata(applied)
-        return (primary_m, patched_clip, metadata, *extras)
+        models, clips, metas = [], [], []
+        extra_bases = (model_2, model_3, model_4, model_5)
+        extras = [[], [], [], []]  # parallel lists for MODEL 2-5
+
+        for e in lines:
+            name = e["name"]
+            if mode == "global" and global_strengths:
+                strengths = global_strengths
+            else:
+                # per-line (or global with no strengths entered → fall back)
+                if mode == "global" and not global_strengths:
+                    print("[FantasticLoraPlotter] global mode but no strengths set "
+                          f"— using line strength for {name}")
+                strengths = [e["model"]]
+
+            for s in strengths:
+                primary = _apply_one(model, clip, name, s, s)
+                if primary is None:
+                    continue   # lora not found — skip this cell entirely
+                pm, pc = primary
+                models.append(pm)
+                clips.append(pc)   # None when CLIP isn't connected — that's fine
+                metas.append(f"{_sanitize_lora_name(name)}_{_format_strength(s)}")
+
+                # Extra model paths: same lora/strength applied to each base.
+                for i, base in enumerate(extra_bases):
+                    if base is None:
+                        continue
+                    r = _apply_one(base, None, name, s, s)
+                    extras[i].append(r[0] if r is not None else base)
+
+        # Nothing applied (no lines, or all not-found): emit one passthrough cell
+        # so the downstream graph still runs once instead of hard-failing.
+        if not models:
+            models = [model]
+            clips = [clip]
+            metas = ["no_lora"]
+            extras = [([b] if b is not None else []) for b in extra_bases]
+
+        return (models, clips, metas, extras[0], extras[1], extras[2], extras[3])
+
+
+# ===========================================================================
+# Fantastic Plotter Image Saver
+# ===========================================================================
+# Merges three nodes into one so a plot can feed any Save Image node directly:
+#   1. LoRA Plot Image Saver  (text overlay per cell)
+#   2. Image List to Image Batch  (impact-pack — resize + stack into a batch)
+#   3. FL Image Batch To Grid (fill-nodes — compose grid, N images per row)
+#
+# Columns are auto-derived from the metadata: each token is "<name>_<strength>",
+# so the number of DISTINCT strengths becomes images_per_row. The plotter emits
+# cells lora-major (each lora swept across the same strengths), so this lays
+# loras out as rows and strengths as columns — the XY grid. Set images_per_row
+# > 0 to override the automatic value.
+
+_PLOT_COLOR_OPTIONS = [
+    "white", "black", "red", "green", "blue", "yellow",
+    "cyan", "magenta", "orange", "gray", "lightgray", "darkgray",
+]
+
+_PLOT_COLOR_MAP = {
+    "white": (255, 255, 255), "black": (0, 0, 0), "red": (255, 0, 0),
+    "green": (0, 255, 0), "blue": (0, 0, 255), "yellow": (255, 255, 0),
+    "cyan": (0, 255, 255), "magenta": (255, 0, 255), "orange": (255, 165, 0),
+    "gray": (128, 128, 128), "lightgray": (211, 211, 211), "darkgray": (169, 169, 169),
+}
+
+_PLOT_FONT_CACHE: dict = {}
+
+
+def _plot_color_to_rgba(color_str, alpha):
+    color_str = str(color_str).strip().lower()
+    if color_str in _PLOT_COLOR_MAP:
+        r, g, b = _PLOT_COLOR_MAP[color_str]
+    elif color_str.startswith("#"):
+        h = color_str[1:]
+        if len(h) == 6:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        elif len(h) == 8:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            alpha = int(h[6:8], 16) / 255.0
+        else:
+            r, g, b = 255, 255, 255
+    else:
+        r, g, b = 255, 255, 255
+    return (r, g, b, int(max(0.0, min(1.0, alpha)) * 255))
+
+
+def _plot_get_font(font_size):
+    if font_size not in _PLOT_FONT_CACHE:
+        font = None
+        for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                     "/System/Library/Fonts/Helvetica.ttc",
+                     "C:\\Windows\\Fonts\\arialbd.ttf"):
+            try:
+                font = ImageFont.truetype(path, font_size)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        _PLOT_FONT_CACHE[font_size] = font
+    return _PLOT_FONT_CACHE[font_size]
+
+
+def _plot_overlay_text(meta: str) -> str:
+    """Turn a metadata token into the displayed label (matches LoRA Plot saver)."""
+    parts = str(meta).rsplit("_", 1)
+    if len(parts) == 2:
+        name, strength = parts
+        return f"{name}\nStrength: {strength}"
+    return str(meta)
+
+
+def _plot_add_overlay(pil_image, text, text_color, bg_color, font_size, padding, opacity):
+    """Draw a semi-transparent label box in the top-right corner."""
+    img = pil_image.copy()
+    draw = ImageDraw.Draw(img, "RGBA")
+    font = _plot_get_font(font_size)
+
+    lines = text.split("\n")
+    bboxes = [draw.textbbox((0, 0), ln, font=font) for ln in lines]
+    max_w = max((b[2] - b[0]) for b in bboxes) if bboxes else 0
+    total_h = sum((b[3] - b[1]) for b in bboxes) + (len(lines) - 1) * 5
+
+    iw, _ih = img.size
+    box_w = max_w + padding * 2
+    box_h = total_h + padding * 2
+    x = iw - box_w - padding
+    y = padding
+
+    draw.rectangle([(x, y), (x + box_w, y + box_h)], fill=_plot_color_to_rgba(bg_color, opacity))
+    text_rgba = _plot_color_to_rgba(text_color, 1.0)
+    yo = y + padding
+    for ln in lines:
+        b = draw.textbbox((0, 0), ln, font=font)
+        draw.text((x + padding, yo), ln, fill=text_rgba, font=font)
+        yo += (b[3] - b[1]) + 5
+    return img
+
+
+def _plot_tensor_to_pil(img):
+    arr = img.detach().cpu().numpy()
+    if arr.ndim == 4:
+        arr = arr[0]
+    arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    return Image.fromarray(arr[..., :3])
+
+
+def _plot_pil_to_tensor(pil):
+    arr = np.array(pil).astype(np.float32) / 255.0
+    if arr.ndim == 2:
+        arr = arr[..., None]
+    return torch.from_numpy(arr)[None, ...]  # [1, H, W, C]
+
+
+def _plot_auto_per_row(metadata) -> int:
+    """images_per_row = number of distinct strengths in the metadata."""
+    n = len(metadata)
+    if n <= 1:
+        return 1
+    strengths = []
+    for m in metadata:
+        parts = str(m).rsplit("_", 1)
+        if len(parts) == 2:
+            try:
+                strengths.append(round(float(parts[1]), 4))
+            except ValueError:
+                pass
+    uniq = list(dict.fromkeys(strengths))   # order-preserving unique
+    if uniq:
+        return max(1, len(uniq))
+    # Couldn't parse strengths — fall back to a near-square layout.
+    return max(1, math.ceil(math.sqrt(n)))
+
+
+def _plot_list_to_batch(tensors):
+    """Resize every image to the first and concat into one [N, H, W, C] batch."""
+    first = tensors[0]
+    if first.ndim == 3:
+        first = first.unsqueeze(0)
+    out = first
+    H, W = out.shape[1], out.shape[2]
+    for t in tensors[1:]:
+        if t.ndim == 3:
+            t = t.unsqueeze(0)
+        if t.device != out.device:
+            t = t.to(out.device)
+        if t.shape[1] != H or t.shape[2] != W:
+            t = comfy.utils.common_upscale(t.movedim(-1, 1), W, H, "lanczos", "center").movedim(1, -1)
+        if t.shape[3] != out.shape[3]:
+            c = min(t.shape[3], out.shape[3])
+            out, t = out[:, :, :, :c], t[:, :, :, :c]
+        out = torch.cat((out, t), dim=0)
+    return out
+
+
+def _plot_batch_to_grid(batch, per_row):
+    n, h, w, c = batch.shape
+    per_row = max(1, int(per_row))
+    rows = math.ceil(n / per_row)
+    grid = torch.zeros((rows * h, per_row * w, c), dtype=batch.dtype, device=batch.device)
+    for i in range(n):
+        r, col = divmod(i, per_row)
+        grid[r * h:(r + 1) * h, col * w:(col + 1) * w, :] = batch[i]
+    return grid.unsqueeze(0)  # [1, rows*h, per_row*w, c]
+
+
+def _plot_parse_name_strength(meta):
+    """Split a metadata token into (name, strength_float). strength None if absent."""
+    parts = str(meta).rsplit("_", 1)
+    if len(parts) == 2:
+        try:
+            return parts[0], round(float(parts[1]), 4)
+        except ValueError:
+            return str(meta), None
+    return str(meta), None
+
+
+def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, padding):
+    """Classic XY plot: clean cells with labels OUTSIDE on the top/left border.
+
+    Rows = loras (Y axis), columns = strengths (X axis). Returns a [1,H,W,C]
+    tensor, or None if the metadata isn't a clean lora x strength rectangle
+    (caller then falls back to the overlay layout).
+    """
+    pils = [_plot_tensor_to_pil(im) for im in images]
+    W, Hh = pils[0].size
+    pils = [p if p.size == (W, Hh) else p.resize((W, Hh)) for p in pils]
+
+    parsed = [_plot_parse_name_strength(m) for m in metadata]
+    names = list(dict.fromkeys(p[0] for p in parsed))
+    strengths = list(dict.fromkeys(p[1] for p in parsed if p[1] is not None))
+    if not strengths or len(names) * len(strengths) != len(pils):
+        return None  # not a clean grid → caller falls back to overlay
+
+    cell = {(nm, st): pil for (nm, st), pil in zip(parsed, pils)}
+
+    text_rgb = _plot_color_to_rgba(text_color, 1.0)[:3]
+    bg_rgb = _plot_color_to_rgba(bg_color, 1.0)[:3]
+
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    def measure(s, f):
+        b = probe.textbbox((0, 0), s, font=f)
+        return b[2] - b[0], b[3] - b[1]
+
+    col_labels = [f"Strength: {_format_strength(s)}" for s in strengths]
+    row_labels = [str(n) for n in names]
+
+    # Column headers sit above a cell of width W — shrink the header font until
+    # the widest one fits, so adjacent headers never overlap on small cells.
+    col_font_size = max(8, int(font_size))
+    while col_font_size > 8:
+        f = _plot_get_font(col_font_size)
+        widest = max((measure(l, f)[0] for l in col_labels), default=0)
+        if widest <= W - padding:
+            break
+        col_font_size -= 1
+    col_font = _plot_get_font(col_font_size)
+    row_font = _plot_get_font(max(8, int(font_size)))
+
+    left_margin = (max((measure(l, row_font)[0] for l in row_labels), default=0)) + padding * 2
+    top_margin = (max((measure(l, col_font)[1] for l in col_labels), default=0)) + padding * 2
+
+    cols, rows = len(strengths), len(names)
+    canvas = Image.new("RGB", (left_margin + cols * W, top_margin + rows * Hh), bg_rgb)
+    draw = ImageDraw.Draw(canvas)
+
+    # Column headers — centered above each column.
+    for c, lab in enumerate(col_labels):
+        w_, h_ = measure(lab, col_font)
+        draw.text((left_margin + c * W + (W - w_) // 2, max(padding, (top_margin - h_) // 2)),
+                  lab, fill=text_rgb, font=col_font)
+    # Row headers — centered vertically in the left margin.
+    for r, lab in enumerate(row_labels):
+        w_, h_ = measure(lab, row_font)
+        draw.text((max(padding, (left_margin - w_) // 2), top_margin + r * Hh + (Hh - h_) // 2),
+                  lab, fill=text_rgb, font=row_font)
+    # Clean cells.
+    for r, nm in enumerate(names):
+        for c, st in enumerate(strengths):
+            pil = cell.get((nm, st))
+            if pil is not None:
+                canvas.paste(pil, (left_margin + c * W, top_margin + r * Hh))
+
+    return _plot_pil_to_tensor(canvas)
+
+
+class FantasticPlotterImageSaver:
+    # Receive the full image/metadata lists (and widgets as 1-element lists).
+    INPUT_IS_LIST = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "metadata": ("STRING", {"forceInput": True}),
+                "constrain_size": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "Constrain Image Output Size: On",
+                    "label_off": "Constrain Image Output Size: Off",
+                    "tooltip": (
+                        "When on, each cell image is scaled down so its longest side equals "
+                        "Max Cell Size before the grid is assembled. Use this to keep the "
+                        "overall output manageable when rendering many large images — e.g. "
+                        "a 4x4 grid of 1024px images becomes a 4x4 grid of smaller cells "
+                        "instead of a giant ~4096px-wide output. Has no effect when off."
+                    ),
+                }),
+                "max_cell_size": ("INT", {
+                    "default": 768, "min": 64, "max": 2048, "step": 8,
+                    "tooltip": "Longest side of each cell image in pixels. Only used when Constrain Image Output Size is on.",
+                }),
+                "text_color": (_PLOT_COLOR_OPTIONS, {"default": "white"}),
+                "background_color": (_PLOT_COLOR_OPTIONS, {"default": "black"}),
+                "font_size": ("INT", {"default": 38, "min": 8, "max": 256, "step": 1}),
+                "padding": ("INT", {"default": 10, "min": 0, "max": 100, "step": 1}),
+                "opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "images_per_row": ("INT", {
+                    "default": 0, "min": 0, "max": 64, "step": 1,
+                    "tooltip": "0 = auto (one column per distinct strength). >0 overrides. Ignored in classic grid.",
+                }),
+                "classic_grid": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "Classic (border labels)",
+                    "label_off": "Overlay (on image)",
+                    "tooltip": (
+                        "Off (default): overlays each image's metadata as a label box drawn ON the image.\n"
+                        "On: classic XY plot — images are padded and the labels are drawn OUTSIDE along the "
+                        "border, loras down the left (rows) and strengths across the top (columns). "
+                        "Needs a full lora x strength grid; otherwise it falls back to overlay."
+                    ),
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("grid",)
+    FUNCTION = "compose"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Plotter Image Saver"
+
+    @staticmethod
+    def _first(v, default=None):
+        # With INPUT_IS_LIST, scalar widgets arrive as 1-element lists.
+        if isinstance(v, list):
+            return v[0] if v else default
+        return v
+
+    def compose(self, images, metadata, text_color, background_color,
+                font_size, padding, opacity, images_per_row, classic_grid=False,
+                constrain_size=False, max_cell_size=512):
+        text_color = self._first(text_color, "white")
+        background_color = self._first(background_color, "black")
+        font_size = int(self._first(font_size, 38))
+        padding = int(self._first(padding, 10))
+        opacity = float(self._first(opacity, 1.0))
+        per_row_override = int(self._first(images_per_row, 0))
+        classic = bool(self._first(classic_grid, False))
+        constrain = bool(self._first(constrain_size, False))
+        max_side = max(64, min(2048, int(self._first(max_cell_size, 512))))
+
+        # images: list of [1,H,W,C] (or [H,W,C]) tensors; metadata: list of str.
+        if not isinstance(images, list):
+            images = [images]
+        if not isinstance(metadata, list):
+            metadata = [metadata]
+
+        if not images:
+            # Nothing to compose — hand back a 1x1 black pixel so nothing crashes.
+            return (torch.zeros((1, 1, 1, 3), dtype=torch.float32),)
+
+        # Align metadata to images: broadcast a single string, else pad/truncate.
+        if len(metadata) == 1 and len(images) > 1:
+            metadata = metadata * len(images)
+        if len(metadata) < len(images):
+            metadata = metadata + [""] * (len(images) - len(metadata))
+        elif len(metadata) > len(images):
+            print(f"[FantasticPlotterImageSaver] metadata ({len(metadata)}) > images "
+                  f"({len(images)}); extra labels ignored.")
+            metadata = metadata[:len(images)]
+
+        # Constrain: scale each cell so its longest side = max_side (only when on).
+        if constrain:
+            resized = []
+            for img in images:
+                t = img if img.ndim == 4 else img.unsqueeze(0)
+                _, H, W, _ = t.shape
+                longest = max(H, W)
+                if longest > max_side:
+                    scale = max_side / longest
+                    nH, nW = max(1, int(H * scale)), max(1, int(W * scale))
+                    t = comfy.utils.common_upscale(
+                        t.movedim(-1, 1), nW, nH, "lanczos", "center"
+                    ).movedim(1, -1)
+                resized.append(t)
+            images = resized
+            print(f"[FantasticPlotterImageSaver] constrained cells to max_side={max_side}px")
+
+        # Classic XY grid: clean cells, labels outside on the border.
+        if classic:
+            grid = _plot_classic_grid(images, metadata, text_color, background_color, font_size, padding)
+            if grid is not None:
+                print(f"[FantasticPlotterImageSaver] classic grid {tuple(grid.shape)}")
+                return (grid,)
+            print("[FantasticPlotterImageSaver] classic grid needs a full lora x strength "
+                  "rectangle — falling back to overlay.")
+
+        # 1) Overlay label on each cell.
+        labelled = []
+        for img, meta in zip(images, metadata):
+            text = _plot_overlay_text(meta)
+            pil = _plot_add_overlay(_plot_tensor_to_pil(img), text,
+                                    text_color, background_color, font_size, padding, opacity)
+            labelled.append(_plot_pil_to_tensor(pil))
+
+        # 2) Resize + batch.
+        batch = _plot_list_to_batch(labelled)
+
+        # 3) Columns: override if set, else auto from metadata.
+        per_row = per_row_override if per_row_override > 0 else _plot_auto_per_row(metadata)
+        per_row = min(per_row, batch.shape[0])  # never wider than the cell count
+
+        # 4) Compose grid → single image.
+        grid = _plot_batch_to_grid(batch, per_row)
+        print(f"[FantasticPlotterImageSaver] {batch.shape[0]} cells -> "
+              f"{per_row} per row -> grid {tuple(grid.shape)}")
+        return (grid,)
 
 
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
+    "FantasticPlotterImageSaver": FantasticPlotterImageSaver,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
     "FantasticLoraLoaderMulti": "Fantastic Lora Loader (Multi-Model) 📁",
     "FantasticLoraPlotter":     "Fantastic Lora Plotter 📊",
+    "FantasticPlotterImageSaver": "Fantastic Plotter Image Saver 📊",
 }
 
 
