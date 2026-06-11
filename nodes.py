@@ -3,16 +3,27 @@ Fantastic Lora Loader — standalone ComfyUI custom nodes.
 
 Two nodes:
   FantasticLoraLoader          — single model + optional CLIP
+                                  (+ randomizer / auto-roll lines)
   FantasticLoraLoaderMulti     — primary model + optional CLIP
                                   + up to 4 additional optional models
-                                  (each patched with the same lora stack)
 
-The lora stack (files, enable flags, strengths) lives in a hidden "lora_data"
-STRING widget managed by the frontend.  The folder filter is frontend-only.
+The lora stack lives in a hidden "lora_data" STRING widget managed by the
+frontend.  Its JSON shape is:
 
-CLIP is optional in both nodes.  In the multi-model node, the CLIP input is
-patched once via the primary path only; the extra model inputs receive model-
-strength patching and return updated MODEL tensors without touching CLIP.
+  {
+    "loras": [
+      {"on": true, "name": "...", "strength": 1.0},          # normal line
+      {"on": true, "name": "...", "strength": 1.0,
+       "random": true, "autoRoll": true, "locked": false,
+       "folders": ["flux/styles", ...] | null}               # randomizer line
+    ],
+    "enabledFolders": ["flux/styles", ...] | null            # node folder filter
+  }
+
+Auto-roll lines (random + autoRoll + not locked) are rolled in the frontend at
+queue time, which bakes a concrete lora name into lora_data before the prompt is
+built. At execution the backend applies every entry by its concrete name, so a
+randomizer line is identical to a normal lora line.
 """
 
 import json
@@ -23,63 +34,137 @@ import comfy.utils
 import comfy.sd
 
 
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
 _LORA_SD_CACHE: dict = {}
+_ROOT_LABEL = "(root)"
 
 
 def _load_lora_sd(path: str):
+    """Return the lora state dict for `path`.
+
+    IMPORTANT: returns a *shallow copy* of the cached dict, never the cached
+    object itself. comfy.lora.load_lora() may remove keys from the dict it is
+    handed; if we returned the cached original, a second application (which only
+    happens when the node re-executes — i.e. under auto-roll) would receive a
+    drained dict and patch the model incompletely, degrading output quality.
+    A shallow copy is cheap (it copies tensor references, not tensor data) and
+    keeps the cached original pristine for every run.
+    """
     sd = _LORA_SD_CACHE.get(path)
     if sd is None:
         sd = comfy.utils.load_torch_file(path, safe_load=True)
         _LORA_SD_CACHE[path] = sd
-    return sd
+    return dict(sd)
 
 
-def _parse_stack(lora_data: str) -> list:
+def _folder_of(f: str) -> str:
+    f = str(f).replace("\\", "/")
+    return f.rsplit("/", 1)[0] if "/" in f else _ROOT_LABEL
+
+
+def _parse_payload(lora_data: str):
+    """Return (entries, enabled_folders). enabled_folders is a list or None (=all)."""
     if not lora_data:
-        return []
+        return [], None
     try:
         data = json.loads(lora_data)
     except (ValueError, TypeError):
-        return []
-    entries = data.get("loras", []) if isinstance(data, dict) else data
-    if not isinstance(entries, list):
-        return []
-    out = []
-    for e in entries:
+        return [], None
+
+    if isinstance(data, list):
+        raw, enabled = data, None
+    elif isinstance(data, dict):
+        raw = data.get("loras", [])
+        enabled = data.get("enabledFolders", None)
+    else:
+        return [], None
+
+    if not isinstance(raw, list):
+        raw = []
+    if enabled is not None and not isinstance(enabled, list):
+        enabled = None
+
+    entries = []
+    for e in raw:
         if not isinstance(e, dict):
             continue
-        name = e.get("name") or e.get("lora")
-        if not name or name in ("None", "NONE"):
+        name = e.get("name") or e.get("lora") or ""
+        is_random = bool(e.get("random"))
+        # Non-random lines still need a name; random lines may be empty (rolled later)
+        if not is_random and (not name or name in ("None", "NONE")):
             continue
         s = e.get("strength")
         if s is not None:
             model_s = clip_s = float(s)
         else:
             model_s = float(e.get("model", 1.0))
-            clip_s  = float(e.get("clip",  1.0))
-        out.append({"on": bool(e.get("on", True)), "name": name,
-                    "model": model_s, "clip": clip_s})
-    return out
+            clip_s = float(e.get("clip", 1.0))
+        item = {"on": bool(e.get("on", True)), "name": name,
+                "model": model_s, "clip": clip_s}
+        if is_random:
+            item["random"] = True
+            item["autoRoll"] = bool(e.get("autoRoll"))
+            item["locked"] = bool(e.get("locked"))
+            item["folders"] = e.get("folders") if isinstance(e.get("folders"), list) else None
+        entries.append(item)
+    return entries, enabled
+
+
+def _parse_stack(lora_data: str) -> list:
+    """Back-compat helper: entries only."""
+    return _parse_payload(lora_data)[0]
+
+
+def _all_lora_files():
+    try:
+        return [str(f).replace(os.sep, "/") for f in folder_paths.get_filename_list("loras")]
+    except Exception as err:  # noqa: BLE001
+        print(f"[FantasticLoraLoader] Failed to list loras: {err}")
+        return []
 
 
 def _apply_stack(model, clip, lora_data: str):
-    """Apply every enabled lora in the stack to (model, clip). Returns (model, clip)."""
-    for e in _parse_stack(lora_data):
+    """Apply the lora stack to (model, clip). Returns (model, clip).
+
+    Every entry — normal or randomizer — is applied by its concrete `name`.
+    Randomizer/auto-roll lines are rolled in the frontend at queue time and
+    arrive here with a concrete name already baked in, so they traverse the
+    exact same code path as a normal lora line. Each resolved path is applied
+    at most once per call.
+    """
+    entries, _enabled = _parse_payload(lora_data)
+    applied_paths: set[str] = set()   # dedup guard
+
+    for e in entries:
         if not e["on"]:
             continue
-        if e["model"] == 0 and (clip is None or e["clip"] == 0):
+
+        name = e["name"]
+        if not name or name in ("None", "NONE"):
             continue
-        path = folder_paths.get_full_path("loras", e["name"])
+
+        # Clamp strengths to a sane range to avoid runaway values.
+        model_s = max(-10.0, min(10.0, float(e.get("model", 1.0))))
+        clip_s  = max(-10.0, min(10.0, float(e.get("clip",  1.0))))
+
+        if model_s == 0 and (clip is None or clip_s == 0):
+            continue
+
+        path = folder_paths.get_full_path("loras", name)
         if path is None:
-            print(f"[FantasticLoraLoader] WARNING: lora not found, skipping: {e['name']}")
+            print(f"[FantasticLoraLoader] WARNING: lora not found, skipping: {name}")
             continue
+
+        # Deduplication: skip if this exact file was already applied this run.
+        if path in applied_paths:
+            print(f"[FantasticLoraLoader] WARNING: duplicate lora entry skipped: {name}")
+            continue
+        applied_paths.add(path)
+
+        print(f"[FantasticLoraLoader] applying {name}  M={model_s} C={clip_s}")
         model, clip = comfy.sd.load_lora_for_models(
-            model, clip, _load_lora_sd(path), e["model"], e["clip"]
+            model, clip, _load_lora_sd(path), model_s, clip_s
         )
+
     return model, clip
 
 
@@ -98,13 +183,8 @@ class FantasticLoraLoader:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "model": ("MODEL",),
-                "lora_data": _LORA_DATA_INPUT,
-            },
-            "optional": {
-                "clip": ("CLIP",),
-            },
+            "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
+            "optional": {"clip": ("CLIP",)},
         }
 
     RETURN_TYPES = ("MODEL", "CLIP")
@@ -112,6 +192,13 @@ class FantasticLoraLoader:
     FUNCTION = "load"
     CATEGORY = "loaders"
     TITLE = "Fantastic Lora Loader"
+
+    @classmethod
+    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
+        # The frontend bakes a fresh random pick into lora_data on every queue,
+        # so the data itself changes when auto-roll lines re-roll — no need to
+        # force a random token. Re-execution happens naturally.
+        return lora_data
 
     def load(self, model, lora_data, clip=None):
         model, clip = _apply_stack(model, clip, lora_data)
@@ -126,10 +213,7 @@ class FantasticLoraLoaderMulti:
     @classmethod
     def INPUT_TYPES(cls):
         return {
-            "required": {
-                "model": ("MODEL",),
-                "lora_data": _LORA_DATA_INPUT,
-            },
+            "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
             "optional": {
                 "clip":    ("CLIP",),
                 "model_2": ("MODEL",),
@@ -139,35 +223,24 @@ class FantasticLoraLoaderMulti:
             },
         }
 
-    # Always return 6 slots; unused extra-model slots return None.
-    RETURN_TYPES  = ("MODEL", "CLIP", "MODEL", "MODEL", "MODEL", "MODEL")
-    RETURN_NAMES  = ("MODEL", "CLIP", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
-    FUNCTION      = "load"
-    CATEGORY      = "loaders"
-    TITLE         = "Fantastic Lora Loader (Multi-Model)"
+    RETURN_TYPES = ("MODEL", "CLIP", "MODEL", "MODEL", "MODEL", "MODEL")
+    RETURN_NAMES = ("MODEL", "CLIP", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
+    FUNCTION = "load"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Lora Loader (Multi-Model)"
+
+    @classmethod
+    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
+        return lora_data
 
     def load(self, model, lora_data, clip=None,
              model_2=None, model_3=None, model_4=None, model_5=None):
-
-        # Primary path: patches both model and CLIP (if connected).
         primary_m, patched_clip = _apply_stack(model, clip, lora_data)
-
-        # Extra paths: patch only the model tensor; CLIP is not touched here
-        # to avoid double-patching the shared CLIP.
         extras = []
         for m in (model_2, model_3, model_4, model_5):
-            if m is not None:
-                patched_m, _ = _apply_stack(m, None, lora_data)
-                extras.append(patched_m)
-            else:
-                extras.append(None)
-
+            extras.append(_apply_stack(m, None, lora_data)[0] if m is not None else None)
         return (primary_m, patched_clip, *extras)
 
-
-# ---------------------------------------------------------------------------
-# Mappings
-# ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoader":      FantasticLoraLoader,
@@ -192,14 +265,8 @@ def _register_routes():
 
     @PromptServer.instance.routes.get("/lora_folder_loader/loras")
     async def _list_loras(_request):
-        try:
-            files = [str(f).replace(os.sep, "/")
-                     for f in folder_paths.get_filename_list("loras")]
-        except Exception as err:
-            print(f"[FantasticLoraLoader] Failed to list loras: {err}")
-            files = []
         from aiohttp import web as _web
-        return _web.json_response(files)
+        return _web.json_response(_all_lora_files())
 
 
 _register_routes()

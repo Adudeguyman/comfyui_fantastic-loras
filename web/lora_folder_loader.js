@@ -111,6 +111,7 @@ function setEnabledFolders(node, setOrNull) {
   node.properties[PROP_ENABLED_FOLDERS] =
     setOrNull == null ? null : { version: 2, folders: [...setOrNull].sort() };
   node.__plffUpdateFolderBtn?.();
+  syncData(node);   // refresh enabledFolders pool used by auto-roll lines
   node.setDirtyCanvas(true, true);
 }
 
@@ -206,9 +207,40 @@ function injectStyles() {
     .lfl-item-dir{opacity:.45;}
     .lfl-chooser-sep{margin:5px 10px;border:none;border-top:1px solid var(--border-color,#3a3a3a);}
     .lfl-chooser-empty{padding:10px 12px;opacity:.6;}
+    /* ── custom tooltip ── */
+    .lfl-tip{position:fixed;z-index:10050;pointer-events:none;max-width:240px;
+      background:#111;color:#eee;border:1px solid #0f848a;border-radius:5px;
+      padding:5px 8px;font:11px/1.35 Arial,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.5);}
+    .lfl-tip b{color:#27d3dc;}
   `;
   document.head.appendChild(s);
 }
+
+// ---------------------------------------------------------------------------
+// Custom hover tooltip (instant, themed — nicer than native title delay)
+// ---------------------------------------------------------------------------
+
+let tipEl = null;
+function ensureTip() {
+  if (!tipEl) { tipEl = document.createElement("div"); tipEl.className = "lfl-tip"; tipEl.style.display = "none"; document.body.appendChild(tipEl); }
+  return tipEl;
+}
+function positionTip(ev) {
+  if (!tipEl) return;
+  const pad = 14;
+  const r = tipEl.getBoundingClientRect();
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + r.width  > window.innerWidth  - 8) x = ev.clientX - r.width  - pad;
+  if (y + r.height > window.innerHeight - 8) y = ev.clientY - r.height - pad;
+  tipEl.style.left = `${Math.max(4, x)}px`;
+  tipEl.style.top  = `${Math.max(4, y)}px`;
+}
+function attachTip(el, html) {
+  el.addEventListener("mouseenter", ev => { const t = ensureTip(); t.innerHTML = html; t.style.display = "block"; positionTip(ev); });
+  el.addEventListener("mousemove", positionTip);
+  el.addEventListener("mouseleave", () => { if (tipEl) tipEl.style.display = "none"; });
+}
+function hideTip() { if (tipEl) tipEl.style.display = "none"; }
 
 // ===========================================================================
 // Folder filter panel
@@ -461,9 +493,17 @@ function clipConnected(node) {
   return !!(inp && inp.link != null);
 }
 
+function effectiveEnabledFoldersArray(node) {
+  const v = node.properties?.[PROP_ENABLED_FOLDERS];
+  if (v == null) return null;                 // null => all folders
+  if (!loraFilesCache) return null;           // can't resolve "all" yet; treat as all
+  const eff = getEffectiveEnabledSet(node, collectUnits(loraFilesCache).keys());
+  return eff == null ? null : [...eff];
+}
+
 function syncData(node) {
   const w = getDataWidget(node);
-  if (w) w.value = JSON.stringify({ loras: node.__loraStack || [] });
+  if (w) w.value = JSON.stringify({ loras: node.__loraStack || [], enabledFolders: effectiveEnabledFoldersArray(node) });
 }
 
 function loadStackFromData(node) {
@@ -472,9 +512,17 @@ function loadStackFromData(node) {
   try {
     const parsed = JSON.parse(w?.value || "{}");
     const entries = Array.isArray(parsed) ? parsed : parsed.loras || [];
-    stack = entries.filter(e => e && (e.name || e.lora)).map(e => {
+    stack = entries.filter(e => e && (e.name || e.lora || e.random)).map(e => {
       const s = e.strength != null ? Number(e.strength) : Number(e.model ?? 1);
-      return { on: e.on !== false, name: e.name || e.lora, model: s, clip: e.clip != null && e.strength == null ? Number(e.clip) : s };
+      const out = { on: e.on !== false, name: e.name || e.lora || "", model: s, clip: e.clip != null && e.strength == null ? Number(e.clip) : s };
+      // Randomizer-line fields (passed through harmlessly by the backend)
+      if (e.random) {
+        out.random   = true;
+        out.locked   = !!e.locked;
+        out.autoRoll = !!e.autoRoll;
+        out.folders  = Array.isArray(e.folders) ? e.folders : null;
+      }
+      return out;
     });
   } catch (_) { stack = []; }
   node.__loraStack = stack;
@@ -483,10 +531,139 @@ function loadStackFromData(node) {
 function snapHeight(node) { const [, h] = node.computeSize(); node.size[1] = h; }
 
 // ===========================================================================
+// Randomizer lines — helpers
+// ===========================================================================
+
+const RAND_EXTRA_WIDTH = 108;  // extra node width while ≥1 randomizer line exists
+const MIN_NODE_WIDTH   = 320;
+
+// Widen the node on the 0→n randomizer-line transition, shrink back on n→0.
+// Uses a delta (not a stored width) so manual user resizes are respected.
+function adjustRandWidth(node) {
+  const c = (node.__loraStack || []).filter(e => e.random).length;
+  const last = node.__lflLastRandCount ?? 0;
+  if (last === 0 && c > 0)      node.size[0] = node.size[0] + RAND_EXTRA_WIDTH;
+  else if (last > 0 && c === 0) node.size[0] = Math.max(MIN_NODE_WIDTH, node.size[0] - RAND_EXTRA_WIDTH);
+  node.__lflLastRandCount = c;
+}
+
+// The folders a randomizer line may pull from: the node's enabled folders,
+// optionally narrowed by the line's own entry.folders selection.
+async function nodeEnabledFolders(node) {
+  const files = await getLoraFiles(true);
+  const units = collectUnits(files);
+  const eff = getEffectiveEnabledSet(node, units.keys());
+  const list = (eff == null ? [...units.keys()] : [...eff]).sort((a, b) => {
+    if (a === ROOT_LABEL) return -1; if (b === ROOT_LABEL) return 1;
+    return a.localeCompare(b, undefined, { sensitivity: "base" });
+  });
+  return { files, units, folders: list };
+}
+
+async function pickRandomLora(node, entry) {
+  const { files, folders } = await nodeEnabledFolders(node);
+  let allowed = new Set(folders);
+  if (Array.isArray(entry.folders)) {
+    allowed = new Set(entry.folders.filter(f => allowed.has(f)));
+  }
+  const pool = files.filter(f => allowed.has(folderOf(f)));
+  if (!pool.length) return null;
+  // Avoid re-picking the same lora when there's a choice
+  if (entry.name && pool.length > 1) {
+    const others = pool.filter(f => f !== entry.name);
+    return others[Math.floor(Math.random() * others.length)];
+  }
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// ---------------------------------------------------------------------------
+// Per-line folder selection panel (📂 icon on randomizer rows)
+// ---------------------------------------------------------------------------
+
+let openLinePanel = null;
+function closeLinePanel() { if (openLinePanel) { openLinePanel.dispose(); openLinePanel = null; } }
+
+async function showLineFolderPanel(node, entry, event) {
+  if (openLinePanel?.entry === entry) { closeLinePanel(); return; }
+  closeLinePanel();
+  injectStyles();
+
+  const { units, folders: available } = await nodeEnabledFolders(node);
+
+  const panel = document.createElement("div"); panel.className = "lfl-panel";
+
+  const header = document.createElement("div"); header.className = "lfl-header";
+  header.innerHTML = `<span class="lfl-title">Randomizer folders</span>`;
+  const close = document.createElement("span"); close.className = "lfl-close"; close.textContent = "✕";
+  close.addEventListener("click", closeLinePanel); header.appendChild(close); panel.appendChild(header);
+
+  const actions = document.createElement("div"); actions.className = "lfl-actions";
+  const mkBtn = (label, fn) => {
+    const b = document.createElement("button"); b.className = "lfl-btn"; b.textContent = label;
+    b.addEventListener("click", fn); actions.appendChild(b);
+  };
+  const apply = () => { syncData(node); renderList(); node.__lflRender?.(); };
+  mkBtn("All enabled", () => { entry.folders = null; apply(); });
+  mkBtn("None",        () => { entry.folders = [];   apply(); });
+  panel.appendChild(actions);
+
+  const listEl = document.createElement("div"); listEl.className = "lfl-tree";
+  panel.appendChild(listEl);
+
+  const isChecked = f => entry.folders == null ? true : entry.folders.includes(f);
+
+  const renderList = () => {
+    listEl.textContent = "";
+    if (!available.length) {
+      const e = document.createElement("div"); e.className = "lfl-empty";
+      e.textContent = "No folders enabled — adjust the node's 📁 Folders filter first.";
+      listEl.appendChild(e); return;
+    }
+    for (const f of available) {
+      const row = document.createElement("div"); row.className = "lfl-row";
+      const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = isChecked(f);
+      const toggle = () => {
+        if (entry.folders == null) entry.folders = available.slice(); // materialize "all"
+        const i = entry.folders.indexOf(f);
+        i === -1 ? entry.folders.push(f) : entry.folders.splice(i, 1);
+        apply();
+      };
+      cb.addEventListener("click", e => { e.preventDefault(); toggle(); });
+      row.appendChild(cb);
+      const name = document.createElement("span"); name.className = "lfl-name";
+      name.textContent = f; name.title = f;
+      name.addEventListener("click", toggle);
+      row.appendChild(name);
+      const cnt = document.createElement("span"); cnt.className = "lfl-count";
+      cnt.textContent = `(${units.get(f) || 0})`;
+      row.appendChild(cnt);
+      listEl.appendChild(row);
+    }
+  };
+  renderList();
+
+  document.body.appendChild(panel);
+  const x = event?.clientX ?? window.innerWidth / 2, y = event?.clientY ?? window.innerHeight / 3;
+  const rect = panel.getBoundingClientRect();
+  panel.style.left = `${Math.max(8, Math.min(x, window.innerWidth  - rect.width  - 8))}px`;
+  panel.style.top  = `${Math.max(8, Math.min(y + 6, window.innerHeight - rect.height - 8))}px`;
+
+  const onPD = e => { if (!panel.contains(e.target)) closeLinePanel(); };
+  const onKD = e => { if (e.key === "Escape") closeLinePanel(); };
+  setTimeout(() => { document.addEventListener("pointerdown", onPD, true); document.addEventListener("keydown", onKD, true); }, 0);
+  openLinePanel = { entry, dispose: () => {
+    document.removeEventListener("pointerdown", onPD, true);
+    document.removeEventListener("keydown", onKD, true);
+    panel.remove();
+  } };
+}
+
+// ===========================================================================
 // Lora row DOM widget (shared between both nodes)
 // ===========================================================================
 
 function buildRowDOM(node) {
+  injectStyles();
   const root = document.createElement("div");
   root.style.cssText = "display:flex;flex-direction:column;gap:3px;font:12px Arial,sans-serif;color:var(--fg-color,#ddd);width:100%;box-sizing:border-box;padding:2px 0;";
 
@@ -497,15 +674,17 @@ function buildRowDOM(node) {
     i.addEventListener("pointerdown", e => e.stopPropagation()); return i;
   };
 
-  const mkIcon = (txt, title, color, fn) => {
-    const b = document.createElement("span"); b.textContent = txt; b.title = title;
+  const mkIcon = (txt, tip, color, fn) => {
+    const b = document.createElement("span"); b.textContent = txt;
     b.style.cssText = "flex:none;cursor:pointer;opacity:.75;min-width:22px;text-align:center;font-size:15px;line-height:1;padding:0 1px;" + (color ? `color:${color};` : "");
     b.addEventListener("mouseenter", () => (b.style.opacity = "1")); b.addEventListener("mouseleave", () => (b.style.opacity = ".75"));
-    b.addEventListener("click", fn); b.addEventListener("pointerdown", e => e.stopPropagation()); return b;
+    b.addEventListener("click", () => { hideTip(); fn(); }); b.addEventListener("pointerdown", e => e.stopPropagation());
+    if (tip) attachTip(b, tip);
+    return b;
   };
 
   const swap = (i, j) => { const s = node.__loraStack; [s[i], s[j]] = [s[j], s[i]]; };
-  const commit = () => { syncData(node); render(); snapHeight(node); node.setDirtyCanvas(true, true); };
+  const commit = () => { syncData(node); render(); adjustRandWidth(node); snapHeight(node); node.setDirtyCanvas(true, true); };
 
   const render = () => {
     root.textContent = "";
@@ -520,15 +699,87 @@ function buildRowDOM(node) {
       const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = entry.on; cb.title = "Enable / disable"; cb.style.flex = "none";
       cb.addEventListener("change", () => { entry.on = cb.checked; commit(); }); cb.addEventListener("pointerdown", e => e.stopPropagation()); row.appendChild(cb);
 
-      const nameEl = document.createElement("span");
-      nameEl.title = entry.name + "  (click to change)";
-      nameEl.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;" + (entry.on ? "" : "opacity:.45;text-decoration:line-through;");
-      // Show dim folder prefix + bright bold filename (mirrors the chooser)
-      const dir = folderOf(entry.name);
-      if (dir !== ROOT_LABEL) {
-        const d = document.createElement("span"); d.style.cssText = "opacity:.45;font-size:11px;"; d.textContent = dir + "/"; nameEl.appendChild(d);
+      // ── Randomizer-only left controls: 🎲 dice + 🔓/🔒 lock + 🔄 auto-roll ──
+      if (entry.random) {
+        const dice = document.createElement("span");
+        dice.textContent = "🎲";
+        dice.style.cssText =
+          "flex:none;text-align:center;min-width:22px;font-size:15px;line-height:1;padding:0 1px;" +
+          (entry.locked ? "opacity:.3;cursor:default;" : "opacity:.85;cursor:pointer;");
+        dice.addEventListener("mouseenter", () => { if (!entry.locked) dice.style.opacity = "1"; });
+        dice.addEventListener("mouseleave", () => { if (!entry.locked) dice.style.opacity = ".85"; });
+        dice.addEventListener("click", async () => {
+          if (entry.locked) return;
+          hideTip();
+          const pick = await pickRandomLora(node, entry);
+          if (pick != null) { entry.name = pick; commit(); }
+        });
+        dice.addEventListener("pointerdown", e => e.stopPropagation());
+        attachTip(dice, entry.locked
+          ? "<b>Roll</b> — disabled while locked 🔒"
+          : "<b>Roll the dice</b><br>Pick a new random lora from this line's folders.");
+        row.appendChild(dice);
+
+        row.appendChild(mkIcon(
+          entry.locked ? "🔒" : "🔓",
+          entry.locked
+            ? "<b>Locked</b> — this lora is frozen.<br>Click to unlock and re-enable 🎲 / 🔄."
+            : "<b>Unlocked</b> — click to lock this lora<br>so the dice and auto-roll can't change it.",
+          null,
+          () => {
+            entry.locked = !entry.locked;
+            // Turning the lock on also disables auto-roll so it can't be
+            // accidentally left active on a frozen line.
+            if (entry.locked) entry.autoRoll = false;
+            commit();
+          }
+        ));
+        // Style the lock icon after it's appended so locked = red pill, unlocked = dim.
+        const lockEl = row.lastElementChild;
+        if (entry.locked) {
+          lockEl.style.cssText += "background:rgba(239,83,80,.22);border:1px solid rgba(239,83,80,.55);border-radius:4px;padding:0 3px;opacity:1;";
+        } else {
+          lockEl.style.opacity = ".4";
+          lockEl.addEventListener("mouseenter", () => lockEl.style.opacity = ".75");
+          lockEl.addEventListener("mouseleave", () => lockEl.style.opacity = ".4");
+        }
+
+        const ar = document.createElement("span");
+        ar.textContent = "🔄";
+        const arOn = !!entry.autoRoll && !entry.locked;  // locked => always treated as off
+        ar.style.cssText =
+          "flex:none;text-align:center;min-width:22px;font-size:15px;line-height:1;padding:0 1px;" +
+          (entry.locked ? "opacity:.2;cursor:default;" : arOn ? "opacity:1;cursor:pointer;" : "opacity:.3;cursor:pointer;");
+        if (!entry.locked) {
+          ar.addEventListener("mouseenter", () => { if (!arOn) ar.style.opacity = ".6"; });
+          ar.addEventListener("mouseleave", () => { if (!arOn) ar.style.opacity = ".3"; });
+          ar.addEventListener("click", () => { hideTip(); entry.autoRoll = !entry.autoRoll; commit(); });
+        }
+        ar.addEventListener("pointerdown", e => e.stopPropagation());
+        attachTip(ar, entry.locked
+          ? "<b>Auto-roll: disabled</b><br>Unlock 🔓 this line to enable auto-roll."
+          : arOn
+            ? "<b>Auto-roll: ON</b><br>Picks a new random lora on <i>every</i> queued run."
+            : "<b>Auto-roll: OFF</b><br>Click to re-randomize this line automatically on every queued run.");
+        row.appendChild(ar);
       }
-      const fn = document.createElement("span"); fn.style.cssText = "font-size:14px;font-weight:bold;"; fn.textContent = baseName(entry.name); nameEl.appendChild(fn);
+
+      const nameEl = document.createElement("span");
+      nameEl.title = entry.name ? entry.name + "  (click to change)" : "Randomizer line — roll 🎲 or pick folders 📂";
+      nameEl.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;" + (entry.on ? "" : "opacity:.45;text-decoration:line-through;");
+      if (!entry.name) {
+        const ph = document.createElement("span");
+        ph.style.cssText = "opacity:.5;font-style:italic;";
+        ph.textContent = "(no lora — roll 🎲 or pick folders 📂)";
+        nameEl.appendChild(ph);
+      } else {
+        // Show dim folder prefix + bright bold filename (mirrors the chooser)
+        const dir = folderOf(entry.name);
+        if (dir !== ROOT_LABEL) {
+          const d = document.createElement("span"); d.style.cssText = "opacity:.45;font-size:11px;"; d.textContent = dir + "/"; nameEl.appendChild(d);
+        }
+        const fn = document.createElement("span"); fn.style.cssText = "font-size:14px;font-weight:bold;"; fn.textContent = baseName(entry.name); nameEl.appendChild(fn);
+      }
       nameEl.addEventListener("click", e => showLoraChooser(node, e, value => { entry.name = value; commit(); }));
       nameEl.addEventListener("pointerdown", e => e.stopPropagation()); row.appendChild(nameEl);
 
@@ -540,9 +791,22 @@ function buildRowDOM(node) {
         const note = document.createElement("span"); note.textContent = "(no CLIP)";
         note.style.cssText = "opacity:.3;font-size:10px;flex:none;white-space:nowrap;"; row.appendChild(note);
       }
-      row.appendChild(mkIcon("▲", "Move up",   null,      () => { if (idx > 0) { swap(idx, idx-1); commit(); } }));
-      row.appendChild(mkIcon("▼", "Move down", null,      () => { if (idx < stack.length-1) { swap(idx, idx+1); commit(); } }));
-      row.appendChild(mkIcon("✕", "Remove",    "#e57373", () => { stack.splice(idx, 1); commit(); }));
+      // ── Randomizer-only right control: 📂 per-line folder selection ─────
+      if (entry.random) {
+        const sel = Array.isArray(entry.folders) ? entry.folders.length : null;
+        row.appendChild(mkIcon(
+          "📂",
+          (sel == null
+            ? "<b>Folders: all enabled</b>"
+            : `<b>Folders: ${sel} selected</b>`) +
+          "<br>Choose which subfolders this line randomizes from.",
+          null,
+          (e) => showLineFolderPanel(node, entry, e)
+        ));
+      }
+      row.appendChild(mkIcon("▲", "Move this lora up",   null,      () => { if (idx > 0) { swap(idx, idx-1); commit(); } }));
+      row.appendChild(mkIcon("▼", "Move this lora down", null,      () => { if (idx < stack.length-1) { swap(idx, idx+1); commit(); } }));
+      row.appendChild(mkIcon("✕", "Remove this lora",    "#e57373", () => { stack.splice(idx, 1); commit(); }));
       root.appendChild(row);
     });
   };
@@ -586,6 +850,19 @@ function addUI(node) {
   if (node.__lflBuilt) return;
   node.__lflBuilt = true;
   buildCoreUI(node);
+
+  // 🎲 Add Lora Randomizer — single-model node only (for now)
+  const randBtn = node.addWidget("button", "lfl_add_rand", null, async () => {
+    const entry = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, folders: null };
+    const pick = await pickRandomLora(node, entry);
+    if (pick != null) entry.name = pick;
+    node.__loraStack.push(entry);
+    node.__lflCommit();
+  });
+  randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
+  if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
+
+  node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
   snapHeight(node);
 }
 
@@ -659,14 +936,34 @@ function addMultiUI(node) {
   if (node.__lflBuilt) return;
   node.__lflBuilt = true;
   node.properties = node.properties || {};
+  // Default to 1 extra model path so the multi-model node starts with 2 in total.
   if (node.properties.extra_model_count == null) node.properties.extra_model_count = 0;
   stripAutoExtraSlots(node);
   buildCoreUI(node);
+
+  // 🎲 Add Lora Randomizer (same as single-model node)
+  const randBtn = node.addWidget("button", "lfl_add_rand", null, async () => {
+    const entry = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, autoRoll: false, folders: null };
+    const pick = await pickRandomLora(node, entry);
+    if (pick != null) entry.name = pick;
+    node.__loraStack.push(entry);
+    node.__lflCommit();
+  });
+  randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
+  if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
+
   const barDom = buildModelBar(node);
   const barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false });
   barWidget.serializeValue = () => undefined;
   barWidget.computeSize = function (width) { return [width, 26]; };
-  updateModelBar(node);
+
+  // On fresh creation (count still 0 after stripAutoExtraSlots) add one pair so
+  // the node starts with 2 model paths. Workflow loads skip this because
+  // onConfigure syncs extra_model_count from the already-restored slots.
+  if (node.properties.extra_model_count === 0) addModelPair(node);
+  else updateModelBar(node);
+
+  node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
   snapHeight(node);
 }
 
@@ -676,6 +973,37 @@ function addMultiUI(node) {
 
 app.registerExtension({
   name: "lfl.FantasticLoraLoader",
+
+  async setup() {
+    // Roll every active auto-roll line just before each prompt is queued, and
+    // bake the chosen lora into lora_data. This makes auto-roll lines identical
+    // to normal lora lines at execution time (same code path, same result) and
+    // updates the node face to show what WILL be used this run.
+    const origQueuePrompt = app.queuePrompt;
+    app.queuePrompt = async function (...args) {
+      try {
+        const nodes = app.graph?._nodes || [];
+        for (const node of nodes) {
+          if (!node.__loraStack) continue;
+          let changed = false;
+          for (const entry of node.__loraStack) {
+            if (entry.random && entry.autoRoll && !entry.locked) {
+              const pick = await pickRandomLora(node, entry);
+              if (pick != null) { entry.name = pick; changed = true; }
+            }
+          }
+          if (changed) {
+            syncData(node);
+            node.__lflRender?.();
+            node.setDirtyCanvas(true, false);
+          }
+        }
+      } catch (err) {
+        console.warn("[FantasticLoraLoader] auto-roll on queue failed", err);
+      }
+      return origQueuePrompt.apply(this, args);
+    };
+  },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (!ALL_NODE_NAMES.includes(nodeData?.name)) return;
@@ -710,6 +1038,9 @@ app.registerExtension({
           if (!this.__lflBuilt) addUI(this);
         }
         loadStackFromData(this);
+        // Serialized node width already reflects any randomizer bump — sync the
+        // counter so the next commit doesn't add it again.
+        this.__lflLastRandCount = (this.__loraStack || []).filter(e => e.random).length;
         this.__lflRender?.();
         this.__plffUpdateFolderBtn?.();
         snapHeight(this);
