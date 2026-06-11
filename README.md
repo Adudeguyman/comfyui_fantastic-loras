@@ -64,7 +64,7 @@ Stored in `node.properties["Enabled Lora Folders"]`:
 | `["flux"]` (legacy v1 array) | Matches that folder plus everything nested under it; auto-upgraded to v2 on first toggle. |
 
 
-## Lora chooser & favourites
+## Lora chooser & favorites
 
 Clicking **➕ Add Lora** or any lora name in the stack opens a custom chooser panel:
 
@@ -72,6 +72,15 @@ Clicking **➕ Add Lora** or any lora name in the stack opens a custom chooser p
 - **Favourites float to the top** of the list, separated from the rest by a thin rule, sorted alphabetically within each group.
 - **Favourites are global** — stored in your browser's `localStorage` so they're shared across all nodes and persist between sessions.
 - **Live search bar** — auto-focused when the panel opens; start typing to filter the list. Both the favourites section and the main list filter simultaneously.
+
+
+## Lora Randomizer
+
+Clicking **🎲 Add Lora Randomizer** adds a special randomizer line. On creation it immediately rolls a random lora from your node's enabled folders. Randomizer lines work like normal lora rows but have four extra controls on the left and right:
+
+```
+[✓] 🎲 🔓 🔄  flux/styles/ anime.safetensors   S [1.00]  📂 ▲ ▼ ✕
+```
 
 
 ### Randomizer controls
@@ -93,14 +102,6 @@ Note: because the roll is backend-side, the lora name displayed on the node face
 
 The 📂 icon on each randomizer line is a **subset** of whatever the node's 📁 filter currently allows — you can't roll from a folder that the node filter has excluded. If the node filter changes, lines that had that folder selected will simply have a smaller (or empty) pool until you re-enable it.
 
-
-## Lora Randomizer
-
-Clicking **🎲 Add Lora Randomizer** adds a special randomizer line. On creation it immediately rolls a random lora from your node's enabled folders. Randomizer lines work like normal lora rows but have four extra controls on the left and right:
-
-```
-[✓] 🎲 🔓 🔄  flux/styles/ anime.safetensors   S [1.00]  📂 ▲ ▼ ✕
-```
 
 
 - Dismiss with **✕**, **Esc**, or by clicking outside the panel.
