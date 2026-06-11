@@ -18,7 +18,11 @@ import { api } from "../../scripts/api.js";
 
 const NODE_NAME       = "FantasticLoraLoader";
 const MULTI_NODE_NAME = "FantasticLoraLoaderMulti";
-const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME];
+const PLOT_NODE_NAME  = "FantasticLoraPlotter";
+const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME, PLOT_NODE_NAME];
+
+// Nodes that use the multi-model UI (stack + dynamic model-path bar).
+const isMultiLike = (name) => name === MULTI_NODE_NAME || name === PLOT_NODE_NAME;
 
 const DATA_WIDGET          = "lora_data";
 const NODE_COLOR           = "#0f848a";
@@ -932,11 +936,10 @@ function buildModelBar(node) {
 // Multi-model node UI
 // ===========================================================================
 
-function addMultiUI(node) {
+function addMultiUI(node, { autoAddPair = true } = {}) {
   if (node.__lflBuilt) return;
   node.__lflBuilt = true;
   node.properties = node.properties || {};
-  // Default to 1 extra model path so the multi-model node starts with 2 in total.
   if (node.properties.extra_model_count == null) node.properties.extra_model_count = 0;
   stripAutoExtraSlots(node);
   buildCoreUI(node);
@@ -957,10 +960,11 @@ function addMultiUI(node) {
   barWidget.serializeValue = () => undefined;
   barWidget.computeSize = function (width) { return [width, 26]; };
 
-  // On fresh creation (count still 0 after stripAutoExtraSlots) add one pair so
-  // the node starts with 2 model paths. Workflow loads skip this because
-  // onConfigure syncs extra_model_count from the already-restored slots.
-  if (node.properties.extra_model_count === 0) addModelPair(node);
+  // On fresh creation (count still 0 after stripAutoExtraSlots) optionally add
+  // one pair. The Multi-Model node starts with 2 paths (autoAddPair=true); the
+  // Plotter starts with a single path (autoAddPair=false). Workflow loads skip
+  // this because onConfigure syncs extra_model_count from restored slots.
+  if (autoAddPair && node.properties.extra_model_count === 0) addModelPair(node);
   else updateModelBar(node);
 
   node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
@@ -1007,7 +1011,8 @@ app.registerExtension({
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (!ALL_NODE_NAMES.includes(nodeData?.name)) return;
-    const isMulti = nodeData.name === MULTI_NODE_NAME;
+    const isMulti   = isMultiLike(nodeData.name);
+    const isPlotter = nodeData.name === PLOT_NODE_NAME;
 
     nodeType.color   = NODE_COLOR;
     nodeType.bgcolor = NODE_BGCOLOR;
@@ -1016,7 +1021,8 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       origOnNodeCreated?.apply(this, arguments);
       this.size = [DEFAULT_WIDTH, 180];
-      try { isMulti ? addMultiUI(this) : addUI(this); }
+      // Plotter uses the multi-model UI but starts with a single model path.
+      try { isMulti ? addMultiUI(this, { autoAddPair: !isPlotter }) : addUI(this); }
       catch (err) { console.warn("[FantasticLoraLoader] UI build failed", err); }
     };
 
@@ -1031,7 +1037,7 @@ app.registerExtension({
       origOnConfigure?.apply(this, arguments);
       try {
         if (isMulti) {
-          if (!this.__lflBuilt) addMultiUI(this);
+          if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: !isPlotter });
           this.properties.extra_model_count = countExtraModelInputs(this);
           updateModelBar(this);
         } else {

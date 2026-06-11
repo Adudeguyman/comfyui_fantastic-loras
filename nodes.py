@@ -28,6 +28,7 @@ randomizer line is identical to a normal lora line.
 
 import json
 import os
+import re
 
 import folder_paths
 import comfy.utils
@@ -122,8 +123,14 @@ def _all_lora_files():
         return []
 
 
-def _apply_stack(model, clip, lora_data: str):
-    """Apply the lora stack to (model, clip). Returns (model, clip).
+def _apply_stack_collect(model, clip, lora_data: str):
+    """Apply the lora stack to (model, clip) and report what was applied.
+
+    Returns (model, clip, applied) where `applied` is a list of
+    (name, model_strength, clip_strength) in application order — exactly the
+    loras that were patched in (post dedup / not-found skips). The plotter uses
+    this to build metadata that reflects the real stack, including auto-rolled
+    picks (which the frontend has already baked into `name` at queue time).
 
     Every entry — normal or randomizer — is applied by its concrete `name`.
     Randomizer/auto-roll lines are rolled in the frontend at queue time and
@@ -133,6 +140,7 @@ def _apply_stack(model, clip, lora_data: str):
     """
     entries, _enabled = _parse_payload(lora_data)
     applied_paths: set[str] = set()   # dedup guard
+    applied: list = []
 
     for e in entries:
         if not e["on"]:
@@ -164,8 +172,42 @@ def _apply_stack(model, clip, lora_data: str):
         model, clip = comfy.sd.load_lora_for_models(
             model, clip, _load_lora_sd(path), model_s, clip_s
         )
+        applied.append((name, model_s, clip_s))
 
+    return model, clip, applied
+
+
+def _apply_stack(model, clip, lora_data: str):
+    """Apply the lora stack to (model, clip). Returns (model, clip)."""
+    model, clip, _applied = _apply_stack_collect(model, clip, lora_data)
     return model, clip
+
+
+# ---------------------------------------------------------------------------
+# Metadata (LoRA Plot Node convention: "<sanitized_lora>_<strength>")
+# ---------------------------------------------------------------------------
+
+def _sanitize_lora_name(filename: str) -> str:
+    basename = os.path.basename(str(filename))
+    name = os.path.splitext(basename)[0]
+    name = re.sub(r'[<>:"/\\|?*]', "_", name).strip(". ")
+    return name or "lora"
+
+
+def _format_strength(value: float) -> str:
+    # Mirror the LoRA Plot Node, which embeds the raw float (e.g. 0.8, 1.0).
+    v = round(float(value), 4)
+    return repr(int(v)) + ".0" if v == int(v) else repr(v)
+
+
+def _build_metadata(applied) -> str:
+    """Single metadata string from the loras applied to the primary path.
+
+    Format per lora: "<sanitized_name>_<model_strength>", joined by ", ".
+    Matches the token shape the LoRA Plot Image Saver parses (rsplit on '_').
+    """
+    parts = [f"{_sanitize_lora_name(name)}_{_format_strength(m)}" for name, m, _c in applied]
+    return ", ".join(parts) if parts else "no_lora"
 
 
 _LORA_DATA_INPUT = (
@@ -242,13 +284,68 @@ class FantasticLoraLoaderMulti:
         return (primary_m, patched_clip, *extras)
 
 
+# ---------------------------------------------------------------------------
+# Node: Fantastic Lora Plotter  (step 1 — loader stage)
+# ---------------------------------------------------------------------------
+#
+# Combines the Multi-Model loader's stack + multi-model paths with the LoRA
+# Plot Node's `metadata` output. Defaults to a single model path (the frontend
+# starts extra_model_count at 0 and does NOT auto-add a pair for this node).
+#
+# Output order is deliberate: metadata sits at a FIXED index (2) BEFORE the
+# dynamic MODEL 2-5 slots, because the frontend strips/re-adds those extra
+# model outputs at the end of the list. Keeping metadata ahead of them means
+# ComfyUI's slot-index → return-value mapping stays aligned no matter how many
+# model paths the user adds.
+
+class FantasticLoraPlotter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
+            "optional": {
+                "clip":    ("CLIP",),
+                "model_2": ("MODEL",),
+                "model_3": ("MODEL",),
+                "model_4": ("MODEL",),
+                "model_5": ("MODEL",),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "MODEL", "MODEL", "MODEL", "MODEL")
+    RETURN_NAMES = ("MODEL", "CLIP", "metadata", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
+    FUNCTION = "load"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Lora Plotter"
+
+    @classmethod
+    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
+        return lora_data
+
+    def load(self, model, lora_data, clip=None,
+             model_2=None, model_3=None, model_4=None, model_5=None):
+        # Primary path patches model (+ CLIP if connected) and reports what was
+        # applied so metadata reflects the real picks.
+        primary_m, patched_clip, applied = _apply_stack_collect(model, clip, lora_data)
+
+        # Extra paths: patch only the model tensor (shared CLIP patched once).
+        extras = []
+        for m in (model_2, model_3, model_4, model_5):
+            extras.append(_apply_stack(m, None, lora_data)[0] if m is not None else None)
+
+        metadata = _build_metadata(applied)
+        return (primary_m, patched_clip, metadata, *extras)
+
+
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
+    "FantasticLoraPlotter":     FantasticLoraPlotter,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
     "FantasticLoraLoaderMulti": "Fantastic Lora Loader (Multi-Model) 📁",
+    "FantasticLoraPlotter":     "Fantastic Lora Plotter 📊",
 }
 
 
