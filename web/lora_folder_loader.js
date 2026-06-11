@@ -19,6 +19,7 @@ import { api } from "../../scripts/api.js";
 const NODE_NAME       = "FantasticLoraLoader";
 const MULTI_NODE_NAME = "FantasticLoraLoaderMulti";
 const PLOT_NODE_NAME  = "FantasticLoraPlotter";
+const SAVER_NODE_NAME = "FantasticPlotterImageSaver";
 const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME, PLOT_NODE_NAME];
 
 // Nodes that use the multi-model UI (stack + dynamic model-path bar).
@@ -507,7 +508,13 @@ function effectiveEnabledFoldersArray(node) {
 
 function syncData(node) {
   const w = getDataWidget(node);
-  if (w) w.value = JSON.stringify({ loras: node.__loraStack || [], enabledFolders: effectiveEnabledFoldersArray(node) });
+  if (!w) return;
+  const payload = { loras: node.__loraStack || [], enabledFolders: effectiveEnabledFoldersArray(node) };
+  if (node.__isPlotter) {
+    payload.plotMode = node.__plotMode === "global" ? "global" : "perline";
+    payload.globalStrengths = Array.isArray(node.__globalStrengths) ? node.__globalStrengths : [];
+  }
+  w.value = JSON.stringify(payload);
 }
 
 function loadStackFromData(node) {
@@ -530,6 +537,15 @@ function loadStackFromData(node) {
     });
   } catch (_) { stack = []; }
   node.__loraStack = stack;
+  // Plotter-only fields (harmlessly ignored by the other node types).
+  try {
+    const parsed = JSON.parse(w?.value || "{}");
+    if (parsed && !Array.isArray(parsed)) {
+      if (parsed.plotMode === "global" || parsed.plotMode === "perline") node.__plotMode = parsed.plotMode;
+      if (Array.isArray(parsed.globalStrengths))
+        node.__globalStrengths = parsed.globalStrengths.map(Number).filter(n => !isNaN(n));
+    }
+  } catch (_) {}
 }
 
 function snapHeight(node) { const [, h] = node.computeSize(); node.size[1] = h; }
@@ -693,6 +709,7 @@ function buildRowDOM(node) {
   const render = () => {
     root.textContent = "";
     const stack = node.__loraStack || [], hasClip = clipConnected(node);
+    const globalMode = node.__isPlotter && node.__plotMode === "global";
     if (!stack.length) {
       const empty = document.createElement("div"); empty.textContent = "No loras yet — click ➕ Add Lora.";
       empty.style.cssText = "opacity:.55;padding:4px 2px;"; root.appendChild(empty); return;
@@ -788,9 +805,13 @@ function buildRowDOM(node) {
       nameEl.addEventListener("pointerdown", e => e.stopPropagation()); row.appendChild(nameEl);
 
       const sLabel = document.createElement("span"); sLabel.textContent = "S";
-      sLabel.title = hasClip ? "Strength (model + clip)" : "Strength (model — CLIP not connected)";
-      sLabel.style.cssText = "opacity:.6;flex:none;font-size:11px;"; row.appendChild(sLabel);
-      row.appendChild(numInput(entry.model, false, v => { const val = isNaN(v) ? 0 : v; entry.model = val; entry.clip = val; syncData(node); }));
+      sLabel.title = globalMode
+        ? "Per-line strength ignored — using Global strengths"
+        : (hasClip ? "Strength (model + clip)" : "Strength (model — CLIP not connected)");
+      sLabel.style.cssText = "opacity:" + (globalMode ? ".3" : ".6") + ";flex:none;font-size:11px;"; row.appendChild(sLabel);
+      const sInput = numInput(entry.model, globalMode, v => { const val = isNaN(v) ? 0 : v; entry.model = val; entry.clip = val; syncData(node); });
+      if (globalMode) { sInput.disabled = true; sInput.title = "Per-line strength ignored in Global mode"; }
+      row.appendChild(sInput);
       if (!hasClip) {
         const note = document.createElement("span"); note.textContent = "(no CLIP)";
         note.style.cssText = "opacity:.3;font-size:10px;flex:none;white-space:nowrap;"; row.appendChild(note);
@@ -936,10 +957,82 @@ function buildModelBar(node) {
 // Multi-model node UI
 // ===========================================================================
 
-function addMultiUI(node, { autoAddPair = true } = {}) {
+// ===========================================================================
+// Fantastic Plotter Image Saver — custom width, constrain group UI
+// ===========================================================================
+
+const SAVER_WIDTH = Math.round(DEFAULT_WIDTH * 1.2) - 50;  // 20% wider minus 50px
+
+function updateClassicGridLabel(node) {
+  if (!node.__lflClassicGridBtn) return;
+  node.__lflClassicGridBtn.label = node.__classicGrid
+    ? "🖼 Grid mode: Classic (border labels)"
+    : "🖼 Grid mode: Overlay (on image)";
+  node.setDirtyCanvas?.(true, false);
+}
+
+function _setupSaverUI(node) {
+  if (node.__lflSaverBuilt) return;
+  node.__lflSaverBuilt = true;
+
+  const constrainW = node.widgets?.find(w => w.name === "constrain_size");
+  const maxSideW   = node.widgets?.find(w => w.name === "max_cell_size");
+  const classicW   = node.widgets?.find(w => w.name === "classic_grid");
+  if (!constrainW || !maxSideW) return;
+
+  // ── Grey-out: toggle max_cell_size disabled based on constrain_size ──
+  const applyDisabled = (val) => {
+    maxSideW.disabled = !val;
+    node.setDirtyCanvas(true, false);
+  };
+  applyDisabled(constrainW.value);
+
+  const origCB = constrainW.callback;
+  constrainW.callback = function (value, ...rest) {
+    origCB?.call(this, value, ...rest);
+    applyDisabled(value);
+  };
+
+  // ── Spacer: a thin gap between the constrain group and the style options ──
+  const spacerDom = document.createElement("div");
+  spacerDom.style.cssText = "height:6px;";
+  const spacerW = node.addDOMWidget("lfl_saver_spacer", "div", spacerDom, { serialize: false });
+  spacerW.serializeValue = () => undefined;
+  spacerW.computeSize = (w) => [w, 6];
+
+  // Move spacer to sit right after max_cell_size.
+  const ws = node.widgets;
+  ws.splice(ws.indexOf(spacerW), 1);
+  ws.splice(ws.indexOf(maxSideW) + 1, 0, spacerW);
+
+  // ── Classic grid toggle button — same style as the Strength Mode button ──
+  if (classicW) {
+    node.__classicGrid = !!classicW.value;
+    hideWidget(node, classicW);
+
+    const classicBtn = node.addWidget("button", "lfl_classic_grid_btn", null, () => {
+      node.__classicGrid = !node.__classicGrid;
+      classicW.value = node.__classicGrid;
+      updateClassicGridLabel(node);
+      node.setDirtyCanvas(true, true);
+    });
+    classicBtn.serialize = false;
+    if (classicBtn.options) classicBtn.options.serialize = false;
+    classicBtn.serializeValue = () => undefined;
+    node.__lflClassicGridBtn = classicBtn;
+    updateClassicGridLabel(node);
+  }
+}
+
+function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
   if (node.__lflBuilt) return;
   node.__lflBuilt = true;
   node.properties = node.properties || {};
+  if (isPlotter) {
+    node.__isPlotter = true;
+    if (node.__plotMode == null) node.__plotMode = "perline";
+    if (node.__globalStrengths == null) node.__globalStrengths = [];
+  }
   if (node.properties.extra_model_count == null) node.properties.extra_model_count = 0;
   stripAutoExtraSlots(node);
   buildCoreUI(node);
@@ -955,6 +1048,9 @@ function addMultiUI(node, { autoAddPair = true } = {}) {
   randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
   if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
 
+  // Plotter-only: strength-mode toggle + global-strengths popup.
+  if (isPlotter) addPlotterControls(node);
+
   const barDom = buildModelBar(node);
   const barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false });
   barWidget.serializeValue = () => undefined;
@@ -969,6 +1065,104 @@ function addMultiUI(node, { autoAddPair = true } = {}) {
 
   node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
   snapHeight(node);
+}
+
+// ===========================================================================
+// Plotter controls — strength-mode toggle + global-strengths popup
+// ===========================================================================
+
+function updatePlotterLabels(node) {
+  const global = node.__plotMode === "global";
+  if (node.__lflPlotModeBtn) node.__lflPlotModeBtn.label = `📊 Strength mode: ${global ? "Global (sweep)" : "Per-line"}`;
+  if (node.__lflPlotGsBtn) {
+    const list = node.__globalStrengths || [];
+    node.__lflPlotGsBtn.label = `🎚 Global strengths: ${list.length ? list.join(", ") : "(none)"}`;
+  }
+  node.setDirtyCanvas?.(true, false);
+}
+
+function addPlotterControls(node) {
+  const modeBtn = node.addWidget("button", "lfl_plot_mode", null, () => {
+    node.__plotMode = node.__plotMode === "global" ? "perline" : "global";
+    syncData(node);
+    updatePlotterLabels(node);
+    node.__lflRender?.();                 // re-render rows to grey/ungrey strengths
+    node.setDirtyCanvas(true, true);
+  });
+  modeBtn.serialize = false; if (modeBtn.options) modeBtn.options.serialize = false; modeBtn.serializeValue = () => undefined;
+  node.__lflPlotModeBtn = modeBtn;
+
+  const gsBtn = node.addWidget("button", "lfl_plot_gs", null, (_v, _c, _n, _p, event) => showGlobalStrengthsPanel(node, event));
+  gsBtn.serialize = false; if (gsBtn.options) gsBtn.options.serialize = false; gsBtn.serializeValue = () => undefined;
+  node.__lflPlotGsBtn = gsBtn;
+
+  updatePlotterLabels(node);
+}
+
+let openStrengthsPanel = null;
+function closeStrengthsPanel() { if (openStrengthsPanel) { openStrengthsPanel.dispose(); openStrengthsPanel = null; } }
+
+function showGlobalStrengthsPanel(node, event) {
+  if (openStrengthsPanel?.node === node) { closeStrengthsPanel(); return; }
+  closeStrengthsPanel();
+  injectStyles();
+
+  const panel = document.createElement("div"); panel.className = "lfl-panel";
+  const header = document.createElement("div"); header.className = "lfl-header";
+  header.innerHTML = `<span class="lfl-title">Global strengths</span>`;
+  const close = document.createElement("span"); close.className = "lfl-close"; close.textContent = "✕";
+  header.appendChild(close); panel.appendChild(header);
+
+  const hint = document.createElement("div");
+  hint.style.cssText = "padding:5px 8px;opacity:.6;font-size:11px;border-bottom:1px solid var(--border-color,#444);";
+  hint.textContent = "Up to 10 values. Blank lines are skipped. Each enabled lora is swept across these (Global mode only).";
+  panel.appendChild(hint);
+
+  const body = document.createElement("div");
+  body.style.cssText = "padding:6px 8px;display:grid;grid-template-columns:auto 1fr;gap:4px 8px;align-items:center;overflow:auto;";
+  const cur = node.__globalStrengths || [];
+  const inputs = [];
+  for (let i = 0; i < 10; i++) {
+    const lab = document.createElement("span"); lab.textContent = String(i + 1); lab.style.cssText = "opacity:.5;text-align:right;";
+    const inp = document.createElement("input"); inp.type = "number"; inp.step = "0.05";
+    inp.value = cur[i] != null ? String(cur[i]) : "";
+    inp.placeholder = "—";
+    inp.style.cssText = "width:100%;box-sizing:border-box;background:var(--comfy-input-bg,#2a2a2a);color:inherit;border:1px solid var(--border-color,#555);border-radius:3px;font:inherit;padding:2px 5px;";
+    inp.addEventListener("pointerdown", e => e.stopPropagation());
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") apply(); });
+    inputs.push(inp);
+    body.appendChild(lab); body.appendChild(inp);
+  }
+  panel.appendChild(body);
+
+  const collect = () => inputs.map(i => i.value.trim()).filter(v => v !== "").map(Number).filter(n => !isNaN(n));
+  const apply = () => {
+    node.__globalStrengths = collect();
+    syncData(node);
+    updatePlotterLabels(node);
+    node.__lflRender?.();
+    closeStrengthsPanel();
+  };
+
+  const actions = document.createElement("div"); actions.className = "lfl-actions";
+  const mkBtn = (label, fn) => { const b = document.createElement("button"); b.className = "lfl-btn"; b.textContent = label; b.addEventListener("click", fn); actions.appendChild(b); };
+  mkBtn("Apply", apply);
+  mkBtn("Clear", () => { inputs.forEach(i => (i.value = "")); });
+  panel.appendChild(actions);
+
+  // ✕ and Escape discard; clicking away keeps what's typed (applies).
+  close.addEventListener("click", closeStrengthsPanel);
+
+  document.body.appendChild(panel);
+  const x = event?.clientX ?? window.innerWidth / 2, y = event?.clientY ?? window.innerHeight / 3;
+  const rect = panel.getBoundingClientRect();
+  panel.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  panel.style.top  = `${Math.max(8, Math.min(y + 6, window.innerHeight - rect.height - 8))}px`;
+
+  const onPD = e => { if (!panel.contains(e.target)) apply(); };
+  const onKD = e => { if (e.key === "Escape") closeStrengthsPanel(); };
+  setTimeout(() => { document.addEventListener("pointerdown", onPD, true); document.addEventListener("keydown", onKD, true); }, 0);
+  openStrengthsPanel = { el: panel, node, dispose: () => { document.removeEventListener("pointerdown", onPD, true); document.removeEventListener("keydown", onKD, true); panel.remove(); } };
 }
 
 // ===========================================================================
@@ -1010,19 +1204,52 @@ app.registerExtension({
   },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (!ALL_NODE_NAMES.includes(nodeData?.name)) return;
-    const isMulti   = isMultiLike(nodeData.name);
-    const isPlotter = nodeData.name === PLOT_NODE_NAME;
+    const nm = nodeData?.name;
+    const isSaver = nm === SAVER_NODE_NAME;
+    if (!ALL_NODE_NAMES.includes(nm) && !isSaver) return;
 
     nodeType.color   = NODE_COLOR;
     nodeType.bgcolor = NODE_BGCOLOR;
+
+    // Saver node: set wider width, wire the constrain group UI, then exit.
+    if (isSaver) {
+      const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        origOnNodeCreated?.apply(this, arguments);
+        this.size = [SAVER_WIDTH, this.size?.[1] ?? 320];
+        try { _setupSaverUI(this); } catch (err) { console.warn("[FantasticLoraLoader] saver UI build failed", err); }
+      };
+
+      const origOnConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        origOnConfigure?.apply(this, arguments);
+        // Restore grey-out and classic grid button state after workflow values are loaded.
+        try {
+          const constrainW = this.widgets?.find(w => w.name === "constrain_size");
+          const maxSideW   = this.widgets?.find(w => w.name === "max_cell_size");
+          const classicW   = this.widgets?.find(w => w.name === "classic_grid");
+          if (constrainW && maxSideW) {
+            maxSideW.disabled = !constrainW.value;
+          }
+          if (classicW) {
+            this.__classicGrid = !!classicW.value;
+            updateClassicGridLabel(this);
+          }
+          this.setDirtyCanvas(true, false);
+        } catch (err) { console.warn("[FantasticLoraLoader] saver onConfigure failed", err); }
+      };
+      return;
+    }
+
+    const isMulti   = isMultiLike(nm);
+    const isPlotter = nm === PLOT_NODE_NAME;
 
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       origOnNodeCreated?.apply(this, arguments);
       this.size = [DEFAULT_WIDTH, 180];
       // Plotter uses the multi-model UI but starts with a single model path.
-      try { isMulti ? addMultiUI(this, { autoAddPair: !isPlotter }) : addUI(this); }
+      try { isMulti ? addMultiUI(this, { autoAddPair: !isPlotter, isPlotter }) : addUI(this); }
       catch (err) { console.warn("[FantasticLoraLoader] UI build failed", err); }
     };
 
@@ -1037,13 +1264,14 @@ app.registerExtension({
       origOnConfigure?.apply(this, arguments);
       try {
         if (isMulti) {
-          if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: !isPlotter });
+          if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: !isPlotter, isPlotter });
           this.properties.extra_model_count = countExtraModelInputs(this);
           updateModelBar(this);
         } else {
           if (!this.__lflBuilt) addUI(this);
         }
         loadStackFromData(this);
+        if (isPlotter) updatePlotterLabels(this);
         // Serialized node width already reflects any randomizer bump — sync the
         // counter so the next commit doesn't add it again.
         this.__lflLastRandCount = (this.__loraStack || []).filter(e => e.random).length;
