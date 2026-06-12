@@ -116,7 +116,7 @@ Internal class name `FantasticLoraPlotter`. Found in **loaders** alongside the o
 
 The Plotter is a sweep node: instead of applying all enabled loras as a single combined stack, it applies each lora **individually** to the base model and emits the results as a list — one generation per cell. Connect it to a KSampler → VAE Decode → Fantastic Plotter Image Saver (see below) and ComfyUI will automatically run the downstream graph once per cell, producing a grid of images.
 
-Inputs are identical to the Multi-Model loader: a primary MODEL + optional CLIP, plus up to four additional optional MODEL paths. The stack UI is the same — add, reorder, enable/disable, randomize. There's also an optional **`global_loras`** input — connect a Fantastic Plotter Global Lora node here to apply a fixed set of "background" loras to every swept cell in addition to the cell's own lora/strength.
+Inputs are identical to the Multi-Model loader: a primary MODEL + optional CLIP, plus up to four additional optional MODEL paths. The stack UI is the same — add, reorder, enable/disable, randomize. There's also an optional **`global_loras`** input — connect a Fantastic Plotter Global Lora node here to apply a fixed set of "background" loras to every swept cell in addition to the cell's own lora/strength. The Plotter has a **🌐 Add Global Lora node (connected)** button that drops one into the graph (to the left of the Plotter) with its output already wired to this input; the button greys out to "Global Lora node connected" once one is attached.
 
 ### Strength modes
 
@@ -155,7 +155,9 @@ Internal class name `FantasticPlotterImageSaver`. Combines three nodes into one:
 2. **Image List to Image Batch** (comfyui-impact-pack) — resizes cells to a common size and stacks them into a batch
 3. **FL Image Batch To Grid** (comfyui_fill-nodes) — composes the batch into a single grid image
 
-Connect the Plotter's `MODEL` list → KSampler → VAE Decode → `images`, and the Plotter's `metadata` list → `metadata`. The node outputs a single `grid` IMAGE you can pass to any Save Image node.
+Connect the Plotter's `MODEL` list → KSampler → VAE Decode → `images`, and the Plotter's `metadata` list → `metadata`. The node outputs the composed `grid` IMAGE (pass it to any Save Image node), plus three passthroughs — `images` (the per-cell list it received, clean/full-res), `metadata`, and `global_loras_info` — so a Grid Viewer (or anything needing the raw cells) can hang off this node instead of re-tapping the source wires.
+
+The node also has an **🔍 Add Grid Viewer (connected)** button: click it to drop a Fantastic Plotter Grid Viewer into the graph just to the right of the Saver, with its `images`, `metadata`, and `global_loras_info` inputs already wired to the Saver's matching passthrough outputs. (If the button can't find those outputs, the Saver node predates them — delete and re-add it.)
 
 ### Controls
 
@@ -214,6 +216,30 @@ When a Global Lora node is connected to the Plotter's `global_loras` input:
 - Disconnecting the Global Lora node re-enables the Plotter's own control toggle.
 - The global loras are applied **after** each swept cell's own lora, stacking on top of it. For example, if the Plotter is sweeping `character_v2` at strengths 0.5 and 1.0, and the Global node has `style_painterly` at 0.8, the saver sees four cells: character_v2 + painterly at 0.5, character_v2 + painterly at 1.0, and (if both controls are on) pure base, and painterly-only.
 
+## Fantastic Plotter Grid Viewer 🔍
+
+Internal class name `FantasticPlotterGridViewer`. Found in **loaders**. This is the interactive twin of the Image Saver — a terminal display node (like the built-in Preview Image, but with far more interaction).
+
+### How to wire it
+
+The viewer needs the **individual** cell images, not the Saver's already-composed grid (you can't pull cells back out of a flattened image). The easiest way to wire it is straight off the **Image Saver**, which passes the per-cell data through:
+
+- `images` ← the Saver's **`images`** output (the per-cell list it received, passed through clean/full-res — *not* the composed `grid`)
+- `metadata` ← the Saver's **`metadata`** output
+- `global_loras_info` (optional) ← the Saver's **`global_loras_info`** output
+
+(You can also tap those three directly from the VAE Decode + Plotter if you prefer; the Saver passthrough just keeps everything coming from one node.) Connect VAE Decode → Image Saver, then Image Saver → Grid Viewer. The Saver still gives you a flat PNG via its `grid` output to save; the Viewer gives you the interactive board.
+
+### Interactions
+
+- **Graph layout** — cells are laid out as a lora × strength grid (rows = loras, columns = strengths), with control images in their own labeled rows at the top, mirroring the Saver's look. The global loras are listed in a strip across the top.
+- **Hide / show rows and columns** — every row and column header has a ✕ to hide it. Hidden rows appear as chips beneath the grid (and hidden columns as chips in the top-left corner); click a chip or **Reset filters** to bring them back. This lets you focus on a subset without re-running the graph.
+- **Click to zoom** — click any cell and it grows out of the grid into a large centered view with its full metadata (lora, strength, globals). Click anywhere off the image and it shrinks back into its place in the grid.
+- **Select & compare** — each cell has a checkbox in its corner. Tick two or more, then hit **Compare (N)** to see them side by side, each captioned with exactly what the Plotter used for that image (lora name, strength, and any global loras). **Clear selection** resets the ticks.
+- **Thumbnail size** — a slider in the toolbar scales every cell live.
+
+The node is freely resizable; the grid scrolls inside it. A standalone `grid_viewer_demo.html` (openable in any browser) is included for previewing the interactions outside ComfyUI.
+
 ## How it works
 
 - **Backend** (`nodes.py`): parses the stack JSON, resolves lora paths via `folder_paths.get_full_path`, loads with `comfy.utils.load_torch_file` (cached per path), applies via `comfy.sd.load_lora_for_models`. The stack is carried in a hidden `lora_data` STRING widget so it reaches Python and serializes with the workflow. CLIP is declared in `INPUT_TYPES["optional"]` so an unconnected input arrives as `None`. Auto-roll lines are re-randomized at execution time; `IS_CHANGED` returns a random token whenever an active auto-roll line exists to prevent ComfyUI from caching the result.
@@ -221,6 +247,7 @@ When a Global Lora node is connected to the Plotter's `global_loras` input:
   - **Image Saver:** receives lists of images and metadata, splits control cells out, optionally constrains size, then renders either an overlay-label style or a classic XY-grid layout (with control rows at the top) into a single grid image. Control cell metadata (`control` and `control_global`) are handled as special labels.
 - **API route**: `GET /lora_folder_loader/loras` serves the lora filename list to the frontend.
 - **Frontend** (`web/lora_folder_loader.js`): DOM widgets for lora rows, folder filter panel, lora chooser panel, and per-line randomizer folder panel. Favourites are stored in `localStorage` under the key `fll_favorites`. Tooltips are custom DOM elements (instant, teal-bordered) rather than native browser title attributes. The Plotter adds global-strength controls and a control-image toggle (disabled when a Global Lora node is attached). The Global Lora node uses the same stack UI as the loaders but adds two control toggles.
+- **Grid Viewer frontend** (`web/plotter_grid_viewer.js`): a separate extension. The Python node (`OUTPUT_NODE`) saves each cell to the temp folder and returns `{"ui": {"fl_cells": [...refs+metadata], "fl_global": [...]}}`; the frontend reads this in `onExecuted` and builds the interactive grid in an `addDOMWidget` container. All zoom / filter / compare interaction is pure DOM with no extra round-trips to the server.
 
 ## Notes
 

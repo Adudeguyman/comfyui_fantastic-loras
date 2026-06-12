@@ -21,6 +21,7 @@ const MULTI_NODE_NAME = "FantasticLoraLoaderMulti";
 const PLOT_NODE_NAME  = "FantasticLoraPlotter";
 const SAVER_NODE_NAME = "FantasticPlotterImageSaver";
 const GLOBAL_NODE_NAME = "FantasticPlotterGlobalLora";
+const VIEWER_NODE_NAME = "FantasticPlotterGridViewer";
 const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME, PLOT_NODE_NAME];
 
 // Nodes that use the multi-model UI (stack + dynamic model-path bar).
@@ -917,6 +918,8 @@ function addGlobalLoraUI(node) {
     node.__ctrlNone = !!v; syncData(node); node.setDirtyCanvas(true, true);
   }, { on: "On", off: "Off" });
   t1.label = "Control Image (no loras applied)";
+  t1.tooltip = "Adds one baseline image with no loras applied at all — neither the plotter's "
+    + "swept loras nor these global loras (the raw base model).";
   t1.serialize = false; if (t1.options) t1.options.serialize = false; t1.serializeValue = () => undefined;
   node.__lflGCtrlNoneW = t1;
 
@@ -924,6 +927,8 @@ function addGlobalLoraUI(node) {
     node.__ctrlGlobal = !!v; syncData(node); node.setDirtyCanvas(true, true);
   }, { on: "On", off: "Off" });
   t2.label = "Control Image (global loras applied)";
+  t2.tooltip = "Adds one baseline image with only these global loras applied — none of the "
+    + "plotter's swept stack loras — so you can see what the global loras contribute on their own.";
   t2.serialize = false; if (t2.options) t2.options.serialize = false; t2.serializeValue = () => undefined;
   node.__lflGCtrlGlobalW = t2;
 
@@ -940,6 +945,12 @@ function updatePlotterControlState(node) {
   if (w) {
     if (connected) { node.__controlImage = false; w.value = false; w.disabled = true; }
     else { w.disabled = false; w.value = !!node.__controlImage; }
+  }
+  if (node.__lflAddGlobalBtn) {
+    node.__lflAddGlobalBtn.disabled = connected;
+    node.__lflAddGlobalBtn.label = connected
+      ? "\uD83C\uDF10 Global Lora node connected"
+      : "\uD83C\uDF10 Add Global Lora node";
   }
   updatePlotterLabels(node);
   syncData(node);
@@ -1033,6 +1044,92 @@ function updateClassicGridLabel(node) {
   node.setDirtyCanvas?.(true, false);
 }
 
+// Drop a Grid Viewer node into the graph and wire the Saver's three passthrough
+// outputs (images / metadata / global_loras_info) straight into it.
+function spawnConnectedViewer(saverNode) {
+  const LG = (typeof LiteGraph !== "undefined") ? LiteGraph : window.LiteGraph;
+  const graph = saverNode.graph;
+  if (!LG || !graph) { console.warn("[FantasticLoraLoader] cannot add viewer — graph unavailable"); return; }
+
+  const viewer = LG.createNode("FantasticPlotterGridViewer");
+  if (!viewer) { console.warn("[FantasticLoraLoader] Grid Viewer node type not registered"); return; }
+  graph.add(viewer);
+
+  // Place it just to the right of the saver, top-aligned.
+  const sw = (saverNode.size && saverNode.size[0]) || 400;
+  viewer.pos = [saverNode.pos[0] + sw + 60, saverNode.pos[1]];
+
+  const outIdx = (name) => (saverNode.outputs || []).findIndex((o) => o.name === name);
+  const inIdx  = (name) => (viewer.inputs || []).findIndex((i) => i.name === name);
+  const wire = (outName, inName) => {
+    const o = outIdx(outName), i = inIdx(inName);
+    if (o >= 0 && i >= 0) saverNode.connect(o, viewer, i);
+    else console.warn(`[FantasticLoraLoader] could not wire ${outName} → ${inName}`,
+                      "(re-add the Saver node if it predates the passthrough outputs)");
+  };
+  wire("images", "images");
+  wire("metadata", "metadata");
+  wire("global_loras_info", "global_loras_info");
+
+  try { updateSaverViewerBtn(saverNode); } catch (_) {}
+  graph.setDirtyCanvas(true, true);
+}
+
+// True if any of the Saver's outputs links to a Grid Viewer node.
+function isViewerConnected(saverNode) {
+  const graph = saverNode.graph;
+  if (!graph) return false;
+  for (const out of (saverNode.outputs || [])) {
+    if (!out || !out.links) continue;
+    for (const lid of out.links) {
+      const link = graph.links?.[lid];
+      if (!link) continue;
+      const tgt = graph.getNodeById?.(link.target_id);
+      if (tgt && tgt.type === VIEWER_NODE_NAME) return true;
+    }
+  }
+  return false;
+}
+
+// Grey out / relabel the Saver's "Add Grid Viewer" button based on whether one
+// is already connected downstream.
+function updateSaverViewerBtn(node) {
+  const btn = node.__lflAddViewerBtn;
+  if (!btn) return;
+  const connected = isViewerConnected(node);
+  btn.disabled = connected;
+  btn.label = connected
+    ? "\uD83D\uDD0D Grid Viewer connected"
+    : "\uD83D\uDD0D Add Grid Viewer";
+  node.setDirtyCanvas(true, false);
+}
+
+// Drop a Global Lora node into the graph (to the left of the Plotter) and wire
+// its global_loras output into the Plotter's global_loras input.
+function spawnConnectedGlobalLora(plotterNode) {
+  const LG = (typeof LiteGraph !== "undefined") ? LiteGraph : window.LiteGraph;
+  const graph = plotterNode.graph;
+  if (!LG || !graph) { console.warn("[FantasticLoraLoader] cannot add global lora — graph unavailable"); return; }
+  // Already fed? Don't add a second one.
+  const gIn = (plotterNode.inputs || []).find((i) => i?.name === "global_loras");
+  if (gIn && gIn.link != null) { console.warn("[FantasticLoraLoader] a Global Lora node is already connected"); return; }
+
+  const gnode = LG.createNode(GLOBAL_NODE_NAME);
+  if (!gnode) { console.warn("[FantasticLoraLoader] Global Lora node type not registered"); return; }
+  graph.add(gnode);
+
+  const gw = (gnode.size && gnode.size[0]) || 360;
+  gnode.pos = [plotterNode.pos[0] - gw - 60, plotterNode.pos[1]];
+
+  const o = (gnode.outputs || []).findIndex((x) => x.name === "global_loras");
+  const i = (plotterNode.inputs || []).findIndex((x) => x.name === "global_loras");
+  if (o >= 0 && i >= 0) gnode.connect(o, plotterNode, i);
+  else console.warn("[FantasticLoraLoader] could not wire global_loras (re-add the Plotter if it predates this input)");
+
+  try { updatePlotterControlState(plotterNode); } catch (_) {}
+  graph.setDirtyCanvas(true, true);
+}
+
 function _setupSaverUI(node) {
   if (node.__lflSaverBuilt) return;
   node.__lflSaverBuilt = true;
@@ -1079,6 +1176,22 @@ function _setupSaverUI(node) {
     node.__lflClassicGridBtn = classicBtn;
     updateClassicGridLabel(node);
   }
+
+  // ── One-click: drop a connected Grid Viewer ──
+  const viewerBtn = node.addWidget("button", "lfl_add_viewer", null, () => {
+    if (isViewerConnected(node)) return;   // already has one
+    try { spawnConnectedViewer(node); }
+    catch (err) { console.warn("[FantasticLoraLoader] add viewer failed", err); }
+  });
+  viewerBtn.label = "\uD83D\uDD0D Add Grid Viewer";
+  viewerBtn.tooltip = "Adds a Fantastic Plotter Grid Viewer node and connects it here — "
+    + "an interactive board showing every generated image laid out as a grid, with zoom, "
+    + "row/column filtering, favourites and side-by-side comparison.";
+  viewerBtn.serialize = false;
+  if (viewerBtn.options) viewerBtn.options.serialize = false;
+  viewerBtn.serializeValue = () => undefined;
+  node.__lflAddViewerBtn = viewerBtn;
+  updateSaverViewerBtn(node);
 }
 
 function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
@@ -1171,8 +1284,24 @@ function addPlotterControls(node) {
     syncData(node);
     node.setDirtyCanvas(true, true);
   }, { on: "On", off: "Off" });
+  ctrlToggle.tooltip = "Adds one extra baseline image with no loras applied at all (the raw "
+    + "base model), so you can compare every swept result against an untouched generation.";
   ctrlToggle.serialize = false; if (ctrlToggle.options) ctrlToggle.options.serialize = false; ctrlToggle.serializeValue = () => undefined;
   node.__lflPlotControlBtn = ctrlToggle;
+
+  const addGlobalBtn = node.addWidget("button", "lfl_add_global", null, () => {
+    if (node.__globalLoraConnected) return;   // greyed out when one is already connected
+    try { spawnConnectedGlobalLora(node); }
+    catch (err) { console.warn("[FantasticLoraLoader] add global lora failed", err); }
+  });
+  addGlobalBtn.label = "\uD83C\uDF10 Add Global Lora node";
+  addGlobalBtn.tooltip = "Adds a Fantastic Plotter Global Lora node and connects it here. "
+    + "Any loras you select in that node apply globally — they're added on top of every image "
+    + "the plotter generates, in addition to each swept cell's own lora.";
+  addGlobalBtn.serialize = false;
+  if (addGlobalBtn.options) addGlobalBtn.options.serialize = false;
+  addGlobalBtn.serializeValue = () => undefined;
+  node.__lflAddGlobalBtn = addGlobalBtn;
 
   updatePlotterLabels(node);
 }
@@ -1328,6 +1457,12 @@ app.registerExtension({
         try { _setupSaverUI(this); } catch (err) { console.warn("[FantasticLoraLoader] saver UI build failed", err); }
       };
 
+      const origSaverOCC = nodeType.prototype.onConnectionsChange;
+      nodeType.prototype.onConnectionsChange = function () {
+        origSaverOCC?.apply(this, arguments);
+        setTimeout(() => { try { updateSaverViewerBtn(this); } catch (_) {} }, 0);
+      };
+
       const origOnConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
         origOnConfigure?.apply(this, arguments);
@@ -1352,6 +1487,7 @@ app.registerExtension({
             this.__classicGrid = !!classicW.value;
             updateClassicGridLabel(this);
           }
+          updateSaverViewerBtn(this);
           this.setDirtyCanvas(true, false);
         } catch (err) { console.warn("[FantasticLoraLoader] saver onConfigure failed", err); }
       };

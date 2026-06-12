@@ -30,6 +30,7 @@ import json
 import os
 import re
 import math
+import random
 
 import folder_paths
 import comfy.utils
@@ -922,8 +923,12 @@ class FantasticPlotterImageSaver:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("grid",)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("grid", "images", "metadata", "global_loras_info")
+    # grid is the single composed image; images/metadata are the per-cell lists
+    # passed straight through (so the Grid Viewer can hang off this node), and
+    # global_loras_info is the same newline-joined summary string it received.
+    OUTPUT_IS_LIST = (False, True, True, False)
     FUNCTION = "compose"
     CATEGORY = "loaders"
     TITLE = "Fantastic Plotter Image Saver"
@@ -961,7 +966,7 @@ class FantasticPlotterImageSaver:
 
         if not images:
             # Nothing to compose — hand back a 1x1 black pixel so nothing crashes.
-            return (torch.zeros((1, 1, 1, 3), dtype=torch.float32),)
+            return (torch.zeros((1, 1, 1, 3), dtype=torch.float32), [], [], str(gli or ""))
 
         # Align metadata to images: broadcast a single string, else pad/truncate.
         if len(metadata) == 1 and len(images) > 1:
@@ -972,6 +977,13 @@ class FantasticPlotterImageSaver:
             print(f"[FantasticPlotterImageSaver] metadata ({len(metadata)}) > images "
                   f"({len(images)}); extra labels ignored.")
             metadata = metadata[:len(images)]
+
+        # Passthrough copies — the clean, pre-constrain per-cell images and their
+        # aligned metadata, so a downstream Grid Viewer gets full-quality cells
+        # regardless of how the grid itself is composed below.
+        passthrough_images = list(images)
+        passthrough_meta = list(metadata)
+        passthrough_global = str(gli or "")
 
         # Constrain: scale each cell so its longest side = max_side (only when on).
         if constrain:
@@ -1011,7 +1023,7 @@ class FantasticPlotterImageSaver:
                                       global_lines=global_lines)
             if grid is not None:
                 print(f"[FantasticPlotterImageSaver] classic grid {tuple(grid.shape)}")
-                return (grid,)
+                return (grid, passthrough_images, passthrough_meta, passthrough_global)
             print("[FantasticPlotterImageSaver] classic grid needs a full lora x strength "
                   "rectangle — falling back to overlay.")
 
@@ -1043,7 +1055,7 @@ class FantasticPlotterImageSaver:
               f"{per_row} per row -> grid {tuple(grid.shape)}"
               + (f" (+{len(control_pairs)} control row(s))" if control_pairs else "")
               + (" (+global loras strip)" if global_lines else ""))
-        return (grid,)
+        return (grid, passthrough_images, passthrough_meta, passthrough_global)
 
 
 # ===========================================================================
@@ -1065,6 +1077,10 @@ class FantasticPlotterGlobalLora:
     FUNCTION = "collect"
     CATEGORY = "loaders"
     TITLE = "Fantastic Plotter Global Lora"
+    DESCRIPTION = ("Loras selected here apply globally — they are added on top of every "
+                   "image the Fantastic Lora Plotter generates, in addition to each swept "
+                   "cell's own lora. Connect this node's output to the Plotter's "
+                   "global_loras input (or use the Plotter's 'Add Global Lora node' button).")
 
     @classmethod
     def IS_CHANGED(cls, lora_data="{}"):
@@ -1087,12 +1103,109 @@ class FantasticPlotterGlobalLora:
         return (payload,)
 
 
+# ===========================================================================
+# Fantastic Plotter Grid Viewer
+# ===========================================================================
+# An interactive, terminal (OUTPUT_NODE) display node — the interactive twin of
+# the Image Saver. It taps the SAME per-cell wires the Saver receives (the
+# decoded IMAGE list + the Plotter's metadata, and optionally global_loras_info)
+# and saves each cell to the temp folder, then hands the frontend a parallel
+# list of {image ref, metadata}. All the layout/zoom/filter/compare interaction
+# happens in web/plotter_grid_viewer.js — Python only persists the cells.
+
+class FantasticPlotterGridViewer:
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_flgrid_" + "".join(
+            random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(6))
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "metadata": ("STRING", {"forceInput": True}),
+            },
+            "optional": {
+                "global_loras_info": ("STRING", {"forceInput": True}),
+            },
+        }
+
+    INPUT_IS_LIST = True
+    RETURN_TYPES = ()
+    FUNCTION = "view"
+    OUTPUT_NODE = True
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Plotter Grid Viewer"
+
+    @staticmethod
+    def _first(v, default=None):
+        if isinstance(v, list):
+            return v[0] if v else default
+        return v if v is not None else default
+
+    def view(self, images, metadata, global_loras_info=None):
+        # Normalise inputs. With INPUT_IS_LIST every arg arrives as a list; the
+        # plotter emits one [1,H,W,C] tensor per cell and one metadata string per
+        # cell, already index-aligned.
+        if images is None:
+            images = []
+        if not isinstance(metadata, list):
+            metadata = [metadata] if metadata is not None else []
+
+        ginfo = self._first(global_loras_info, "") or ""
+        global_lines = [ln for ln in str(ginfo).split("\n") if ln.strip()]
+
+        # Flatten any batched cells into individual frames, keeping metadata aligned.
+        frames = []
+        for idx, img in enumerate(images):
+            meta = metadata[idx] if idx < len(metadata) else ""
+            if img is None:
+                continue
+            arr = img
+            if getattr(arr, "ndim", 0) == 4:
+                for b in range(arr.shape[0]):
+                    frames.append((arr[b], meta))
+            else:
+                frames.append((arr, meta))
+
+        results = []
+        if frames:
+            h = int(frames[0][0].shape[0])
+            w = int(frames[0][0].shape[1])
+            full_output_folder, filename, counter, subfolder, _pref = \
+                folder_paths.get_save_image_path(
+                    "ComfyUI" + self.prefix_append, self.output_dir, w, h)
+
+            for (tensor, meta) in frames:
+                a = 255.0 * tensor.cpu().numpy()
+                pil = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+                file = f"{filename}_{counter:05}_.png"
+                pil.save(os.path.join(full_output_folder, file), compress_level=1)
+                results.append({
+                    "filename": file,
+                    "subfolder": subfolder,
+                    "type": self.type,
+                    "metadata": str(meta),
+                })
+                counter += 1
+
+        # The frontend reads fl_cells (image refs + per-cell metadata) and
+        # fl_global (the global loras summary) in onExecuted.
+        return {"ui": {
+            "fl_cells": results,
+            "fl_global": global_lines,
+        }}
+
+
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
     "FantasticPlotterGlobalLora": FantasticPlotterGlobalLora,
     "FantasticPlotterImageSaver": FantasticPlotterImageSaver,
+    "FantasticPlotterGridViewer": FantasticPlotterGridViewer,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
@@ -1100,6 +1213,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraPlotter":     "Fantastic Lora Plotter 📊",
     "FantasticPlotterGlobalLora": "Fantastic Plotter Global Lora 🌐",
     "FantasticPlotterImageSaver": "Fantastic Plotter Image Saver 📊",
+    "FantasticPlotterGridViewer": "Fantastic Plotter Grid Viewer 🔍",
 }
 
 
