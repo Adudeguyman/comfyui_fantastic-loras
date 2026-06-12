@@ -116,7 +116,7 @@ Internal class name `FantasticLoraPlotter`. Found in **loaders** alongside the o
 
 The Plotter is a sweep node: instead of applying all enabled loras as a single combined stack, it applies each lora **individually** to the base model and emits the results as a list — one generation per cell. Connect it to a KSampler → VAE Decode → Fantastic Plotter Image Saver (see below) and ComfyUI will automatically run the downstream graph once per cell, producing a grid of images.
 
-Inputs are identical to the Multi-Model loader: a primary MODEL + optional CLIP, plus up to four additional optional MODEL paths. The stack UI is the same — add, reorder, enable/disable, randomize.
+Inputs are identical to the Multi-Model loader: a primary MODEL + optional CLIP, plus up to four additional optional MODEL paths. The stack UI is the same — add, reorder, enable/disable, randomize. There's also an optional **`global_loras`** input — connect a Fantastic Plotter Global Lora node here to apply a fixed set of "background" loras to every swept cell in addition to the cell's own lora/strength.
 
 ### Strength modes
 
@@ -132,6 +132,10 @@ The Plotter adds two buttons below the lora stack:
 **🎚 Global strengths** opens a popup with 10 individual number fields. Blanks are skipped; order and duplicates are preserved. The button face shows the active list. Both the mode and the strength list serialize inside `lora_data` and save with the workflow.
 
 Per-line strength inputs are greyed out while Global mode is active.
+
+### Control Image
+
+The Plotter has a **Control Image** toggle that adds a baseline generation with zero loras applied, so you can see the pure base model. When a Fantastic Plotter Global Lora node is attached to the `global_loras` input, this toggle is disabled — control is instead driven from the Global Lora node, which has its own two control options (see below).
 
 ### Multi-model sweep
 
@@ -177,11 +181,46 @@ Connect the Plotter's `MODEL` list → KSampler → VAE Decode → `images`, and
 
 When `images_per_row` is `0`, the node reads the `metadata` list and counts the number of **distinct strength values**. That becomes the column count, so Global-mode sweeps automatically lay out as a true XY grid (loras = rows, strengths = columns) without any manual configuration.
 
+---
+
+## Fantastic Plotter Global Lora 🌐
+
+Internal class name `FantasticPlotterGlobalLora`. Found in **loaders** alongside the other nodes.
+
+A companion to the Fantastic Lora Plotter. This node lets you define a set of "global" loras that get applied to every swept cell **in addition to** the cell's own lora. This is useful for exploring how a style lora (e.g., `painterly.safetensors`) interacts with different character or subject loras — the character lora sweeps while the style stays constant.
+
+### Stack and strength
+
+The Global Lora node has the full lora-stack UI: folder filter, favourites, add/remove/reorder loras, per-line strength controls, enable/disable checkboxes. There is **no randomizer** — the list stays fixed for the run.
+
+Each enabled lora runs at its own per-line strength (e.g., if you add `painterly` with strength 0.8 and `texture` with strength 0.5, both run at those fixed strengths on every swept cell). When connected to the Plotter's `global_loras` input, the Plotter's own stack loras sweep across their strengths while these globals stay constant.
+
+### Control images
+
+The Global Lora node has two toggles (not buttons):
+
+| Toggle | Behaviour |
+|---|---|
+| **Control Image (no loras applied)** | When on, the Plotter adds a baseline generation with zero loras — the pure base model, so you see the vanilla output. |
+| **Control Image (global loras applied)** | When on, the Plotter adds a second baseline with only the global loras applied (none of the swept loras). Useful to see what the globals alone contribute. |
+
+Enable both and the grid gains two control-image rows at the top, each repeated across every column.
+
+### Plotter behaviour when attached
+
+When a Global Lora node is connected to the Plotter's `global_loras` input:
+
+- The Plotter's own **Control Image** toggle is **disabled** and relabeled "Set control on Global Lora Node" — control is now driven entirely by the Global Lora node's two toggles.
+- Disconnecting the Global Lora node re-enables the Plotter's own control toggle.
+- The global loras are applied **after** each swept cell's own lora, stacking on top of it. For example, if the Plotter is sweeping `character_v2` at strengths 0.5 and 1.0, and the Global node has `style_painterly` at 0.8, the saver sees four cells: character_v2 + painterly at 0.5, character_v2 + painterly at 1.0, and (if both controls are on) pure base, and painterly-only.
+
 ## How it works
 
 - **Backend** (`nodes.py`): parses the stack JSON, resolves lora paths via `folder_paths.get_full_path`, loads with `comfy.utils.load_torch_file` (cached per path), applies via `comfy.sd.load_lora_for_models`. The stack is carried in a hidden `lora_data` STRING widget so it reaches Python and serializes with the workflow. CLIP is declared in `INPUT_TYPES["optional"]` so an unconnected input arrives as `None`. Auto-roll lines are re-randomized at execution time; `IS_CHANGED` returns a random token whenever an active auto-roll line exists to prevent ComfyUI from caching the result.
+  - **Plotter sweep:** the Plotter applies each enabled lora individually to a copy of the base model (not stacked), emitting one model+metadata pair per cell. If a Global Lora node is attached, its loras are then stacked on top of each swept cell's result. Control images (baseline generations with zero or global-only loras) are appended as extra cells.
+  - **Image Saver:** receives lists of images and metadata, splits control cells out, optionally constrains size, then renders either an overlay-label style or a classic XY-grid layout (with control rows at the top) into a single grid image. Control cell metadata (`control` and `control_global`) are handled as special labels.
 - **API route**: `GET /lora_folder_loader/loras` serves the lora filename list to the frontend.
-- **Frontend** (`web/lora_folder_loader.js`): DOM widgets for lora rows, folder filter panel, lora chooser panel, and per-line randomizer folder panel. Favourites are stored in `localStorage` under the key `fll_favorites`. Tooltips are custom DOM elements (instant, teal-bordered) rather than native browser title attributes.
+- **Frontend** (`web/lora_folder_loader.js`): DOM widgets for lora rows, folder filter panel, lora chooser panel, and per-line randomizer folder panel. Favourites are stored in `localStorage` under the key `fll_favorites`. Tooltips are custom DOM elements (instant, teal-bordered) rather than native browser title attributes. The Plotter adds global-strength controls and a control-image toggle (disabled when a Global Lora node is attached). The Global Lora node uses the same stack UI as the loaders but adds two control toggles.
 
 ## Notes
 

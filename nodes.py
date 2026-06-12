@@ -237,10 +237,11 @@ def _apply_one(model, clip, name, model_s, clip_s):
 def _parse_plot_config(lora_data: str):
     """Read plotter-only fields from the payload.
 
-    Returns (mode, global_strengths) where mode is "perline" | "global" and
-    global_strengths is a list of floats (blanks already dropped by the frontend).
+    Returns (mode, global_strengths, control_image) where mode is
+    "perline" | "global", global_strengths is a list of floats (blanks already
+    dropped by the frontend), and control_image is a bool.
     """
-    mode, gstr = "perline", []
+    mode, gstr, control = "perline", [], False
     try:
         data = json.loads(lora_data) if lora_data else {}
     except (ValueError, TypeError):
@@ -255,7 +256,47 @@ def _parse_plot_config(lora_data: str):
                     gstr.append(float(v))
                 except (ValueError, TypeError):
                     pass
-    return mode, gstr
+        control = bool(data.get("controlImage", False))
+    return mode, gstr, control
+
+
+def _parse_global_loras(global_loras):
+    """Normalize the payload from a Fantastic Plotter Global Lora node.
+
+    Returns (loras, control_none, control_global) where loras is a list of
+    (name, model_strength, clip_strength) tuples.
+    """
+    if not isinstance(global_loras, dict):
+        return [], False, False
+    loras = []
+    for g in (global_loras.get("loras") or []):
+        if not isinstance(g, dict):
+            continue
+        name = g.get("name")
+        if not name or name in ("None", "NONE"):
+            continue
+        try:
+            ms = float(g.get("model", 1.0))
+        except (ValueError, TypeError):
+            ms = 1.0
+        try:
+            cs = float(g.get("clip", ms))
+        except (ValueError, TypeError):
+            cs = ms
+        loras.append((name, ms, cs))
+    return (loras,
+            bool(global_loras.get("control_none")),
+            bool(global_loras.get("control_global")))
+
+
+def _apply_global_chain(model, clip, globals_list):
+    """Apply every global lora in sequence on top of (model, clip)."""
+    m, c = model, clip
+    for (name, ms, cs) in globals_list:
+        r = _apply_one(m, c, name, ms, cs)
+        if r is not None:
+            m, c = r
+    return m, c
 
 
 _LORA_DATA_INPUT = (
@@ -367,6 +408,7 @@ class FantasticLoraPlotter:
             "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
             "optional": {
                 "clip":    ("CLIP",),
+                "global_loras": ("FL_GLOBAL_LORAS",),
                 "model_2": ("MODEL",),
                 "model_3": ("MODEL",),
                 "model_4": ("MODEL",),
@@ -374,23 +416,26 @@ class FantasticLoraPlotter:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "MODEL", "MODEL", "MODEL", "MODEL")
-    RETURN_NAMES = ("MODEL", "CLIP", "metadata", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
-    OUTPUT_IS_LIST = (True, True, True, True, True, True, True)
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING", "MODEL", "MODEL", "MODEL", "MODEL")
+    RETURN_NAMES = ("MODEL", "CLIP", "metadata", "global_loras_info", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
+    OUTPUT_IS_LIST = (True, True, True, False, True, True, True, True)
     FUNCTION = "load"
     CATEGORY = "loaders"
     TITLE = "Fantastic Lora Plotter"
 
     @classmethod
-    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
-        # plotMode / globalStrengths live inside lora_data, and the frontend
-        # bakes auto-roll picks into it too, so this re-triggers on any change.
-        return lora_data
+    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, global_loras=None, **kwargs):
+        # plotMode / globalStrengths / controlImage live inside lora_data, and the
+        # frontend bakes auto-roll picks into it too. The global_loras payload is
+        # folded in so a change to the attached Global Lora node re-triggers too.
+        return f"{lora_data}|{global_loras}"
 
-    def load(self, model, lora_data, clip=None,
+    def load(self, model, lora_data, clip=None, global_loras=None,
              model_2=None, model_3=None, model_4=None, model_5=None):
         entries, _enabled = _parse_payload(lora_data)
-        mode, global_strengths = _parse_plot_config(lora_data)
+        mode, global_strengths, control_image = _parse_plot_config(lora_data)
+        g_loras, g_ctrl_none, g_ctrl_global = _parse_global_loras(global_loras)
+        has_global_node = global_loras is not None
 
         # Only enabled, concretely-named lines become cells. Randomizer lines
         # already carry a baked name from the frontend at queue time.
@@ -417,16 +462,43 @@ class FantasticLoraPlotter:
                 if primary is None:
                     continue   # lora not found — skip this cell entirely
                 pm, pc = primary
+                # Global loras apply on top of every swept cell.
+                pm, pc = _apply_global_chain(pm, pc, g_loras)
                 models.append(pm)
                 clips.append(pc)   # None when CLIP isn't connected — that's fine
                 metas.append(f"{_sanitize_lora_name(name)}_{_format_strength(s)}")
 
-                # Extra model paths: same lora/strength applied to each base.
+                # Extra model paths: same lora/strength (+ globals) per base.
                 for i, base in enumerate(extra_bases):
                     if base is None:
                         continue
                     r = _apply_one(base, None, name, s, s)
-                    extras[i].append(r[0] if r is not None else base)
+                    bm = r[0] if r is not None else base
+                    bm, _ = _apply_global_chain(bm, None, g_loras)
+                    extras[i].append(bm)
+
+        # Control cells. When a Global Lora node is attached it drives control
+        # (the plotter's own Control Image toggle is disabled in the UI); we then
+        # honour its two flags. Otherwise the plotter's own Control Image is used.
+        def _append_control(prim_model, prim_clip, label, extra_fn):
+            models.append(prim_model)
+            clips.append(prim_clip)
+            metas.append(label)
+            for i, base in enumerate(extra_bases):
+                if base is not None:
+                    extras[i].append(extra_fn(base))
+
+        if has_global_node:
+            if g_ctrl_none:
+                # Pure base model — no sweep loras, no globals.
+                _append_control(model, clip, "control", lambda b: b)
+            if g_ctrl_global:
+                # Base model + global loras only (none of the stack loras).
+                gm, gc = _apply_global_chain(model, clip, g_loras)
+                _append_control(gm, gc, "control_global",
+                                lambda b: _apply_global_chain(b, None, g_loras)[0])
+        elif control_image:
+            _append_control(model, clip, "control", lambda b: b)
 
         # Nothing applied (no lines, or all not-found): emit one passthrough cell
         # so the downstream graph still runs once instead of hard-failing.
@@ -436,7 +508,13 @@ class FantasticLoraPlotter:
             metas = ["no_lora"]
             extras = [([b] if b is not None else []) for b in extra_bases]
 
-        return (models, clips, metas, extras[0], extras[1], extras[2], extras[3])
+        # Human-readable summary of the global loras for the saver to display
+        # (e.g. "painterly_0.8\ntexture_0.5"). Empty string if none are set.
+        global_loras_info = "\n".join(
+            f"{_sanitize_lora_name(name)}_{_format_strength(ms)}" for (name, ms, _cs) in g_loras
+        )
+
+        return (models, clips, metas, global_loras_info, extras[0], extras[1], extras[2], extras[3])
 
 
 # ===========================================================================
@@ -608,6 +686,19 @@ def _plot_batch_to_grid(batch, per_row):
     return grid.unsqueeze(0)  # [1, rows*h, per_row*w, c]
 
 
+# Control cell tokens emitted by the plotter → the label drawn on their row.
+_CONTROL_LABELS = {
+    "control": "control",
+    "control_global": "Control (with global loras)",
+}
+
+def _is_control_meta(meta):
+    return str(meta) in _CONTROL_LABELS
+
+def _control_label(meta):
+    return _CONTROL_LABELS.get(str(meta), "control")
+
+
 def _plot_parse_name_strength(meta):
     """Split a metadata token into (name, strength_float). strength None if absent."""
     parts = str(meta).rsplit("_", 1)
@@ -619,13 +710,18 @@ def _plot_parse_name_strength(meta):
     return str(meta), None
 
 
-def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, padding):
+def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, padding, control_rows=None, global_lines=None):
     """Classic XY plot: clean cells with labels OUTSIDE on the top/left border.
 
-    Rows = loras (Y axis), columns = strengths (X axis). Returns a [1,H,W,C]
-    tensor, or None if the metadata isn't a clean lora x strength rectangle
-    (caller then falls back to the overlay layout).
+    Rows = loras (Y axis), columns = strengths (X axis). control_rows is an
+    optional list of (label, pil) — each becomes a full row at the top, repeated
+    across every strength column. global_lines is an optional list of strings
+    ("name_strength" per global lora) drawn in the top-left corner box. Returns
+    a [1,H,W,C] tensor, or None if the metadata isn't a clean lora x strength
+    rectangle (caller falls back to overlay).
     """
+    control_rows = control_rows or []
+    global_lines = global_lines or []
     pils = [_plot_tensor_to_pil(im) for im in images]
     W, Hh = pils[0].size
     pils = [p if p.size == (W, Hh) else p.resize((W, Hh)) for p in pils]
@@ -646,8 +742,11 @@ def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, paddin
         b = probe.textbbox((0, 0), s, font=f)
         return b[2] - b[0], b[3] - b[1]
 
+    ctrl_rows = [(lab, (p if p.size == (W, Hh) else p.resize((W, Hh)))) for lab, p in control_rows]
+    n_ctrl = len(ctrl_rows)
+
     col_labels = [f"Strength: {_format_strength(s)}" for s in strengths]
-    row_labels = [str(n) for n in names]
+    row_labels = [lab for lab, _ in ctrl_rows] + [str(n) for n in names]
 
     # Column headers sit above a cell of width W — shrink the header font until
     # the widest one fits, so adjacent headers never overlap on small cells.
@@ -664,7 +763,17 @@ def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, paddin
     left_margin = (max((measure(l, row_font)[0] for l in row_labels), default=0)) + padding * 2
     top_margin = (max((measure(l, col_font)[1] for l in col_labels), default=0)) + padding * 2
 
-    cols, rows = len(strengths), len(names)
+    # Global loras box in the top-left corner — expand margins to fit it.
+    global_font = _plot_get_font(max(8, int(font_size)))
+    global_block = (["Global Loras:"] + global_lines) if global_lines else []
+    if global_block:
+        gw = max((measure(l, global_font)[0] for l in global_block), default=0) + padding * 2
+        gh = sum(measure(l, global_font)[1] + 2 for l in global_block) + padding * 2
+        left_margin = max(left_margin, gw)
+        top_margin = max(top_margin, gh)
+
+    cols = len(strengths)
+    rows = len(names) + n_ctrl
     canvas = Image.new("RGB", (left_margin + cols * W, top_margin + rows * Hh), bg_rgb)
     draw = ImageDraw.Draw(canvas)
 
@@ -678,12 +787,85 @@ def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, paddin
         w_, h_ = measure(lab, row_font)
         draw.text((max(padding, (left_margin - w_) // 2), top_margin + r * Hh + (Hh - h_) // 2),
                   lab, fill=text_rgb, font=row_font)
-    # Clean cells.
+    # Global loras box — top-left corner, left-aligned.
+    if global_block:
+        cy = padding
+        for l in global_block:
+            draw.text((padding, cy), l, fill=text_rgb, font=global_font)
+            cy += measure(l, global_font)[1] + 2
+
+    # Control rows at the top — each image repeated across every strength column.
+    for r, (_lab, cpil) in enumerate(ctrl_rows):
+        for c in range(cols):
+            canvas.paste(cpil, (left_margin + c * W, top_margin + r * Hh))
+    # Lora cells.
     for r, nm in enumerate(names):
         for c, st in enumerate(strengths):
             pil = cell.get((nm, st))
             if pil is not None:
-                canvas.paste(pil, (left_margin + c * W, top_margin + r * Hh))
+                canvas.paste(pil, (left_margin + c * W, top_margin + (r + n_ctrl) * Hh))
+
+    return _plot_pil_to_tensor(canvas)
+
+
+def _plot_add_global_strip(grid, global_lines, text_color, bg_color, font_size, padding):
+    """Prepend a thin full-width strip above the grid listing global loras.
+
+    grid is a [1,H,W,C] tensor; global_lines is a list of "name_strength"
+    strings, joined into "Global Loras: a, b, c" and word-wrapped to the
+    grid's width (shrinking the font first if even a single word overflows).
+    Returns a new [1,H',W,C] tensor with the strip on top.
+    """
+    if not global_lines:
+        return grid
+
+    pil = _plot_tensor_to_pil(grid)
+    W, H = pil.size
+
+    text_rgb = _plot_color_to_rgba(text_color, 1.0)[:3]
+    bg_rgb = _plot_color_to_rgba(bg_color, 1.0)[:3]
+
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    def measure(s, f):
+        b = probe.textbbox((0, 0), s, font=f)
+        return b[2] - b[0], b[3] - b[1]
+
+    header = "Global Loras: " + ", ".join(global_lines)
+    max_w = max(1, W - padding * 2)
+
+    def wrap(text, font):
+        words = text.split(" ")
+        lines, cur = [], ""
+        for w in words:
+            trial = f"{cur} {w}".strip()
+            if measure(trial, font)[0] <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
+
+    # Shrink the font until every wrapped line fits, then wrap at that size.
+    fsize = max(8, int(font_size))
+    f = _plot_get_font(fsize)
+    lines = wrap(header, f)
+    while fsize > 8 and any(measure(l, f)[0] > max_w for l in lines):
+        fsize -= 1
+        f = _plot_get_font(fsize)
+        lines = wrap(header, f)
+
+    line_h = measure("Ag", f)[1]
+    strip_h = len(lines) * (line_h + 2) + padding * 2 - 2
+
+    canvas = Image.new("RGB", (W, H + strip_h), bg_rgb)
+    canvas.paste(pil, (0, strip_h))
+    draw = ImageDraw.Draw(canvas)
+    cy = padding
+    for l in lines:
+        draw.text((padding, cy), l, fill=text_rgb, font=f)
+        cy += line_h + 2
 
     return _plot_pil_to_tensor(canvas)
 
@@ -716,7 +898,7 @@ class FantasticPlotterImageSaver:
                 }),
                 "text_color": (_PLOT_COLOR_OPTIONS, {"default": "white"}),
                 "background_color": (_PLOT_COLOR_OPTIONS, {"default": "black"}),
-                "font_size": ("INT", {"default": 38, "min": 8, "max": 256, "step": 1}),
+                "font_size": ("INT", {"default": 20, "min": 8, "max": 256, "step": 1}),
                 "padding": ("INT", {"default": 10, "min": 0, "max": 100, "step": 1}),
                 "opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "images_per_row": ("INT", {
@@ -735,6 +917,9 @@ class FantasticPlotterImageSaver:
                     ),
                 }),
             },
+            "optional": {
+                "global_loras_info": ("STRING", {"forceInput": True}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -752,7 +937,7 @@ class FantasticPlotterImageSaver:
 
     def compose(self, images, metadata, text_color, background_color,
                 font_size, padding, opacity, images_per_row, classic_grid=False,
-                constrain_size=False, max_cell_size=512):
+                constrain_size=False, max_cell_size=512, global_loras_info=None):
         text_color = self._first(text_color, "white")
         background_color = self._first(background_color, "black")
         font_size = int(self._first(font_size, 38))
@@ -762,6 +947,11 @@ class FantasticPlotterImageSaver:
         classic = bool(self._first(classic_grid, False))
         constrain = bool(self._first(constrain_size, False))
         max_side = max(64, min(2048, int(self._first(max_cell_size, 512))))
+
+        # Global loras summary (from the Plotter's global_loras_info output, if
+        # connected) — one "name_strength" entry per line, blanks dropped.
+        gli = self._first(global_loras_info, "")
+        global_lines = [ln for ln in str(gli or "").split("\n") if ln.strip()]
 
         # images: list of [1,H,W,C] (or [H,W,C]) tensors; metadata: list of str.
         if not isinstance(images, list):
@@ -800,47 +990,115 @@ class FantasticPlotterImageSaver:
             images = resized
             print(f"[FantasticPlotterImageSaver] constrained cells to max_side={max_side}px")
 
+        # Separate control cell(s) from the main grid cells. The plotter emits at
+        # most one of each control kind ("control", "control_global"); each becomes
+        # its own full top row, the single image repeated across every column.
+        control_pairs = [(im, m) for im, m in zip(images, metadata) if _is_control_meta(m)]
+        main_pairs    = [(im, m) for im, m in zip(images, metadata) if not _is_control_meta(m)]
+
+        if main_pairs:
+            main_images = [p[0] for p in main_pairs]
+            main_meta = [p[1] for p in main_pairs]
+        else:
+            # Only control cells (or nothing else) — show what we have, no repeat.
+            main_images, main_meta, control_pairs = images, metadata, []
+
         # Classic XY grid: clean cells, labels outside on the border.
         if classic:
-            grid = _plot_classic_grid(images, metadata, text_color, background_color, font_size, padding)
+            ctrl_rows = [(_control_label(m), _plot_tensor_to_pil(im)) for im, m in control_pairs]
+            grid = _plot_classic_grid(main_images, main_meta, text_color, background_color,
+                                      font_size, padding, control_rows=ctrl_rows,
+                                      global_lines=global_lines)
             if grid is not None:
                 print(f"[FantasticPlotterImageSaver] classic grid {tuple(grid.shape)}")
                 return (grid,)
             print("[FantasticPlotterImageSaver] classic grid needs a full lora x strength "
                   "rectangle — falling back to overlay.")
 
-        # 1) Overlay label on each cell.
+        # 1) Overlay label on each main cell.
         labelled = []
-        for img, meta in zip(images, metadata):
+        for img, meta in zip(main_images, main_meta):
             text = _plot_overlay_text(meta)
             pil = _plot_add_overlay(_plot_tensor_to_pil(img), text,
                                     text_color, background_color, font_size, padding, opacity)
             labelled.append(_plot_pil_to_tensor(pil))
 
-        # 2) Resize + batch.
+        # 2) Columns: override if set, else auto from the main metadata.
+        per_row = per_row_override if per_row_override > 0 else _plot_auto_per_row(main_meta)
+        per_row = max(1, min(per_row, len(labelled)))  # never wider than the cell count
+
+        # 3) Control rows: each control image repeated across a full top row.
+        top_rows = []
+        for img, meta in control_pairs:
+            cpil = _plot_add_overlay(_plot_tensor_to_pil(img), _control_label(meta),
+                                     text_color, background_color, font_size, padding, opacity)
+            top_rows += [_plot_pil_to_tensor(cpil)] * per_row
+        labelled = top_rows + labelled
+
+        # 4) Resize + batch, then compose grid → single image.
         batch = _plot_list_to_batch(labelled)
-
-        # 3) Columns: override if set, else auto from metadata.
-        per_row = per_row_override if per_row_override > 0 else _plot_auto_per_row(metadata)
-        per_row = min(per_row, batch.shape[0])  # never wider than the cell count
-
-        # 4) Compose grid → single image.
         grid = _plot_batch_to_grid(batch, per_row)
+        grid = _plot_add_global_strip(grid, global_lines, text_color, background_color, font_size, padding)
         print(f"[FantasticPlotterImageSaver] {batch.shape[0]} cells -> "
-              f"{per_row} per row -> grid {tuple(grid.shape)}")
+              f"{per_row} per row -> grid {tuple(grid.shape)}"
+              + (f" (+{len(control_pairs)} control row(s))" if control_pairs else "")
+              + (" (+global loras strip)" if global_lines else ""))
         return (grid,)
+
+
+# ===========================================================================
+# Fantastic Plotter Global Lora
+# ===========================================================================
+# A mini lora-stack collector (same chooser/folder-filter UI as the loaders, no
+# randomizer) that feeds a set of "global" loras into the Plotter. Those loras
+# are applied to EVERY swept cell on top of the cell's own lora. It also carries
+# the two control-image flags, so when this node is attached the Plotter's own
+# Control Image toggle is disabled and control is driven from here instead.
+
+class FantasticPlotterGlobalLora:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"lora_data": _LORA_DATA_INPUT}}
+
+    RETURN_TYPES = ("FL_GLOBAL_LORAS",)
+    RETURN_NAMES = ("global_loras",)
+    FUNCTION = "collect"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Plotter Global Lora"
+
+    @classmethod
+    def IS_CHANGED(cls, lora_data="{}"):
+        return lora_data
+
+    def collect(self, lora_data):
+        entries, _enabled = _parse_payload(lora_data)
+        loras = [{"name": e["name"], "model": e["model"], "clip": e["clip"]}
+                 for e in entries
+                 if e["on"] and e["name"] and e["name"] not in ("None", "NONE")]
+        try:
+            cfg = json.loads(lora_data) if lora_data else {}
+        except (ValueError, TypeError):
+            cfg = {}
+        payload = {
+            "loras": loras,
+            "control_none": bool(cfg.get("controlNone")) if isinstance(cfg, dict) else False,
+            "control_global": bool(cfg.get("controlGlobal")) if isinstance(cfg, dict) else False,
+        }
+        return (payload,)
 
 
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
+    "FantasticPlotterGlobalLora": FantasticPlotterGlobalLora,
     "FantasticPlotterImageSaver": FantasticPlotterImageSaver,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
     "FantasticLoraLoaderMulti": "Fantastic Lora Loader (Multi-Model) 📁",
     "FantasticLoraPlotter":     "Fantastic Lora Plotter 📊",
+    "FantasticPlotterGlobalLora": "Fantastic Plotter Global Lora 🌐",
     "FantasticPlotterImageSaver": "Fantastic Plotter Image Saver 📊",
 }
 
