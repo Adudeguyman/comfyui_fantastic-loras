@@ -513,6 +513,7 @@ function syncData(node) {
   if (node.__isPlotter) {
     payload.plotMode = node.__plotMode === "global" ? "global" : "perline";
     payload.globalStrengths = Array.isArray(node.__globalStrengths) ? node.__globalStrengths : [];
+    payload.controlImage = !!node.__controlImage;
   }
   w.value = JSON.stringify(payload);
 }
@@ -544,6 +545,7 @@ function loadStackFromData(node) {
       if (parsed.plotMode === "global" || parsed.plotMode === "perline") node.__plotMode = parsed.plotMode;
       if (Array.isArray(parsed.globalStrengths))
         node.__globalStrengths = parsed.globalStrengths.map(Number).filter(n => !isNaN(n));
+      if (typeof parsed.controlImage === "boolean") node.__controlImage = parsed.controlImage;
     }
   } catch (_) {}
 }
@@ -963,6 +965,13 @@ function buildModelBar(node) {
 
 const SAVER_WIDTH = Math.round(DEFAULT_WIDTH * 1.2) - 50;  // 20% wider minus 50px
 
+// Canonical order of the saver's serializable widgets (matches INPUT_TYPES).
+// Used to re-apply saved values by NAME so widget positions can't desync them.
+const SAVER_WIDGET_ORDER = [
+  "constrain_size", "max_cell_size", "text_color", "background_color",
+  "font_size", "padding", "opacity", "images_per_row", "classic_grid",
+];
+
 function updateClassicGridLabel(node) {
   if (!node.__lflClassicGridBtn) return;
   node.__lflClassicGridBtn.label = node.__classicGrid
@@ -993,17 +1002,12 @@ function _setupSaverUI(node) {
     applyDisabled(value);
   };
 
-  // ── Spacer: a thin gap between the constrain group and the style options ──
-  const spacerDom = document.createElement("div");
-  spacerDom.style.cssText = "height:6px;";
-  const spacerW = node.addDOMWidget("lfl_saver_spacer", "div", spacerDom, { serialize: false });
-  spacerW.serializeValue = () => undefined;
-  spacerW.computeSize = (w) => [w, 6];
-
-  // Move spacer to sit right after max_cell_size.
-  const ws = node.widgets;
-  ws.splice(ws.indexOf(spacerW), 1);
-  ws.splice(ws.indexOf(maxSideW) + 1, 0, spacerW);
+  // ── Gap between the constrain group and the style options ──
+  // Done via max_cell_size's height (NOT a separate widget): inserting a
+  // non-serializing DOM widget here would desync ComfyUI's positional
+  // widgets_values restore and shift every value below it.
+  const WH = (window.LiteGraph && window.LiteGraph.NODE_WIDGET_HEIGHT) || 20;
+  maxSideW.computeSize = function (w) { return [w, WH + 10]; };
 
   // ── Classic grid toggle button — same style as the Strength Mode button ──
   if (classicW) {
@@ -1032,6 +1036,7 @@ function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
     node.__isPlotter = true;
     if (node.__plotMode == null) node.__plotMode = "perline";
     if (node.__globalStrengths == null) node.__globalStrengths = [];
+    if (node.__controlImage == null) node.__controlImage = false;
   }
   if (node.properties.extra_model_count == null) node.properties.extra_model_count = 0;
   stripAutoExtraSlots(node);
@@ -1078,6 +1083,10 @@ function updatePlotterLabels(node) {
     const list = node.__globalStrengths || [];
     node.__lflPlotGsBtn.label = `🎚 Global strengths: ${list.length ? list.join(", ") : "(none)"}`;
   }
+  if (node.__lflPlotControlBtn) {
+    node.__lflPlotControlBtn.label =
+      `${node.__controlImage ? "☑" : "☐"} Control Image (no loras applied)`;
+  }
   node.setDirtyCanvas?.(true, false);
 }
 
@@ -1095,6 +1104,15 @@ function addPlotterControls(node) {
   const gsBtn = node.addWidget("button", "lfl_plot_gs", null, (_v, _c, _n, _p, event) => showGlobalStrengthsPanel(node, event));
   gsBtn.serialize = false; if (gsBtn.options) gsBtn.options.serialize = false; gsBtn.serializeValue = () => undefined;
   node.__lflPlotGsBtn = gsBtn;
+
+  const ctrlBtn = node.addWidget("button", "lfl_plot_control", null, () => {
+    node.__controlImage = !node.__controlImage;
+    syncData(node);
+    updatePlotterLabels(node);
+    node.setDirtyCanvas(true, true);
+  });
+  ctrlBtn.serialize = false; if (ctrlBtn.options) ctrlBtn.options.serialize = false; ctrlBtn.serializeValue = () => undefined;
+  node.__lflPlotControlBtn = ctrlBtn;
 
   updatePlotterLabels(node);
 }
@@ -1223,14 +1241,23 @@ app.registerExtension({
       const origOnConfigure = nodeType.prototype.onConfigure;
       nodeType.prototype.onConfigure = function (info) {
         origOnConfigure?.apply(this, arguments);
-        // Restore grey-out and classic grid button state after workflow values are loaded.
         try {
+          // Re-apply saved values BY NAME. ComfyUI restores widgets_values by
+          // position; any non-serializing widget we add can shift that mapping,
+          // so we map the saved array back onto widgets by their canonical order.
+          const vals = info?.widgets_values;
+          if (Array.isArray(vals) && vals.length === SAVER_WIDGET_ORDER.length) {
+            SAVER_WIDGET_ORDER.forEach((nm, i) => {
+              if (vals[i] === undefined) return;
+              const w = this.widgets?.find(x => x.name === nm);
+              if (w) w.value = vals[i];
+            });
+          }
+          // Restore grey-out and classic grid button state.
           const constrainW = this.widgets?.find(w => w.name === "constrain_size");
           const maxSideW   = this.widgets?.find(w => w.name === "max_cell_size");
           const classicW   = this.widgets?.find(w => w.name === "classic_grid");
-          if (constrainW && maxSideW) {
-            maxSideW.disabled = !constrainW.value;
-          }
+          if (constrainW && maxSideW) maxSideW.disabled = !constrainW.value;
           if (classicW) {
             this.__classicGrid = !!classicW.value;
             updateClassicGridLabel(this);

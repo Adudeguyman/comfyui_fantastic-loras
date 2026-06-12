@@ -237,10 +237,11 @@ def _apply_one(model, clip, name, model_s, clip_s):
 def _parse_plot_config(lora_data: str):
     """Read plotter-only fields from the payload.
 
-    Returns (mode, global_strengths) where mode is "perline" | "global" and
-    global_strengths is a list of floats (blanks already dropped by the frontend).
+    Returns (mode, global_strengths, control_image) where mode is
+    "perline" | "global", global_strengths is a list of floats (blanks already
+    dropped by the frontend), and control_image is a bool.
     """
-    mode, gstr = "perline", []
+    mode, gstr, control = "perline", [], False
     try:
         data = json.loads(lora_data) if lora_data else {}
     except (ValueError, TypeError):
@@ -255,7 +256,8 @@ def _parse_plot_config(lora_data: str):
                     gstr.append(float(v))
                 except (ValueError, TypeError):
                     pass
-    return mode, gstr
+        control = bool(data.get("controlImage", False))
+    return mode, gstr, control
 
 
 _LORA_DATA_INPUT = (
@@ -390,7 +392,7 @@ class FantasticLoraPlotter:
     def load(self, model, lora_data, clip=None,
              model_2=None, model_3=None, model_4=None, model_5=None):
         entries, _enabled = _parse_payload(lora_data)
-        mode, global_strengths = _parse_plot_config(lora_data)
+        mode, global_strengths, control_image = _parse_plot_config(lora_data)
 
         # Only enabled, concretely-named lines become cells. Randomizer lines
         # already carry a baked name from the frontend at queue time.
@@ -427,6 +429,17 @@ class FantasticLoraPlotter:
                         continue
                     r = _apply_one(base, None, name, s, s)
                     extras[i].append(r[0] if r is not None else base)
+
+        # Control image: one extra cell with the untouched base model(s) and no
+        # lora applied, so the user can see a vanilla baseline. Appended at the
+        # end so it doesn't disturb the lora-major ordering the grid relies on.
+        if control_image:
+            models.append(model)
+            clips.append(clip)
+            metas.append("control")
+            for i, base in enumerate(extra_bases):
+                if base is not None:
+                    extras[i].append(base)
 
         # Nothing applied (no lines, or all not-found): emit one passthrough cell
         # so the downstream graph still runs once instead of hard-failing.
@@ -619,12 +632,13 @@ def _plot_parse_name_strength(meta):
     return str(meta), None
 
 
-def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, padding):
+def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, padding, control_pil=None):
     """Classic XY plot: clean cells with labels OUTSIDE on the top/left border.
 
-    Rows = loras (Y axis), columns = strengths (X axis). Returns a [1,H,W,C]
-    tensor, or None if the metadata isn't a clean lora x strength rectangle
-    (caller then falls back to the overlay layout).
+    Rows = loras (Y axis), columns = strengths (X axis). When control_pil is
+    given it becomes a full "control" row at the very top, repeated across every
+    strength column. Returns a [1,H,W,C] tensor, or None if the metadata isn't a
+    clean lora x strength rectangle (caller then falls back to the overlay layout).
     """
     pils = [_plot_tensor_to_pil(im) for im in images]
     W, Hh = pils[0].size
@@ -646,8 +660,12 @@ def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, paddin
         b = probe.textbbox((0, 0), s, font=f)
         return b[2] - b[0], b[3] - b[1]
 
+    has_control = control_pil is not None
+    if has_control and control_pil.size != (W, Hh):
+        control_pil = control_pil.resize((W, Hh))
+
     col_labels = [f"Strength: {_format_strength(s)}" for s in strengths]
-    row_labels = [str(n) for n in names]
+    row_labels = (["control"] if has_control else []) + [str(n) for n in names]
 
     # Column headers sit above a cell of width W — shrink the header font until
     # the widest one fits, so adjacent headers never overlap on small cells.
@@ -664,7 +682,8 @@ def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, paddin
     left_margin = (max((measure(l, row_font)[0] for l in row_labels), default=0)) + padding * 2
     top_margin = (max((measure(l, col_font)[1] for l in col_labels), default=0)) + padding * 2
 
-    cols, rows = len(strengths), len(names)
+    cols = len(strengths)
+    rows = len(names) + (1 if has_control else 0)
     canvas = Image.new("RGB", (left_margin + cols * W, top_margin + rows * Hh), bg_rgb)
     draw = ImageDraw.Draw(canvas)
 
@@ -678,12 +697,18 @@ def _plot_classic_grid(images, metadata, text_color, bg_color, font_size, paddin
         w_, h_ = measure(lab, row_font)
         draw.text((max(padding, (left_margin - w_) // 2), top_margin + r * Hh + (Hh - h_) // 2),
                   lab, fill=text_rgb, font=row_font)
-    # Clean cells.
+
+    row_offset = 1 if has_control else 0
+    # Control row at the top — same image repeated across every strength column.
+    if has_control:
+        for c in range(cols):
+            canvas.paste(control_pil, (left_margin + c * W, top_margin))
+    # Lora cells.
     for r, nm in enumerate(names):
         for c, st in enumerate(strengths):
             pil = cell.get((nm, st))
             if pil is not None:
-                canvas.paste(pil, (left_margin + c * W, top_margin + r * Hh))
+                canvas.paste(pil, (left_margin + c * W, top_margin + (r + row_offset) * Hh))
 
     return _plot_pil_to_tensor(canvas)
 
@@ -716,7 +741,7 @@ class FantasticPlotterImageSaver:
                 }),
                 "text_color": (_PLOT_COLOR_OPTIONS, {"default": "white"}),
                 "background_color": (_PLOT_COLOR_OPTIONS, {"default": "black"}),
-                "font_size": ("INT", {"default": 38, "min": 8, "max": 256, "step": 1}),
+                "font_size": ("INT", {"default": 20, "min": 8, "max": 256, "step": 1}),
                 "padding": ("INT", {"default": 10, "min": 0, "max": 100, "step": 1}),
                 "opacity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "images_per_row": ("INT", {
@@ -800,34 +825,56 @@ class FantasticPlotterImageSaver:
             images = resized
             print(f"[FantasticPlotterImageSaver] constrained cells to max_side={max_side}px")
 
+        # Separate the control cell(s) from the main grid cells. The plotter
+        # emits a single "control" cell (base model, no lora); we repeat that one
+        # image across the top row rather than generating it once per column.
+        control_imgs = [im for im, m in zip(images, metadata) if str(m) == "control"]
+        main_pairs = [(im, m) for im, m in zip(images, metadata) if str(m) != "control"]
+        control_img = control_imgs[0] if control_imgs else None
+
+        if main_pairs:
+            main_images = [p[0] for p in main_pairs]
+            main_meta = [p[1] for p in main_pairs]
+        else:
+            # Only a control cell (or nothing else) — show what we have, no repeat.
+            main_images, main_meta, control_img = images, metadata, None
+
         # Classic XY grid: clean cells, labels outside on the border.
         if classic:
-            grid = _plot_classic_grid(images, metadata, text_color, background_color, font_size, padding)
+            control_pil = _plot_tensor_to_pil(control_img) if control_img is not None else None
+            grid = _plot_classic_grid(main_images, main_meta, text_color, background_color,
+                                      font_size, padding, control_pil=control_pil)
             if grid is not None:
                 print(f"[FantasticPlotterImageSaver] classic grid {tuple(grid.shape)}")
                 return (grid,)
             print("[FantasticPlotterImageSaver] classic grid needs a full lora x strength "
                   "rectangle — falling back to overlay.")
 
-        # 1) Overlay label on each cell.
+        # 1) Overlay label on each main cell.
         labelled = []
-        for img, meta in zip(images, metadata):
+        for img, meta in zip(main_images, main_meta):
             text = _plot_overlay_text(meta)
             pil = _plot_add_overlay(_plot_tensor_to_pil(img), text,
                                     text_color, background_color, font_size, padding, opacity)
             labelled.append(_plot_pil_to_tensor(pil))
 
-        # 2) Resize + batch.
+        # 2) Columns: override if set, else auto from the main metadata.
+        per_row = per_row_override if per_row_override > 0 else _plot_auto_per_row(main_meta)
+        per_row = max(1, min(per_row, len(labelled)))  # never wider than the cell count
+
+        # 3) Control row: repeat the single control image across a full top row.
+        if control_img is not None:
+            ctrl_pil = _plot_add_overlay(_plot_tensor_to_pil(control_img), "control",
+                                         text_color, background_color, font_size, padding, opacity)
+            ctrl_t = _plot_pil_to_tensor(ctrl_pil)
+            labelled = [ctrl_t] * per_row + labelled
+
+        # 4) Resize + batch, then compose grid → single image.
         batch = _plot_list_to_batch(labelled)
-
-        # 3) Columns: override if set, else auto from metadata.
-        per_row = per_row_override if per_row_override > 0 else _plot_auto_per_row(metadata)
-        per_row = min(per_row, batch.shape[0])  # never wider than the cell count
-
-        # 4) Compose grid → single image.
         grid = _plot_batch_to_grid(batch, per_row)
         print(f"[FantasticPlotterImageSaver] {batch.shape[0]} cells -> "
-              f"{per_row} per row -> grid {tuple(grid.shape)}")
+              f"{per_row} per row -> grid {tuple(grid.shape)}"
+              + (" (+control row)" if control_img is not None else ""))
         return (grid,)
 
 
