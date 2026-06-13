@@ -18,7 +18,14 @@ import { api } from "../../scripts/api.js";
 
 const NODE_NAME       = "FantasticLoraLoader";
 const MULTI_NODE_NAME = "FantasticLoraLoaderMulti";
-const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME];
+const PLOT_NODE_NAME  = "FantasticLoraPlotter";
+const SAVER_NODE_NAME = "FantasticPlotterImageSaver";
+const GLOBAL_NODE_NAME = "FantasticPlotterGlobalLora";
+const VIEWER_NODE_NAME = "FantasticPlotterGridViewer";
+const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME, PLOT_NODE_NAME];
+
+// Nodes that use the multi-model UI (stack + dynamic model-path bar).
+const isMultiLike = (name) => name === MULTI_NODE_NAME || name === PLOT_NODE_NAME;
 
 const DATA_WIDGET          = "lora_data";
 const NODE_COLOR           = "#0f848a";
@@ -503,7 +510,18 @@ function effectiveEnabledFoldersArray(node) {
 
 function syncData(node) {
   const w = getDataWidget(node);
-  if (w) w.value = JSON.stringify({ loras: node.__loraStack || [], enabledFolders: effectiveEnabledFoldersArray(node) });
+  if (!w) return;
+  const payload = { loras: node.__loraStack || [], enabledFolders: effectiveEnabledFoldersArray(node) };
+  if (node.__isPlotter) {
+    payload.plotMode = node.__plotMode === "global" ? "global" : "perline";
+    payload.globalStrengths = Array.isArray(node.__globalStrengths) ? node.__globalStrengths : [];
+    payload.controlImage = !!node.__controlImage;
+  }
+  if (node.__isGlobalLora) {
+    payload.controlNone = !!node.__ctrlNone;
+    payload.controlGlobal = !!node.__ctrlGlobal;
+  }
+  w.value = JSON.stringify(payload);
 }
 
 function loadStackFromData(node) {
@@ -526,6 +544,18 @@ function loadStackFromData(node) {
     });
   } catch (_) { stack = []; }
   node.__loraStack = stack;
+  // Plotter-only fields (harmlessly ignored by the other node types).
+  try {
+    const parsed = JSON.parse(w?.value || "{}");
+    if (parsed && !Array.isArray(parsed)) {
+      if (parsed.plotMode === "global" || parsed.plotMode === "perline") node.__plotMode = parsed.plotMode;
+      if (Array.isArray(parsed.globalStrengths))
+        node.__globalStrengths = parsed.globalStrengths.map(Number).filter(n => !isNaN(n));
+      if (typeof parsed.controlImage === "boolean") node.__controlImage = parsed.controlImage;
+      if (typeof parsed.controlNone === "boolean") node.__ctrlNone = parsed.controlNone;
+      if (typeof parsed.controlGlobal === "boolean") node.__ctrlGlobal = parsed.controlGlobal;
+    }
+  } catch (_) {}
 }
 
 function snapHeight(node) { const [, h] = node.computeSize(); node.size[1] = h; }
@@ -689,6 +719,7 @@ function buildRowDOM(node) {
   const render = () => {
     root.textContent = "";
     const stack = node.__loraStack || [], hasClip = clipConnected(node);
+    const globalMode = node.__isPlotter && node.__plotMode === "global";
     if (!stack.length) {
       const empty = document.createElement("div"); empty.textContent = "No loras yet — click ➕ Add Lora.";
       empty.style.cssText = "opacity:.55;padding:4px 2px;"; root.appendChild(empty); return;
@@ -784,10 +815,14 @@ function buildRowDOM(node) {
       nameEl.addEventListener("pointerdown", e => e.stopPropagation()); row.appendChild(nameEl);
 
       const sLabel = document.createElement("span"); sLabel.textContent = "S";
-      sLabel.title = hasClip ? "Strength (model + clip)" : "Strength (model — CLIP not connected)";
-      sLabel.style.cssText = "opacity:.6;flex:none;font-size:11px;"; row.appendChild(sLabel);
-      row.appendChild(numInput(entry.model, false, v => { const val = isNaN(v) ? 0 : v; entry.model = val; entry.clip = val; syncData(node); }));
-      if (!hasClip) {
+      sLabel.title = globalMode
+        ? "Per-line strength ignored — using Global strengths"
+        : (hasClip ? "Strength (model + clip)" : "Strength (model — CLIP not connected)");
+      sLabel.style.cssText = "opacity:" + (globalMode ? ".3" : ".6") + ";flex:none;font-size:11px;"; row.appendChild(sLabel);
+      const sInput = numInput(entry.model, globalMode, v => { const val = isNaN(v) ? 0 : v; entry.model = val; entry.clip = val; syncData(node); });
+      if (globalMode) { sInput.disabled = true; sInput.title = "Per-line strength ignored in Global mode"; }
+      row.appendChild(sInput);
+      if (!hasClip && !node.__isGlobalLora) {
         const note = document.createElement("span"); note.textContent = "(no CLIP)";
         note.style.cssText = "opacity:.3;font-size:10px;flex:none;white-space:nowrap;"; row.appendChild(note);
       }
@@ -867,6 +902,62 @@ function addUI(node) {
 }
 
 // ===========================================================================
+// Global Lora node UI — stack (no randomizer) + two control toggles
+// ===========================================================================
+
+function addGlobalLoraUI(node) {
+  if (node.__lflBuilt) return;
+  node.__lflBuilt = true;
+  node.__isGlobalLora = true;
+  if (node.__ctrlNone == null) node.__ctrlNone = false;
+  if (node.__ctrlGlobal == null) node.__ctrlGlobal = false;
+
+  buildCoreUI(node);   // folder filter + rows + Add Lora (no randomizer)
+
+  const t1 = node.addWidget("toggle", "lfl_g_ctrl_none", !!node.__ctrlNone, (v) => {
+    node.__ctrlNone = !!v; syncData(node); node.setDirtyCanvas(true, true);
+  }, { on: "On", off: "Off" });
+  t1.label = "Control Image (no loras applied)";
+  t1.tooltip = "Adds one baseline image with no loras applied at all — neither the plotter's "
+    + "swept loras nor these global loras (the raw base model).";
+  t1.serialize = false; if (t1.options) t1.options.serialize = false; t1.serializeValue = () => undefined;
+  node.__lflGCtrlNoneW = t1;
+
+  const t2 = node.addWidget("toggle", "lfl_g_ctrl_global", !!node.__ctrlGlobal, (v) => {
+    node.__ctrlGlobal = !!v; syncData(node); node.setDirtyCanvas(true, true);
+  }, { on: "On", off: "Off" });
+  t2.label = "Control Image (global loras applied)";
+  t2.tooltip = "Adds one baseline image with only these global loras applied — none of the "
+    + "plotter's swept stack loras — so you can see what the global loras contribute on their own.";
+  t2.serialize = false; if (t2.options) t2.options.serialize = false; t2.serializeValue = () => undefined;
+  node.__lflGCtrlGlobalW = t2;
+
+  snapHeight(node);
+}
+
+// Disable the Plotter's own Control Image toggle while a Global Lora node is
+// attached (control is driven from that node instead).
+function updatePlotterControlState(node) {
+  const gIn = (node.inputs || []).find(i => i?.name === "global_loras");
+  const connected = !!(gIn && gIn.link != null);
+  node.__globalLoraConnected = connected;
+  const w = node.__lflPlotControlBtn;
+  if (w) {
+    if (connected) { node.__controlImage = false; w.value = false; w.disabled = true; }
+    else { w.disabled = false; w.value = !!node.__controlImage; }
+  }
+  if (node.__lflAddGlobalBtn) {
+    node.__lflAddGlobalBtn.disabled = connected;
+    node.__lflAddGlobalBtn.label = connected
+      ? "\uD83C\uDF10 Global Lora node connected"
+      : "\uD83C\uDF10 Add Global Lora node";
+  }
+  updatePlotterLabels(node);
+  syncData(node);
+  node.setDirtyCanvas(true, true);
+}
+
+// ===========================================================================
 // Multi-model slot management
 // ===========================================================================
 
@@ -932,11 +1023,187 @@ function buildModelBar(node) {
 // Multi-model node UI
 // ===========================================================================
 
-function addMultiUI(node) {
+// ===========================================================================
+// Fantastic Plotter Image Saver — custom width, constrain group UI
+// ===========================================================================
+
+const SAVER_WIDTH = DEFAULT_WIDTH;  // same width as the Fantastic Lora Plotter
+
+// Canonical order of the saver's serializable widgets (matches INPUT_TYPES).
+// Used to re-apply saved values by NAME so widget positions can't desync them.
+const SAVER_WIDGET_ORDER = [
+  "constrain_size", "max_cell_size", "text_color", "background_color",
+  "font_size", "padding", "opacity", "images_per_row", "classic_grid",
+];
+
+function updateClassicGridLabel(node) {
+  if (!node.__lflClassicGridBtn) return;
+  node.__lflClassicGridBtn.label = node.__classicGrid
+    ? "🖼 Grid mode: Classic (border labels)"
+    : "🖼 Grid mode: Overlay (on image)";
+  node.setDirtyCanvas?.(true, false);
+}
+
+// Drop a Grid Viewer node into the graph and wire the Saver's three passthrough
+// outputs (images / metadata / global_loras_info) straight into it.
+function spawnConnectedViewer(saverNode) {
+  const LG = (typeof LiteGraph !== "undefined") ? LiteGraph : window.LiteGraph;
+  const graph = saverNode.graph;
+  if (!LG || !graph) { console.warn("[FantasticLoraLoader] cannot add viewer — graph unavailable"); return; }
+
+  const viewer = LG.createNode("FantasticPlotterGridViewer");
+  if (!viewer) { console.warn("[FantasticLoraLoader] Grid Viewer node type not registered"); return; }
+  graph.add(viewer);
+
+  // Place it just to the right of the saver, top-aligned.
+  const sw = (saverNode.size && saverNode.size[0]) || 400;
+  viewer.pos = [saverNode.pos[0] + sw + 60, saverNode.pos[1]];
+
+  const outIdx = (name) => (saverNode.outputs || []).findIndex((o) => o.name === name);
+  const inIdx  = (name) => (viewer.inputs || []).findIndex((i) => i.name === name);
+  const wire = (outName, inName) => {
+    const o = outIdx(outName), i = inIdx(inName);
+    if (o >= 0 && i >= 0) saverNode.connect(o, viewer, i);
+    else console.warn(`[FantasticLoraLoader] could not wire ${outName} → ${inName}`,
+                      "(re-add the Saver node if it predates the passthrough outputs)");
+  };
+  wire("images", "images");
+  wire("metadata", "metadata");
+  wire("global_loras_info", "global_loras_info");
+
+  try { updateSaverViewerBtn(saverNode); } catch (_) {}
+  graph.setDirtyCanvas(true, true);
+}
+
+// True if any of the Saver's outputs links to a Grid Viewer node.
+function isViewerConnected(saverNode) {
+  const graph = saverNode.graph;
+  if (!graph) return false;
+  for (const out of (saverNode.outputs || [])) {
+    if (!out || !out.links) continue;
+    for (const lid of out.links) {
+      const link = graph.links?.[lid];
+      if (!link) continue;
+      const tgt = graph.getNodeById?.(link.target_id);
+      if (tgt && tgt.type === VIEWER_NODE_NAME) return true;
+    }
+  }
+  return false;
+}
+
+// Grey out / relabel the Saver's "Add Grid Viewer" button based on whether one
+// is already connected downstream.
+function updateSaverViewerBtn(node) {
+  const btn = node.__lflAddViewerBtn;
+  if (!btn) return;
+  const connected = isViewerConnected(node);
+  btn.disabled = connected;
+  btn.label = connected
+    ? "\uD83D\uDD0D Grid Viewer connected"
+    : "\uD83D\uDD0D Add Grid Viewer";
+  node.setDirtyCanvas(true, false);
+}
+
+// Drop a Global Lora node into the graph (to the left of the Plotter) and wire
+// its global_loras output into the Plotter's global_loras input.
+function spawnConnectedGlobalLora(plotterNode) {
+  const LG = (typeof LiteGraph !== "undefined") ? LiteGraph : window.LiteGraph;
+  const graph = plotterNode.graph;
+  if (!LG || !graph) { console.warn("[FantasticLoraLoader] cannot add global lora — graph unavailable"); return; }
+  // Already fed? Don't add a second one.
+  const gIn = (plotterNode.inputs || []).find((i) => i?.name === "global_loras");
+  if (gIn && gIn.link != null) { console.warn("[FantasticLoraLoader] a Global Lora node is already connected"); return; }
+
+  const gnode = LG.createNode(GLOBAL_NODE_NAME);
+  if (!gnode) { console.warn("[FantasticLoraLoader] Global Lora node type not registered"); return; }
+  graph.add(gnode);
+
+  const gw = (gnode.size && gnode.size[0]) || 360;
+  gnode.pos = [plotterNode.pos[0] - gw - 60, plotterNode.pos[1]];
+
+  const o = (gnode.outputs || []).findIndex((x) => x.name === "global_loras");
+  const i = (plotterNode.inputs || []).findIndex((x) => x.name === "global_loras");
+  if (o >= 0 && i >= 0) gnode.connect(o, plotterNode, i);
+  else console.warn("[FantasticLoraLoader] could not wire global_loras (re-add the Plotter if it predates this input)");
+
+  try { updatePlotterControlState(plotterNode); } catch (_) {}
+  graph.setDirtyCanvas(true, true);
+}
+
+function _setupSaverUI(node) {
+  if (node.__lflSaverBuilt) return;
+  node.__lflSaverBuilt = true;
+
+  const constrainW = node.widgets?.find(w => w.name === "constrain_size");
+  const maxSideW   = node.widgets?.find(w => w.name === "max_cell_size");
+  const classicW   = node.widgets?.find(w => w.name === "classic_grid");
+  if (!constrainW || !maxSideW) return;
+
+  // ── Grey-out: toggle max_cell_size disabled based on constrain_size ──
+  const applyDisabled = (val) => {
+    maxSideW.disabled = !val;
+    node.setDirtyCanvas(true, false);
+  };
+  applyDisabled(constrainW.value);
+
+  const origCB = constrainW.callback;
+  constrainW.callback = function (value, ...rest) {
+    origCB?.call(this, value, ...rest);
+    applyDisabled(value);
+  };
+
+  // ── Gap between the constrain group and the style options ──
+  // Done via max_cell_size's height (NOT a separate widget): inserting a
+  // non-serializing DOM widget here would desync ComfyUI's positional
+  // widgets_values restore and shift every value below it.
+  const WH = (window.LiteGraph && window.LiteGraph.NODE_WIDGET_HEIGHT) || 20;
+  maxSideW.computeSize = function (w) { return [w, WH + 10]; };
+
+  // ── Classic grid toggle button — same style as the Strength Mode button ──
+  if (classicW) {
+    node.__classicGrid = !!classicW.value;
+    hideWidget(node, classicW);
+
+    const classicBtn = node.addWidget("button", "lfl_classic_grid_btn", null, () => {
+      node.__classicGrid = !node.__classicGrid;
+      classicW.value = node.__classicGrid;
+      updateClassicGridLabel(node);
+      node.setDirtyCanvas(true, true);
+    });
+    classicBtn.serialize = false;
+    if (classicBtn.options) classicBtn.options.serialize = false;
+    classicBtn.serializeValue = () => undefined;
+    node.__lflClassicGridBtn = classicBtn;
+    updateClassicGridLabel(node);
+  }
+
+  // ── One-click: drop a connected Grid Viewer ──
+  const viewerBtn = node.addWidget("button", "lfl_add_viewer", null, () => {
+    if (isViewerConnected(node)) return;   // already has one
+    try { spawnConnectedViewer(node); }
+    catch (err) { console.warn("[FantasticLoraLoader] add viewer failed", err); }
+  });
+  viewerBtn.label = "\uD83D\uDD0D Add Grid Viewer";
+  viewerBtn.tooltip = "Adds a Fantastic Plotter Grid Viewer node and connects it here — "
+    + "an interactive board showing every generated image laid out as a grid, with zoom, "
+    + "row/column filtering, favourites and side-by-side comparison.";
+  viewerBtn.serialize = false;
+  if (viewerBtn.options) viewerBtn.options.serialize = false;
+  viewerBtn.serializeValue = () => undefined;
+  node.__lflAddViewerBtn = viewerBtn;
+  updateSaverViewerBtn(node);
+}
+
+function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
   if (node.__lflBuilt) return;
   node.__lflBuilt = true;
   node.properties = node.properties || {};
-  // Default to 1 extra model path so the multi-model node starts with 2 in total.
+  if (isPlotter) {
+    node.__isPlotter = true;
+    if (node.__plotMode == null) node.__plotMode = "perline";
+    if (node.__globalStrengths == null) node.__globalStrengths = [];
+    if (node.__controlImage == null) node.__controlImage = false;
+  }
   if (node.properties.extra_model_count == null) node.properties.extra_model_count = 0;
   stripAutoExtraSlots(node);
   buildCoreUI(node);
@@ -952,19 +1219,157 @@ function addMultiUI(node) {
   randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
   if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
 
+  // Plotter-only: strength-mode toggle + global-strengths popup.
+  if (isPlotter) addPlotterControls(node);
+
   const barDom = buildModelBar(node);
   const barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false });
   barWidget.serializeValue = () => undefined;
   barWidget.computeSize = function (width) { return [width, 26]; };
 
-  // On fresh creation (count still 0 after stripAutoExtraSlots) add one pair so
-  // the node starts with 2 model paths. Workflow loads skip this because
-  // onConfigure syncs extra_model_count from the already-restored slots.
-  if (node.properties.extra_model_count === 0) addModelPair(node);
+  // On fresh creation (count still 0 after stripAutoExtraSlots) optionally add
+  // one pair. The Multi-Model node starts with 2 paths (autoAddPair=true); the
+  // Plotter starts with a single path (autoAddPair=false). Workflow loads skip
+  // this because onConfigure syncs extra_model_count from restored slots.
+  if (autoAddPair && node.properties.extra_model_count === 0) addModelPair(node);
   else updateModelBar(node);
 
   node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
   snapHeight(node);
+}
+
+// ===========================================================================
+// Plotter controls — strength-mode toggle + global-strengths popup
+// ===========================================================================
+
+function updatePlotterLabels(node) {
+  const global = node.__plotMode === "global";
+  if (node.__lflPlotModeBtn) node.__lflPlotModeBtn.label = `📊 Strength mode: ${global ? "Global (applied to all loras)" : "Per-line"}`;
+  if (node.__lflPlotGsBtn) {
+    const list = node.__globalStrengths || [];
+    node.__lflPlotGsBtn.label = `🎚 Global strengths: ${list.length ? list.join(", ") : "(none)"}`;
+    node.__lflPlotGsBtn.disabled = !global;
+  }
+  if (node.__lflPlotControlBtn) {
+    node.__lflPlotControlBtn.label = node.__globalLoraConnected
+      ? "Set control on Global Lora Node"
+      : "Control Image (no loras applied)";
+  }
+  node.setDirtyCanvas?.(true, false);
+}
+
+function addPlotterControls(node) {
+  const modeBtn = node.addWidget("button", "lfl_plot_mode", null, () => {
+    node.__plotMode = node.__plotMode === "global" ? "perline" : "global";
+    syncData(node);
+    updatePlotterLabels(node);
+    node.__lflRender?.();                 // re-render rows to grey/ungrey strengths
+    node.setDirtyCanvas(true, true);
+  });
+  modeBtn.serialize = false; if (modeBtn.options) modeBtn.options.serialize = false; modeBtn.serializeValue = () => undefined;
+  node.__lflPlotModeBtn = modeBtn;
+
+  const gsBtn = node.addWidget("button", "lfl_plot_gs", null, (_v, _c, _n, _p, event) => {
+    if (node.__plotMode !== "global") return;  // disabled in Per-line mode
+    showGlobalStrengthsPanel(node, event);
+  });
+  gsBtn.tooltip = "Set the strengths to test. Every lora in your list runs once at each "
+    + "strength you enter here — e.g. 2 loras \u00d7 3 strengths = 6 images.";
+  gsBtn.serialize = false; if (gsBtn.options) gsBtn.options.serialize = false; gsBtn.serializeValue = () => undefined;
+  node.__lflPlotGsBtn = gsBtn;
+
+  const ctrlToggle = node.addWidget("toggle", "lfl_plot_control", !!node.__controlImage, (v) => {
+    if (node.__globalLoraConnected) return;   // disabled while a Global Lora node drives control
+    node.__controlImage = !!v;
+    syncData(node);
+    node.setDirtyCanvas(true, true);
+  }, { on: "On", off: "Off" });
+  ctrlToggle.tooltip = "Adds one extra baseline image with no loras applied at all (the raw "
+    + "base model), so you can compare every swept result against an untouched generation.";
+  ctrlToggle.serialize = false; if (ctrlToggle.options) ctrlToggle.options.serialize = false; ctrlToggle.serializeValue = () => undefined;
+  node.__lflPlotControlBtn = ctrlToggle;
+
+  const addGlobalBtn = node.addWidget("button", "lfl_add_global", null, () => {
+    if (node.__globalLoraConnected) return;   // greyed out when one is already connected
+    try { spawnConnectedGlobalLora(node); }
+    catch (err) { console.warn("[FantasticLoraLoader] add global lora failed", err); }
+  });
+  addGlobalBtn.label = "\uD83C\uDF10 Add Global Lora node";
+  addGlobalBtn.tooltip = "Adds a Fantastic Plotter Global Lora node and connects it here. "
+    + "Any loras you select in that node apply globally — they're added on top of every image "
+    + "the plotter generates, in addition to each swept cell's own lora.";
+  addGlobalBtn.serialize = false;
+  if (addGlobalBtn.options) addGlobalBtn.options.serialize = false;
+  addGlobalBtn.serializeValue = () => undefined;
+  node.__lflAddGlobalBtn = addGlobalBtn;
+
+  updatePlotterLabels(node);
+}
+
+let openStrengthsPanel = null;
+function closeStrengthsPanel() { if (openStrengthsPanel) { openStrengthsPanel.dispose(); openStrengthsPanel = null; } }
+
+function showGlobalStrengthsPanel(node, event) {
+  if (openStrengthsPanel?.node === node) { closeStrengthsPanel(); return; }
+  closeStrengthsPanel();
+  injectStyles();
+
+  const panel = document.createElement("div"); panel.className = "lfl-panel";
+  const header = document.createElement("div"); header.className = "lfl-header";
+  header.innerHTML = `<span class="lfl-title">Global strengths</span>`;
+  const close = document.createElement("span"); close.className = "lfl-close"; close.textContent = "✕";
+  header.appendChild(close); panel.appendChild(header);
+
+  const hint = document.createElement("div");
+  hint.style.cssText = "padding:5px 8px;opacity:.6;font-size:11px;border-bottom:1px solid var(--border-color,#444);";
+  hint.textContent = "Up to 10 values. Blank lines are skipped. Each enabled lora is swept across these (Global mode only).";
+  panel.appendChild(hint);
+
+  const body = document.createElement("div");
+  body.style.cssText = "padding:6px 8px;display:grid;grid-template-columns:auto 1fr;gap:4px 8px;align-items:center;overflow:auto;";
+  const cur = node.__globalStrengths || [];
+  const inputs = [];
+  for (let i = 0; i < 10; i++) {
+    const lab = document.createElement("span"); lab.textContent = String(i + 1); lab.style.cssText = "opacity:.5;text-align:right;";
+    const inp = document.createElement("input"); inp.type = "number"; inp.step = "0.05";
+    inp.value = cur[i] != null ? String(cur[i]) : "";
+    inp.placeholder = "—";
+    inp.style.cssText = "width:100%;box-sizing:border-box;background:var(--comfy-input-bg,#2a2a2a);color:inherit;border:1px solid var(--border-color,#555);border-radius:3px;font:inherit;padding:2px 5px;";
+    inp.addEventListener("pointerdown", e => e.stopPropagation());
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") apply(); });
+    inputs.push(inp);
+    body.appendChild(lab); body.appendChild(inp);
+  }
+  panel.appendChild(body);
+
+  const collect = () => inputs.map(i => i.value.trim()).filter(v => v !== "").map(Number).filter(n => !isNaN(n));
+  const apply = () => {
+    node.__globalStrengths = collect();
+    syncData(node);
+    updatePlotterLabels(node);
+    node.__lflRender?.();
+    closeStrengthsPanel();
+  };
+
+  const actions = document.createElement("div"); actions.className = "lfl-actions";
+  const mkBtn = (label, fn) => { const b = document.createElement("button"); b.className = "lfl-btn"; b.textContent = label; b.addEventListener("click", fn); actions.appendChild(b); };
+  mkBtn("Apply", apply);
+  mkBtn("Clear", () => { inputs.forEach(i => (i.value = "")); });
+  panel.appendChild(actions);
+
+  // ✕ and Escape discard; clicking away keeps what's typed (applies).
+  close.addEventListener("click", closeStrengthsPanel);
+
+  document.body.appendChild(panel);
+  const x = event?.clientX ?? window.innerWidth / 2, y = event?.clientY ?? window.innerHeight / 3;
+  const rect = panel.getBoundingClientRect();
+  panel.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  panel.style.top  = `${Math.max(8, Math.min(y + 6, window.innerHeight - rect.height - 8))}px`;
+
+  const onPD = e => { if (!panel.contains(e.target)) apply(); };
+  const onKD = e => { if (e.key === "Escape") closeStrengthsPanel(); };
+  setTimeout(() => { document.addEventListener("pointerdown", onPD, true); document.addEventListener("keydown", onKD, true); }, 0);
+  openStrengthsPanel = { el: panel, node, dispose: () => { document.removeEventListener("pointerdown", onPD, true); document.removeEventListener("keydown", onKD, true); panel.remove(); } };
 }
 
 // ===========================================================================
@@ -1006,24 +1411,108 @@ app.registerExtension({
   },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (!ALL_NODE_NAMES.includes(nodeData?.name)) return;
-    const isMulti = nodeData.name === MULTI_NODE_NAME;
+    const nm = nodeData?.name;
+    const isSaver = nm === SAVER_NODE_NAME;
+    const isGlobal = nm === GLOBAL_NODE_NAME;
+    if (!ALL_NODE_NAMES.includes(nm) && !isSaver && !isGlobal) return;
 
     nodeType.color   = NODE_COLOR;
     nodeType.bgcolor = NODE_BGCOLOR;
+
+    // Global Lora node: stack UI (no randomizer) + two control toggles.
+    if (isGlobal) {
+      const origONC = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        origONC?.apply(this, arguments);
+        this.size = [DEFAULT_WIDTH, 200];
+        try { addGlobalLoraUI(this); } catch (err) { console.warn("[FantasticLoraLoader] global UI build failed", err); }
+      };
+      const origOCC = nodeType.prototype.onConnectionsChange;
+      nodeType.prototype.onConnectionsChange = function () {
+        origOCC?.apply(this, arguments);
+        setTimeout(() => this.__lflRender?.(), 0);
+      };
+      const origOConf = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        origOConf?.apply(this, arguments);
+        try {
+          if (!this.__lflBuilt) addGlobalLoraUI(this);
+          loadStackFromData(this);
+          if (this.__lflGCtrlNoneW)   this.__lflGCtrlNoneW.value   = !!this.__ctrlNone;
+          if (this.__lflGCtrlGlobalW) this.__lflGCtrlGlobalW.value = !!this.__ctrlGlobal;
+          this.__lflRender?.();
+          this.__plffUpdateFolderBtn?.();
+          snapHeight(this);
+        } catch (err) { console.warn("[FantasticLoraLoader] global onConfigure failed", err); }
+      };
+      return;
+    }
+
+    // Saver node: set wider width, wire the constrain group UI, then exit.
+    if (isSaver) {
+      const origOnNodeCreated = nodeType.prototype.onNodeCreated;
+      nodeType.prototype.onNodeCreated = function () {
+        origOnNodeCreated?.apply(this, arguments);
+        this.size = [SAVER_WIDTH, this.size?.[1] ?? 320];
+        try { _setupSaverUI(this); } catch (err) { console.warn("[FantasticLoraLoader] saver UI build failed", err); }
+      };
+
+      const origSaverOCC = nodeType.prototype.onConnectionsChange;
+      nodeType.prototype.onConnectionsChange = function () {
+        origSaverOCC?.apply(this, arguments);
+        setTimeout(() => { try { updateSaverViewerBtn(this); } catch (_) {} }, 0);
+      };
+
+      const origOnConfigure = nodeType.prototype.onConfigure;
+      nodeType.prototype.onConfigure = function (info) {
+        origOnConfigure?.apply(this, arguments);
+        try {
+          // Re-apply saved values BY NAME. ComfyUI restores widgets_values by
+          // position; any non-serializing widget we add can shift that mapping,
+          // so we map the saved array back onto widgets by their canonical order.
+          const vals = info?.widgets_values;
+          if (Array.isArray(vals) && vals.length === SAVER_WIDGET_ORDER.length) {
+            SAVER_WIDGET_ORDER.forEach((nm, i) => {
+              if (vals[i] === undefined) return;
+              const w = this.widgets?.find(x => x.name === nm);
+              if (w) w.value = vals[i];
+            });
+          }
+          // Restore grey-out and classic grid button state.
+          const constrainW = this.widgets?.find(w => w.name === "constrain_size");
+          const maxSideW   = this.widgets?.find(w => w.name === "max_cell_size");
+          const classicW   = this.widgets?.find(w => w.name === "classic_grid");
+          if (constrainW && maxSideW) maxSideW.disabled = !constrainW.value;
+          if (classicW) {
+            this.__classicGrid = !!classicW.value;
+            updateClassicGridLabel(this);
+          }
+          updateSaverViewerBtn(this);
+          this.setDirtyCanvas(true, false);
+        } catch (err) { console.warn("[FantasticLoraLoader] saver onConfigure failed", err); }
+      };
+      return;
+    }
+
+    const isMulti   = isMultiLike(nm);
+    const isPlotter = nm === PLOT_NODE_NAME;
 
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       origOnNodeCreated?.apply(this, arguments);
       this.size = [DEFAULT_WIDTH, 180];
-      try { isMulti ? addMultiUI(this) : addUI(this); }
+      // Plotter uses the multi-model UI but starts with a single model path.
+      try { isMulti ? addMultiUI(this, { autoAddPair: !isPlotter, isPlotter }) : addUI(this); }
       catch (err) { console.warn("[FantasticLoraLoader] UI build failed", err); }
     };
 
     const origOnConnectionsChange = nodeType.prototype.onConnectionsChange;
     nodeType.prototype.onConnectionsChange = function () {
       origOnConnectionsChange?.apply(this, arguments);
-      setTimeout(() => this.__lflRender?.(), 0);
+      setTimeout(() => {
+        this.__lflRender?.();
+        if (isPlotter) { try { updatePlotterControlState(this); } catch (_) {} }
+      }, 0);
     };
 
     const origOnConfigure = nodeType.prototype.onConfigure;
@@ -1031,13 +1520,14 @@ app.registerExtension({
       origOnConfigure?.apply(this, arguments);
       try {
         if (isMulti) {
-          if (!this.__lflBuilt) addMultiUI(this);
+          if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: !isPlotter, isPlotter });
           this.properties.extra_model_count = countExtraModelInputs(this);
           updateModelBar(this);
         } else {
           if (!this.__lflBuilt) addUI(this);
         }
         loadStackFromData(this);
+        if (isPlotter) { updatePlotterLabels(this); updatePlotterControlState(this); }
         // Serialized node width already reflects any randomizer bump — sync the
         // counter so the next commit doesn't add it again.
         this.__lflLastRandCount = (this.__loraStack || []).filter(e => e.random).length;
