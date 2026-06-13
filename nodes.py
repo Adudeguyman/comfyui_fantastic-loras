@@ -995,6 +995,17 @@ class FantasticPlotterImageSaver:
                     "default": 0, "min": 0, "max": 64, "step": 1,
                     "tooltip": "0 = auto (one column per distinct strength). >0 overrides. Ignored in classic grid.",
                 }),
+                "single_strength_layout": (["row", "column"], {
+                    "default": "row",
+                    "tooltip": (
+                        "Only applies in auto mode when every lora is tested at a single (same) "
+                        "strength, i.e. one image per lora.\n"
+                        "row (default): loras lay out side by side in one row.\n"
+                        "column: loras stack vertically in one column.\n"
+                        "Has no effect when strengths vary (that already forms a row) or when "
+                        "images_per_row is set."
+                    ),
+                }),
                 "classic_grid": ("BOOLEAN", {
                     "default": False,
                     "label_on": "Classic (border labels)",
@@ -1031,6 +1042,7 @@ class FantasticPlotterImageSaver:
 
     def compose(self, images, metadata, text_color, background_color,
                 font_size, padding, opacity, images_per_row, classic_grid=False,
+                single_strength_layout="row",
                 constrain_size=False, max_cell_size=512, global_loras_info=None):
         text_color = self._first(text_color, "white")
         background_color = self._first(background_color, "black")
@@ -1125,7 +1137,18 @@ class FantasticPlotterImageSaver:
             labelled.append(_plot_pil_to_tensor(pil))
 
         # 2) Columns: override if set, else auto from the main metadata.
-        per_row = per_row_override if per_row_override > 0 else _plot_auto_per_row(main_meta)
+        if per_row_override > 0:
+            per_row = per_row_override
+        else:
+            auto_per_row = _plot_auto_per_row(main_meta)
+            # Single-strength case (one image per lora → one distinct strength):
+            # auto gives a single column. Optionally lay those out as one row.
+            single_strength = auto_per_row == 1 and len(labelled) > 1
+            layout = self._first(single_strength_layout, "row")
+            if single_strength and layout == "row":
+                per_row = len(labelled)
+            else:
+                per_row = auto_per_row
         per_row = max(1, min(per_row, len(labelled)))  # never wider than the cell count
 
         # 3) Control rows: each control image repeated across a full top row.
@@ -1486,6 +1509,56 @@ def _parse_archive_cfg(raw):
     return cfg
 
 
+# --- global archive defaults (persisted in the user directory) ----------------
+# Stored under ComfyUI's user directory (like WAS Node Suite keeps its settings),
+# so a brand-new Grid Viewer node can start from the last-used archive settings
+# and the file survives pack updates/reinstalls. Falls back to the pack folder if
+# the user-directory API isn't available on this ComfyUI version.
+_USER_CFG_DIRNAME = "fantastic-loras"
+
+def _user_config_dir():
+    base = None
+    try:
+        base = folder_paths.get_user_directory()
+    except Exception:
+        base = None
+    if not base:
+        base = os.path.dirname(os.path.abspath(__file__))
+    d = os.path.join(base, _USER_CFG_DIRNAME)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _archive_defaults_path():
+    return os.path.join(_user_config_dir(), "archive_defaults.json")
+
+def _read_archive_defaults():
+    try:
+        with open(_archive_defaults_path(), "r", encoding="utf-8") as f:
+            return _parse_archive_cfg(json.load(f))
+    except Exception:
+        return _default_archive_cfg()
+
+def _write_archive_defaults(cfg):
+    cfg = _parse_archive_cfg(cfg)
+    path = _archive_defaults_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        os.replace(tmp, path)   # atomic
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
 # An interactive, terminal (OUTPUT_NODE) display node — the interactive twin of
 # the Image Saver. It taps the SAME per-cell wires the Saver receives (the
 # decoded IMAGE list + the Plotter's metadata, and optionally global_loras_info)
@@ -1781,6 +1854,23 @@ def _register_routes():
     async def _runs(_request):
         from aiohttp import web as _web
         return _web.json_response({"runs": _list_runs()})
+
+    # global archive defaults (new Grid Viewer nodes start from these)
+    @PromptServer.instance.routes.get("/fantastic_loras/archive_defaults")
+    async def _get_archive_defaults(_request):
+        from aiohttp import web as _web
+        return _web.json_response({"defaults": _read_archive_defaults()})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/archive_defaults")
+    async def _set_archive_defaults(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        cfg = body.get("defaults", body) if isinstance(body, dict) else {}
+        ok = _write_archive_defaults(cfg)
+        return _web.json_response({"ok": bool(ok), "defaults": _read_archive_defaults()})
 
     @PromptServer.instance.routes.get("/fantastic_loras/run/{rid}")
     async def _run(request):

@@ -1,8 +1,8 @@
 {
   "id": "799f6991-05d8-4658-8e09-1afa4520bd87",
   "revision": 0,
-  "last_node_id": 188,
-  "last_link_id": 309,
+  "last_node_id": 189,
+  "last_link_id": 310,
   "nodes": [
     {
       "id": 99,
@@ -163,45 +163,6 @@
         ],
         "palette": []
       }
-    },
-    {
-      "id": 184,
-      "type": "SaveImageAdvanced",
-      "pos": [
-        6431.939825042675,
-        1193.8268825410205
-      ],
-      "size": [
-        553.7837245447772,
-        130
-      ],
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 297
-        }
-      ],
-      "outputs": [],
-      "properties": {
-        "cnr_id": "comfy-core",
-        "ver": "0.24.0",
-        "Node name for S&R": "SaveImageAdvanced",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.6"
-        }
-      },
-      "widgets_values": [
-        "Ideogram4Grid/%date:yyyy_MM_dd%/pic",
-        "png",
-        "8-bit",
-        "sRGB"
-      ]
     },
     {
       "id": 175,
@@ -592,10 +553,11 @@
         }
       ],
       "properties": {
-        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
+        "cnr_id": "comfyui-fantastic-loras",
         "ver": "5c4c9697fe370d9541a3aca681a193dd06e2332b",
         "Node name for S&R": "FantasticLoraPlotter",
         "extra_model_count": 1,
+        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
         "ue_properties": {
           "widget_ue_connectable": {},
           "input_ue_unconnectable": {},
@@ -640,9 +602,10 @@
         }
       ],
       "properties": {
-        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
+        "cnr_id": "comfyui-fantastic-loras",
         "ver": "5c4c9697fe370d9541a3aca681a193dd06e2332b",
         "Node name for S&R": "FantasticPlotterGlobalLora",
+        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
         "ue_properties": {
           "widget_ue_connectable": {},
           "input_ue_unconnectable": {},
@@ -702,92 +665,6 @@
       "bgcolor": "#535"
     },
     {
-      "id": 183,
-      "type": "FantasticPlotterImageSaver",
-      "pos": [
-        6431.939825042675,
-        790
-      ],
-      "size": [
-        560,
-        344
-      ],
-      "flags": {},
-      "order": 9,
-      "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": 294
-        },
-        {
-          "name": "metadata",
-          "type": "STRING",
-          "link": 295
-        },
-        {
-          "name": "global_loras_info",
-          "shape": 7,
-          "type": "STRING",
-          "link": 296
-        }
-      ],
-      "outputs": [
-        {
-          "name": "grid",
-          "type": "IMAGE",
-          "links": [
-            297
-          ]
-        },
-        {
-          "name": "images",
-          "shape": 6,
-          "type": "IMAGE",
-          "links": [
-            307
-          ]
-        },
-        {
-          "name": "metadata",
-          "shape": 6,
-          "type": "STRING",
-          "links": [
-            308
-          ]
-        },
-        {
-          "name": "global_loras_info",
-          "type": "STRING",
-          "links": [
-            309
-          ]
-        }
-      ],
-      "properties": {
-        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
-        "ver": "5c4c9697fe370d9541a3aca681a193dd06e2332b",
-        "Node name for S&R": "FantasticPlotterImageSaver",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.6"
-        }
-      },
-      "widgets_values": [
-        false,
-        768,
-        "white",
-        "black",
-        20,
-        10,
-        1,
-        0,
-        false
-      ]
-    },
-    {
       "id": 188,
       "type": "FantasticPlotterGridViewer",
       "pos": [
@@ -821,18 +698,144 @@
       ],
       "outputs": [],
       "properties": {
-        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
+        "cnr_id": "comfyui-fantastic-loras",
         "ver": "4c6408c88c62e6b1312e0d7dc0974489259aaba9",
+        "Node name for S&R": "FantasticPlotterGridViewer",
+        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
         "ue_properties": {
           "widget_ue_connectable": {},
-          "input_ue_unconnectable": {}
-        },
-        "Node name for S&R": "FantasticPlotterGridViewer"
+          "input_ue_unconnectable": {},
+          "version": "7.6"
+        }
       },
       "widgets_values": [
-        "{\"archive\":false,\"maxAgeOn\":true,\"maxAgeDays\":14,\"lastNOn\":false,\"lastN\":20}",
+        "{\"archive\":true,\"maxAgeOn\":true,\"maxAgeDays\":14,\"lastNOn\":false,\"lastN\":20}",
         "",
         ""
+      ]
+    },
+    {
+      "id": 183,
+      "type": "FantasticPlotterImageSaver",
+      "pos": [
+        6431.939825042675,
+        790
+      ],
+      "size": [
+        560,
+        368
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 294
+        },
+        {
+          "name": "metadata",
+          "type": "STRING",
+          "link": 295
+        },
+        {
+          "name": "global_loras_info",
+          "shape": 7,
+          "type": "STRING",
+          "link": 296
+        }
+      ],
+      "outputs": [
+        {
+          "name": "grid",
+          "type": "IMAGE",
+          "links": [
+            310
+          ]
+        },
+        {
+          "name": "images",
+          "shape": 6,
+          "type": "IMAGE",
+          "links": [
+            307
+          ]
+        },
+        {
+          "name": "metadata",
+          "shape": 6,
+          "type": "STRING",
+          "links": [
+            308
+          ]
+        },
+        {
+          "name": "global_loras_info",
+          "type": "STRING",
+          "links": [
+            309
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-fantastic-loras",
+        "ver": "5c4c9697fe370d9541a3aca681a193dd06e2332b",
+        "Node name for S&R": "FantasticPlotterImageSaver",
+        "aux_id": "Adudeguyman/comfyui_fantastic-loras",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.6"
+        }
+      },
+      "widgets_values": [
+        false,
+        768,
+        "white",
+        "black",
+        20,
+        10,
+        1,
+        0,
+        false,
+        false
+      ]
+    },
+    {
+      "id": 189,
+      "type": "SaveImage",
+      "pos": [
+        6438.975414351004,
+        1224.2043674639594
+      ],
+      "size": [
+        552.2574640756411,
+        441.5157471521047
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 310
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.24.0",
+        "Node name for S&R": "SaveImage",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "input_ue_unconnectable": {},
+          "version": "7.6"
+        }
+      },
+      "widgets_values": [
+        "Ideogram4Grid/%date:yyyy_MM_dd%/pic"
       ]
     }
   ],
@@ -934,14 +937,6 @@
       "STRING"
     ],
     [
-      297,
-      183,
-      0,
-      184,
-      0,
-      "IMAGE"
-    ],
-    [
       307,
       183,
       1,
@@ -964,6 +959,14 @@
       188,
       2,
       "STRING"
+    ],
+    [
+      310,
+      183,
+      0,
+      189,
+      0,
+      "IMAGE"
     ]
   ],
   "groups": [],
@@ -974,8 +977,8 @@
         "version": 1,
         "state": {
           "lastGroupId": 9,
-          "lastNodeId": 188,
-          "lastLinkId": 309,
+          "lastNodeId": 189,
+          "lastLinkId": 310,
           "lastRerouteId": 0
         },
         "revision": 0,
@@ -3222,8 +3225,8 @@
     "ds": {
       "scale": 0.7900588235294245,
       "offset": [
-        -6006.929029122805,
-        -310.47419100652456
+        -5022.192226204211,
+        375.55067683651373
       ]
     }
   },

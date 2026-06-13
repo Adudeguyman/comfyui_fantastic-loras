@@ -181,6 +181,7 @@ The node also has an **🔍 Add Grid Viewer (connected)** button: click it to dr
 | `padding` | 10 | Padding inside the label box and around the border labels in Classic mode. |
 | `opacity` | 1.0 | Opacity of the label box (Overlay mode only). |
 | `images_per_row` | 0 | 0 = auto (see below). Any positive value overrides. Ignored in Classic mode. |
+| `single_strength_layout` | row | When every lora is tested at the same single strength (one image per lora), choose whether they lay out in one **row** or stack in one **column**. |
 | **🖼 Grid mode** button | Overlay | Toggles between the two layout modes (see below). |
 
 ### Grid modes
@@ -192,6 +193,8 @@ The node also has an **🔍 Add Grid Viewer (connected)** button: click it to dr
 ### Auto column detection
 
 When `images_per_row` is `0`, the node reads the `metadata` list and counts the number of **distinct strength values**. That becomes the column count, so Global-mode sweeps automatically lay out as a true XY grid (loras = rows, strengths = columns) without any manual configuration.
+
+One special case: when you're testing several loras at a **single shared strength** (so there's one image per lora and only one distinct strength), auto would otherwise put them all in a single column. By default (`single_strength_layout = row`), this case instead lays them out side by side in one row. Set it to **`column`** to revert to the single-column stack. It only affects this single-strength case — when strengths vary (already a row) or `images_per_row` is set, it does nothing.
 
 ---
 
@@ -272,6 +275,8 @@ There are two ways a grid lands on disk, and the toolbar shows which state you'r
 - **Keep only the last [N] runs** — off by default. When both rules are on they apply together: an *unpinned* run is removed if it's older than the age limit **or** falls outside the newest N. Pinned grids are exempt. Cleanup runs after each auto-saved generation, and never deletes the run just created.
 - **📌 Manage pinned grids** — a cleanup manager. Pinned grids (exempt from auto-cleanup, so the only way to remove them is here) are listed at the top; auto-saved grids are listed in their own section below. Check any and delete them together, with a confirm step.
 
+Your Archive Settings (the auto-save toggle and the cleanup rules) are remembered as **global defaults**: changing them saves to a small `archive_defaults.json` in ComfyUI's user directory (`user/fantastic-loras/`), and any *new* Grid Viewer node starts from those settings instead of the built-ins. A workflow that already has its own saved settings keeps them — the global default only seeds brand-new nodes. (On older ComfyUI versions without a user-directory API, the file falls back to the pack folder.)
+
 Saved grids reference files by name, so moving the workflow to another machine (or deleting the output files) means a grid won't reload there.
 
 The node is freely resizable; the grid scrolls inside it. A standalone `grid_viewer_demo.html` (openable in any browser) is included for previewing the interactions outside ComfyUI.
@@ -282,15 +287,15 @@ Internal class name `FantasticLoraMimic`. Found in **loaders**.
 
 > ⚠️ **Experimental.** The Mimic node (and its Subgraph Companion) is still a proof-of-concept. It reads other nodes' configured loras through informal ComfyUI frontend internals and covers a fixed set of loader families, so it can break with ComfyUI updates or with loaders it doesn't have an adapter for. Treat it as a convenience for dual-model workflows, not a guaranteed-stable part of the pack — double-check that what it mirrors matches what you intend before relying on a result.
 
-Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. Useful for models with dual model workflows such as Wan 2.2, Ideogram4, or 2nd-pass setups. There are two ways to feed it (a wire always wins over the picker):
+Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. Useful for models with dual model workflows such as Wan 2.2, Ideogram4, or 2nd-pass setups. There are two ways to feed it (if a wire is connected it always wins over the picker):
 
-**1. Wire (cooperating nodes).** Connect any **`LORA_STACK`** output into the Mimic's `lora_stack` input. Our `Fantastic Lora Loader` and `Fantastic Lora Loader (Multi-Model)` now emit a `lora_stack` output, and the Mimic also accepts the common Efficiency-style `LORA_STACK` (list of `(name, model_strength, clip_strength)`), so third-party stackers work too. The Mimic re-emits the resolved stack on its own `lora_stack` output for chaining.
-
-**2. Pick (any node).** With nothing wired, choose a **source** node in the Mimic's UI and it mirrors that node's configured loras into itself — read live from the graph in the frontend, before execution. It can read several loader families: our own stack nodes (they carry a `lora_data` blob); the stock `LoraLoader` / `LoraLoaderModelOnly` (and shape-compatible ones like the pysssss loader); rgthree's `Power Lora Loader`; and numbered-widget stackers like Efficiency `LoRA Stacker` and Comfyroll `CR LoRA Stack`. Controls:
+**1. Pick (any node) — recommended.** With nothing wired, choose a **source** node in the Mimic's UI and it mirrors that node's configured loras into itself — read live from the graph in the frontend, before execution. This is the fuller-featured path, giving you per-lora control: each mirrored lora can either **directly mimic (link)** the source — its strength tracks the source live, so you set it once on the source and forget it — or be **unlinked for fine control**, letting you override that lora's strength on the Mimic independently of the source. It can read several loader families: our own stack nodes (they carry a `lora_data` blob); the stock `LoraLoader` / `LoraLoaderModelOnly` (and shape-compatible ones like the pysssss loader); rgthree's `Power Lora Loader`; and numbered-widget stackers like Efficiency `LoRA Stacker` and Comfyroll `CR LoRA Stack`. Controls:
 - **source** — a dropdown of compatible nodes (labelled `#id title`), or **(auto-detect)** which uses the only compatible source when there's exactly one, or **(none)**.
 - **live_mirror** (on by default) — keeps copying as you edit the source; turn off to only update on demand.
 - **↻ Pull now** — copy the source's loras immediately.
 - A status line shows what's currently being mimicked.
+
+**2. Wire (cooperating nodes).** Connect any **`LORA_STACK`** output into the Mimic's `lora_stack` input. Our `Fantastic Lora Loader` and `Fantastic Lora Loader (Multi-Model)` emit a `lora_stack` output, and the Mimic also accepts the common Efficiency-style `LORA_STACK` (list of `(name, model_strength, clip_strength)`), so third-party stackers work too. The Mimic re-emits the resolved stack on its own `lora_stack` output for chaining. **Note the tradeoff:** a `LORA_STACK` is only resolved tuples computed when the graph runs, with no per-lora link/strength metadata, so the wire path **can't** offer the picker's strength controls — it's hardwired to directly mimic whatever the connected node produces, applied flat. To change a wired lora's strength, adjust it on the upstream node, or use the picker instead.
 
 Outputs: `MODEL`, `CLIP`, `lora_stack` (the resolved stack, for chaining), and `mimicked` (a STRING summary of what was applied).
 

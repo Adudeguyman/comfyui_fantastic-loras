@@ -1077,6 +1077,31 @@ class GridViewer {
     }
   }
 
+  // Global defaults (persisted server-side in the user dir). A brand-new node
+  // with no saved fl_archive starts from these; changing settings updates them.
+  async _loadArchiveDefaults() {
+    try {
+      const res = await fetch(apiPath("/fantastic_loras/archive_defaults"));
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && data.defaults && typeof data.defaults === "object") {
+        this.archiveCfg = { ...this.archiveCfg, ...data.defaults };
+        this._syncArchiveWidget();
+        this._updateToolbar();
+      }
+    } catch (_) { /* offline / route missing — keep built-in defaults */ }
+  }
+
+  _saveArchiveDefaults() {
+    try {
+      fetch(apiPath("/fantastic_loras/archive_defaults"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ defaults: this.archiveCfg }),
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
   openArchivePanel() {
     const o = this.overlay;
     o.innerHTML = ""; o.style.display = "block"; o.style.background = "rgba(3,14,15,.7)";
@@ -1155,7 +1180,7 @@ class GridViewer {
     const close = el("button",
       "align-self:flex-end;background:#14403f;color:" + TEXT_COL + ";border:1px solid " + BORDER + ";" +
       "border-radius:5px;padding:3px 12px;cursor:pointer;font-size:12px;", { textContent: "Done" });
-    close.onclick = () => { apply(); o.style.display = "none"; o.innerHTML = ""; };
+    close.onclick = () => { apply(); this._saveArchiveDefaults(); o.style.display = "none"; o.innerHTML = ""; };
     panel.appendChild(close);
 
     o.appendChild(panel);
@@ -1409,10 +1434,14 @@ app.registerExtension({
         aw.type = "fl_hidden";
         aw.hidden = true;
         viewer.archiveWidget = aw;
+        const hadSaved = !!(aw.value && String(aw.value).trim());
         try {
-          if (aw.value) viewer.archiveCfg = { ...viewer.archiveCfg, ...JSON.parse(aw.value) };
+          if (hadSaved) viewer.archiveCfg = { ...viewer.archiveCfg, ...JSON.parse(aw.value) };
         } catch (_) {}
         viewer._syncArchiveWidget();
+        // Brand-new node (no archive config saved in the workflow): start from the
+        // global defaults. A workflow's own saved config always wins over these.
+        if (!hadSaved) viewer._loadArchiveDefaults();
       }
 
       // Hide the fl_grid_ref state widget — its serialized value is how the grid
