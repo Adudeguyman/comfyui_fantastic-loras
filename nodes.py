@@ -31,6 +31,8 @@ import os
 import re
 import math
 import random
+import time
+import shutil
 
 import folder_paths
 import comfy.utils
@@ -1193,6 +1195,297 @@ class FantasticPlotterGlobalLora:
 # ===========================================================================
 # Fantastic Plotter Grid Viewer
 # ===========================================================================
+# ===========================================================================
+# Grid archive — disk-backed run storage for the Grid Viewer
+# ===========================================================================
+# When the viewer's archive mode is on, each run is written to
+#   output/fantastic-loras-grids/<run_id>/cells/*.png  +  manifest.json
+# so the grid (and any saved comparisons) can be reloaded from disk later,
+# independent of the workflow. A run_id is a sortable timestamp + short random
+# token. Retention (max-age / keep-last-N) is enforced after each archived run.
+
+_ARCHIVE_DIRNAME = "fantastic-loras-grids"
+_RUN_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
+
+
+def _grid_archive_root():
+    root = os.path.join(folder_paths.get_output_directory(), _ARCHIVE_DIRNAME)
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _safe_run_id(rid):
+    return bool(rid) and bool(_RUN_ID_RE.match(str(rid)))
+
+
+def _run_dir(rid):
+    return os.path.join(_grid_archive_root(), str(rid))
+
+
+def _new_run_id():
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + "".join(
+        random.choice("0123456789abcdef") for _ in range(6))
+
+
+def _lora_from_token(token):
+    """Pull a lora display name out of a 'name_strength' metadata token, dropping
+    the trailing strength. Returns None for control/empty tokens."""
+    s = str(token or "").strip()
+    if not s or s in ("control", "control_global", "no_lora"):
+        return None
+    first = s.split(",")[0].strip()
+    idx = first.rfind("_")
+    if idx > 0:
+        tail = first[idx + 1:]
+        try:
+            float(tail)
+            first = first[:idx]
+        except ValueError:
+            pass
+    return first or None
+
+
+def _run_label(metadata_list, global_lines=None):
+    """Name a run after the loras it swept, plus any global loras (tagged).
+    Sweep loras are joined with ' / '; globals are appended as 'name (global)'.
+    (This is display text in the manifest, not a path — the folder is the run_id —
+    so the separator is purely cosmetic.)"""
+    DELIM = " / "
+    MAX_NAMES = 4
+
+    names = []
+    for m in (metadata_list or []):
+        nm = _lora_from_token(m)
+        if nm and nm not in names:
+            names.append(nm)
+    gnames = []
+    for g in (global_lines or []):
+        gn = _lora_from_token(g)
+        if gn and gn not in gnames:
+            gnames.append(gn)
+
+    parts = []
+    if names:
+        shown = names[:MAX_NAMES]
+        seg = DELIM.join(shown)
+        if len(names) > MAX_NAMES:
+            seg += DELIM + f"+{len(names) - MAX_NAMES} more"
+        parts.append(seg)
+    if gnames:
+        gseg = ", ".join(gnames[:2])
+        if len(gnames) > 2:
+            gseg += f", +{len(gnames) - 2}"
+        parts.append(f"{gseg} (global)")
+
+    return DELIM.join(parts) if parts else "grid"
+
+
+def _read_manifest(rid):
+    if not _safe_run_id(rid):
+        return None
+    path = os.path.join(_run_dir(rid), "manifest.json")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _write_manifest(rid, data):
+    if not _safe_run_id(rid):
+        return False
+    d = _run_dir(rid)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, "manifest.json.tmp")
+    final = os.path.join(d, "manifest.json")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, final)
+        return True
+    except Exception:
+        return False
+
+
+def _cells_as_refs(rid, cells):
+    """Turn a manifest's cell list into frontend image refs."""
+    sub = (_ARCHIVE_DIRNAME + "/" + str(rid) + "/cells").replace(os.sep, "/")
+    return [{
+        "filename": c.get("file", ""),
+        "subfolder": sub,
+        "type": "output",
+        "metadata": c.get("metadata", ""),
+    } for c in (cells or [])]
+
+
+def _list_runs():
+    root = _grid_archive_root()
+    out = []
+    try:
+        entries = os.listdir(root)
+    except Exception:
+        return out
+    for rid in entries:
+        if not _safe_run_id(rid):
+            continue
+        man = _read_manifest(rid)
+        if not man:
+            continue
+        out.append({
+            "run_id": rid,
+            "name": man.get("name", "grid"),
+            "created": man.get("created", 0),
+            "created_str": man.get("created_str", ""),
+            "cell_count": len(man.get("cells", [])),
+            "comparison_count": len(man.get("comparisons", [])),
+            "pinned": bool(man.get("pinned", False)),
+        })
+    out.sort(key=lambda r: r.get("created", 0), reverse=True)
+    return out
+
+
+def _resolve_ref_path(ref):
+    """Safely resolve a frontend image ref ({filename, subfolder, type}) to an
+    on-disk path, guarding against path traversal outside the type's base dir."""
+    try:
+        rtype = str(ref.get("type", "temp"))
+        if rtype == "output":
+            base = folder_paths.get_output_directory()
+        elif rtype == "input":
+            base = folder_paths.get_input_directory()
+        else:
+            base = folder_paths.get_temp_directory()
+        sub = str(ref.get("subfolder", "") or "")
+        fn = str(ref.get("filename", "") or "")
+        if not fn:
+            return None
+        path = os.path.normpath(os.path.join(base, sub, fn))
+        base_real = os.path.realpath(base)
+        if not os.path.realpath(path).startswith(base_real):
+            return None
+        return path if os.path.isfile(path) else None
+    except Exception:
+        return None
+
+
+def _save_grid_from_refs(cells, global_lines, comparisons, favorites=None, pinned=True):
+    """Create a new (pinned) archive run by copying already-rendered cell images
+    from their current location into a fresh run folder. Used by the manual
+    'Save Grid' action. Returns the manifest dict, or None on total failure."""
+    rid = _new_run_id()
+    cells_dir = os.path.join(_run_dir(rid), "cells")
+    os.makedirs(cells_dir, exist_ok=True)
+
+    manifest_cells = []
+    copied = 0
+    for i, ref in enumerate(cells or []):
+        src = _resolve_ref_path(ref)
+        meta = str(ref.get("metadata", "")) if isinstance(ref, dict) else ""
+        if not src:
+            continue
+        dst_name = f"cell_{i:04}.png"
+        try:
+            shutil.copyfile(src, os.path.join(cells_dir, dst_name))
+        except Exception:
+            continue
+        manifest_cells.append({
+            "file": dst_name, "metadata": meta,
+            "control": meta in ("control", "control_global"),
+        })
+        copied += 1
+
+    if not copied:
+        _delete_run(rid)   # nothing copied — don't leave an empty folder
+        return None
+
+    comps = []
+    for c in (comparisons or []):
+        if isinstance(c, dict) and c.get("name"):
+            comps.append({"name": str(c["name"]),
+                          "keys": [str(k) for k in (c.get("keys") or [])],
+                          "created": time.time()})
+
+    manifest = {
+        "run_id": rid,
+        "name": _run_label([c["metadata"] for c in manifest_cells], global_lines),
+        "created": time.time(),
+        "created_str": time.strftime("%Y-%m-%d %H:%M"),
+        "global": [str(g) for g in (global_lines or [])],
+        "cells": manifest_cells,
+        "comparisons": comps,
+        "favorites": [str(k) for k in (favorites or [])],
+        "pinned": bool(pinned),
+    }
+    _write_manifest(rid, manifest)
+    return manifest
+
+
+def _delete_run(rid):
+    if not _safe_run_id(rid):
+        return False
+    d = _run_dir(rid)
+    try:
+        if os.path.isdir(d):
+            shutil.rmtree(d)
+        return True
+    except Exception:
+        return False
+
+
+def _run_retention(cfg, keep_id=None):
+    """Delete archived runs that violate the retention policy. A run is removed
+    if (max-age is on AND it's older than the limit) OR (last-N is on AND it
+    falls outside the newest N). The run just created (keep_id) is never touched.
+    Returns the list of deleted run_ids."""
+    age_on = bool(cfg.get("maxAgeOn"))
+    n_on = bool(cfg.get("lastNOn"))
+    if not age_on and not n_on:
+        return []
+
+    runs = _list_runs()  # newest first
+    deleted = []
+    now = time.time()
+
+    try:
+        max_age_days = float(cfg.get("maxAgeDays", 14))
+    except (TypeError, ValueError):
+        max_age_days = 14.0
+    try:
+        last_n = int(cfg.get("lastN", 20))
+    except (TypeError, ValueError):
+        last_n = 20
+
+    for idx, r in enumerate(runs):
+        rid = r["run_id"]
+        if keep_id and rid == keep_id:
+            continue
+        if r.get("pinned"):
+            continue   # pinned grids are exempt from automatic cleanup
+        too_old = age_on and (now - float(r.get("created", now))) > max_age_days * 86400.0
+        beyond_n = n_on and idx >= max(0, last_n)
+        if too_old or beyond_n:
+            if _delete_run(rid):
+                deleted.append(rid)
+    return deleted
+
+
+def _default_archive_cfg():
+    return {"archive": False, "maxAgeOn": True, "maxAgeDays": 14,
+            "lastNOn": False, "lastN": 20}
+
+
+def _parse_archive_cfg(raw):
+    cfg = _default_archive_cfg()
+    if raw:
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if isinstance(data, dict):
+                cfg.update({k: data[k] for k in cfg if k in data})
+        except Exception:
+            pass
+    return cfg
+
+
 # An interactive, terminal (OUTPUT_NODE) display node — the interactive twin of
 # the Image Saver. It taps the SAME per-cell wires the Saver receives (the
 # decoded IMAGE list + the Plotter's metadata, and optionally global_loras_info)
@@ -1202,8 +1495,7 @@ class FantasticPlotterGlobalLora:
 
 class FantasticPlotterGridViewer:
     def __init__(self):
-        self.output_dir = folder_paths.get_temp_directory()
-        self.type = "temp"
+        self.temp_dir = folder_paths.get_temp_directory()
         self.prefix_append = "_flgrid_" + "".join(
             random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(6))
 
@@ -1216,6 +1508,12 @@ class FantasticPlotterGridViewer:
             },
             "optional": {
                 "global_loras_info": ("STRING", {"forceInput": True}),
+                # Archive config (managed by the frontend's Archive settings UI).
+                # JSON: {archive, maxAgeOn, maxAgeDays, lastNOn, lastN}
+                "fl_archive": ("STRING", {"default": ""}),
+                # Frontend-managed grid state (cells/runId/comparisons/favorites)
+                # so the viewer reliably restores on reload. Python ignores it.
+                "fl_grid_ref": ("STRING", {"default": ""}),
             },
         }
 
@@ -1232,7 +1530,7 @@ class FantasticPlotterGridViewer:
             return v[0] if v else default
         return v if v is not None else default
 
-    def view(self, images, metadata, global_loras_info=None):
+    def view(self, images, metadata, global_loras_info=None, fl_archive=None, fl_grid_ref=None):
         # Normalise inputs. With INPUT_IS_LIST every arg arrives as a list; the
         # plotter emits one [1,H,W,C] tensor per cell and one metadata string per
         # cell, already index-aligned.
@@ -1240,6 +1538,9 @@ class FantasticPlotterGridViewer:
             images = []
         if not isinstance(metadata, list):
             metadata = [metadata] if metadata is not None else []
+
+        cfg = _parse_archive_cfg(self._first(fl_archive, ""))
+        archive = bool(cfg.get("archive"))
 
         ginfo = self._first(global_loras_info, "") or ""
         global_lines = [ln for ln in str(ginfo).split("\n") if ln.strip()]
@@ -1257,33 +1558,78 @@ class FantasticPlotterGridViewer:
             else:
                 frames.append((arr, meta))
 
+        if archive:
+            return self._view_archive(frames, global_lines, metadata, cfg)
+        return self._view_temp(frames, global_lines)
+
+    # --- ephemeral path: temp folder, restored from the workflow JSON ----------
+    def _view_temp(self, frames, global_lines):
         results = []
         if frames:
             h = int(frames[0][0].shape[0])
             w = int(frames[0][0].shape[1])
             full_output_folder, filename, counter, subfolder, _pref = \
                 folder_paths.get_save_image_path(
-                    "ComfyUI" + self.prefix_append, self.output_dir, w, h)
-
+                    "ComfyUI" + self.prefix_append, self.temp_dir, w, h)
             for (tensor, meta) in frames:
-                a = 255.0 * tensor.cpu().numpy()
-                pil = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+                pil = self._to_pil(tensor)
                 file = f"{filename}_{counter:05}_.png"
                 pil.save(os.path.join(full_output_folder, file), compress_level=1)
                 results.append({
-                    "filename": file,
-                    "subfolder": subfolder,
-                    "type": self.type,
-                    "metadata": str(meta),
+                    "filename": file, "subfolder": subfolder,
+                    "type": "temp", "metadata": str(meta),
                 })
                 counter += 1
+        return {"ui": {"fl_cells": results, "fl_global": global_lines, "fl_run_id": [""]}}
 
-        # The frontend reads fl_cells (image refs + per-cell metadata) and
-        # fl_global (the global loras summary) in onExecuted.
+    # --- archive path: per-run subfolder + manifest, with retention ------------
+    def _view_archive(self, frames, global_lines, metadata, cfg):
+        rid = _new_run_id()
+        cells_dir = os.path.join(_run_dir(rid), "cells")
+        os.makedirs(cells_dir, exist_ok=True)
+
+        manifest_cells = []
+        results = []
+        for i, (tensor, meta) in enumerate(frames):
+            pil = self._to_pil(tensor)
+            file = f"cell_{i:04}.png"
+            pil.save(os.path.join(cells_dir, file), compress_level=1)
+            manifest_cells.append({
+                "file": file, "metadata": str(meta),
+                "control": str(meta) in ("control", "control_global"),
+            })
+
+        results = _cells_as_refs(rid, manifest_cells)
+
+        manifest = {
+            "run_id": rid,
+            "name": _run_label([c["metadata"] for c in manifest_cells], global_lines),
+            "created": time.time(),
+            "created_str": time.strftime("%Y-%m-%d %H:%M"),
+            "global": global_lines,
+            "cells": manifest_cells,
+            "comparisons": [],
+            "favorites": [],
+            "pinned": False,   # auto-saved runs start unpinned (retention applies)
+        }
+        _write_manifest(rid, manifest)
+
+        # Enforce retention AFTER writing this run (never deletes this run).
+        try:
+            _run_retention(cfg, keep_id=rid)
+        except Exception as exc:
+            print(f"[FantasticGridViewer] retention cleanup failed: {exc}")
+
         return {"ui": {
             "fl_cells": results,
             "fl_global": global_lines,
+            "fl_run_id": [rid],
         }}
+
+    @staticmethod
+    def _to_pil(tensor):
+        a = 255.0 * tensor.cpu().numpy()
+        return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
 
 # ===========================================================================
@@ -1429,6 +1775,120 @@ def _register_routes():
     async def _list_loras(_request):
         from aiohttp import web as _web
         return _web.json_response(_all_lora_files())
+
+    # --- grid archive ---------------------------------------------------------
+    @PromptServer.instance.routes.get("/fantastic_loras/runs")
+    async def _runs(_request):
+        from aiohttp import web as _web
+        return _web.json_response({"runs": _list_runs()})
+
+    @PromptServer.instance.routes.get("/fantastic_loras/run/{rid}")
+    async def _run(request):
+        from aiohttp import web as _web
+        rid = request.match_info.get("rid", "")
+        man = _read_manifest(rid)
+        if not man:
+            return _web.json_response({"error": "not found"}, status=404)
+        return _web.json_response({
+            "run_id": rid,
+            "name": man.get("name", "grid"),
+            "created_str": man.get("created_str", ""),
+            "global": man.get("global", []),
+            "cells": _cells_as_refs(rid, man.get("cells", [])),
+            "comparisons": man.get("comparisons", []),
+            "favorites": man.get("favorites", []),
+            "pinned": bool(man.get("pinned", False)),
+        })
+
+    @PromptServer.instance.routes.post("/fantastic_loras/run/{rid}/favorites")
+    async def _favorites(request):
+        from aiohttp import web as _web
+        rid = request.match_info.get("rid", "")
+        man = _read_manifest(rid)
+        if not man:
+            return _web.json_response({"error": "not found"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        man["favorites"] = [str(k) for k in (body.get("favorites") or [])]
+        ok = _write_manifest(rid, man)
+        return _web.json_response({"ok": ok, "favorites": man["favorites"]})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/run/{rid}/pin")
+    async def _pin(request):
+        from aiohttp import web as _web
+        rid = request.match_info.get("rid", "")
+        man = _read_manifest(rid)
+        if not man:
+            return _web.json_response({"error": "not found"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        man["pinned"] = bool(body.get("pinned", True))
+        ok = _write_manifest(rid, man)
+        return _web.json_response({"ok": ok, "pinned": man["pinned"]})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/save_grid")
+    async def _save_grid(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        man = _save_grid_from_refs(
+            body.get("cells") or [],
+            body.get("global") or [],
+            body.get("comparisons") or [],
+            favorites=body.get("favorites") or [],
+            pinned=bool(body.get("pinned", True)))
+        if not man:
+            return _web.json_response(
+                {"error": "no images available to save (they may have been cleared)"},
+                status=409)
+        rid = man["run_id"]
+        return _web.json_response({
+            "ok": True,
+            "run_id": rid,
+            "name": man["name"],
+            "cells": _cells_as_refs(rid, man["cells"]),
+            "comparisons": man["comparisons"],
+            "favorites": man.get("favorites", []),
+            "pinned": man["pinned"],
+        })
+
+    @PromptServer.instance.routes.post("/fantastic_loras/run/{rid}/comparison")
+    async def _comparison(request):
+        from aiohttp import web as _web
+        rid = request.match_info.get("rid", "")
+        man = _read_manifest(rid)
+        if not man:
+            return _web.json_response({"error": "not found"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        action = body.get("action", "save")
+        name = str(body.get("name", "")).strip()
+        comps = man.get("comparisons", [])
+        if action == "delete":
+            comps = [c for c in comps if c.get("name") != name]
+        else:  # save / replace by name
+            keys = [str(k) for k in (body.get("keys") or [])]
+            comps = [c for c in comps if c.get("name") != name]
+            comps.append({"name": name, "keys": keys, "created": time.time()})
+        man["comparisons"] = comps
+        ok = _write_manifest(rid, man)
+        return _web.json_response({"ok": ok, "comparisons": comps})
+
+    @PromptServer.instance.routes.delete("/fantastic_loras/run/{rid}")
+    async def _delete(request):
+        from aiohttp import web as _web
+        rid = request.match_info.get("rid", "")
+        if not _safe_run_id(rid):
+            return _web.json_response({"error": "bad id"}, status=400)
+        return _web.json_response({"ok": _delete_run(rid)})
 
 
 _register_routes()

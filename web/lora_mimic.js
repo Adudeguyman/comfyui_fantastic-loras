@@ -94,23 +94,28 @@ function isStockLora(node) {
     (names.includes("strength_model") || names.includes("strength_clip"));
 }
 
-// --- numbered-widget stackers (Efficiency "LoRA Stacker", Comfyroll "CR LoRA Stack") ---
-// Both lay loras out as lora_name_1, lora_name_2, ... with per-index strength widgets
-// under various names. One adapter covers both by probing the known aliases.
+// --- numbered-widget stackers --------------------------------------------------
+// Covers Efficiency "LoRA Stacker" & Comfyroll "CR LoRA Stack" (lora_name_1, …)
+// AND rgthree "Lora Loader Stack" (lora_01/strength_01, zero-padded, single
+// strength). Index strings are kept verbatim (so "01" maps to strength_01) and
+// per-slot strength is probed across the known aliases.
+const _LORA_IDX_RE = /^lora(?:_name)?_(\d+)$/;
+
 function isNumberedStacker(node) {
-  return (node.widgets || []).some((w) => w && /^lora_name_\d+$/.test(String(w.name || "")));
+  return (node.widgets || []).some((w) => w && _LORA_IDX_RE.test(String(w.name || "")));
 }
 
 function numberedStackEntries(node) {
   const wmap = {};
   for (const w of (node.widgets || [])) if (w && w.name != null) wmap[w.name] = w.value;
-  const idxs = [];
+
+  const slots = [];
   for (const k of Object.keys(wmap)) {
-    const m = /^lora_name_(\d+)$/.exec(k);
-    if (m) idxs.push(parseInt(m[1], 10));
+    const m = _LORA_IDX_RE.exec(k);
+    if (m) slots.push({ key: k, idx: m[1] });   // idx kept as-is (may be zero-padded)
   }
-  if (!idxs.length) return null;
-  idxs.sort((a, b) => a - b);
+  if (!slots.length) return null;
+  slots.sort((a, b) => parseInt(a.idx, 10) - parseInt(b.idx, 10));
 
   // Efficiency: lora_count caps how many rows are active
   const loraCount = (typeof wmap["lora_count"] === "number") ? wmap["lora_count"] : null;
@@ -121,10 +126,11 @@ function numberedStackEntries(node) {
   };
 
   const out = [];
-  for (const i of idxs) {
-    if (loraCount != null && i > loraCount) continue;
-    const name = wmap[`lora_name_${i}`];
-    if (!name || name === "None") continue;
+  for (const slot of slots) {
+    const i = slot.idx;
+    if (loraCount != null && parseInt(i, 10) > loraCount) continue;
+    const name = wmap[slot.key];
+    if (!name || name === "None" || typeof name !== "string") continue;
     // per-row on/off (Comfyroll: switch_i = "On"/"Off"; others: enable_i / on_i booleans)
     const sw = pick([`switch_${i}`, `enable_${i}`, `on_${i}`]);
     if (sw !== undefined) {

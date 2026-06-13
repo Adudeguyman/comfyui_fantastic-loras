@@ -239,14 +239,42 @@ The viewer needs the **individual** cell images, not the Saver's already-compose
 - **Graph layout** — cells are laid out as a lora × strength grid (rows = loras, columns = strengths), with control images in their own labeled rows at the top, mirroring the Saver's look. The global loras are listed in a strip across the top.
 - **Hide / show rows and columns** — every row and column header has a ✕ to hide it. Hidden rows appear as chips beneath the grid (and hidden columns as chips in the top-left corner); click a chip or **Reset filters** to bring them back. This lets you focus on a subset without re-running the graph.
 - **Click to zoom** — click any cell and it grows out of the grid into a large centered view with its full metadata (lora, strength, globals). Click anywhere off the image and it shrinks back into its place in the grid.
-- **Select & compare** — each cell has a checkbox in its corner. Tick two or more, then hit **Compare (N)** to see them side by side, each captioned with exactly what the Plotter used for that image (lora name, strength, and any global loras). **Clear selection** resets the ticks.
+- **Select & compare** — each cell has a checkbox in its corner. Tick two or more, then hit **Compare (N)** to see them side by side, each captioned with exactly what the Plotter used for that image (lora name, strength, and any global loras). **Clear selection** resets the ticks. In the compare view, **⤓ Export image** downloads the side-by-side as one PNG, and **💾 Save comparison** stores that set of cells so you can reopen the live comparison later (see below).
 - **Thumbnail size** — a slider in the toolbar scales every cell live.
+
+### Saved comparisons
+
+The grid persists with your workflow — reopening the workflow or switching tabs brings the last run's grid back without re-running (only lightweight image references are stored, not the pixels). On top of that you can bank specific comparisons:
+
+- **💾 Save comparison** (in the compare view) saves the current set of selected cells under a name. **☰ Saved Comparisons (N)** in the toolbar lists them — click one to reopen that comparison live, or ✕ to delete it.
+- A saved comparison is **bound to its run's grid**. Reopening the workflow restores the grid and its saved comparisons together. **Running the Plotter again is a clean slate** — the new grid replaces the old one and the previous run's selection, favourites, and saved comparisons are cleared, since they belonged to a grid that no longer exists.
+
+### Saving grids to disk
+
+By default, grid images live in ComfyUI's temp folder, which is cleared on restart — so the in-workflow grid restores within a session (reload, tab switch) but not after a full restart. To keep grids permanently you save them to disk, where each saved grid is a run folder under `output/fantastic-loras-grids/<run_id>/` (its own subfolder, never the output root) with a `manifest.json` holding the layout, metadata, and saved comparisons.
+
+There are two ways a grid lands on disk, and the toolbar shows which state you're in:
+
+- **💾 Save Grid** — saves the current grid on demand. Manually-saved grids are **pinned**: they're kept until you delete them and are never touched by automatic cleanup. Once saved, the button area shows **✓ Saved**, a **📌 Pin / Pinned** toggle, and **🗑 Delete This Grid**.
+- **Auto-save every run** (in Archive Settings) — writes *every* run to disk automatically. Auto-saved grids start unpinned and are subject to the cleanup rules. A status indicator in the toolbar (**● Auto-saving** / **○ Auto-save off**) always shows whether new runs are being kept.
+- **📂 Saved Grids** — browse and load grids from disk. Always available, even with auto-save off, so turning auto-save off never orphans grids you already saved. Each entry is named after the loras it swept (joined with ` / `) plus any global loras tagged `(global)`, shows a 📌 if pinned, plus the date/time, and has Load and 🗑.
+
+### Archive Settings ⚙
+
+- **Auto-save every run to disk** — the toggle described above. A note reminds you it keeps every generated image on disk and uses space. The cleanup rules below appear when it's on.
+- **Delete runs older than [N] days** — *on by default, 14 days.*
+- **Keep only the last [N] runs** — off by default. When both rules are on they apply together: an *unpinned* run is removed if it's older than the age limit **or** falls outside the newest N. Pinned grids are exempt. Cleanup runs after each auto-saved generation, and never deletes the run just created.
+- **📌 Manage pinned grids** — a cleanup manager. Pinned grids (exempt from auto-cleanup, so the only way to remove them is here) are listed at the top; auto-saved grids are listed in their own section below. Check any and delete them together, with a confirm step.
+
+Saved grids reference files by name, so moving the workflow to another machine (or deleting the output files) means a grid won't reload there.
 
 The node is freely resizable; the grid scrolls inside it. A standalone `grid_viewer_demo.html` (openable in any browser) is included for previewing the interactions outside ComfyUI.
 
 ## Fantastic Lora Mimic 🪞
 
-Internal class name `FantasticLoraMimic`. Found in **loaders**. *(Proof-of-concept.)*
+Internal class name `FantasticLoraMimic`. Found in **loaders**.
+
+> ⚠️ **Experimental.** The Mimic node (and its Subgraph Companion) is still a proof-of-concept. It reads other nodes' configured loras through informal ComfyUI frontend internals and covers a fixed set of loader families, so it can break with ComfyUI updates or with loaders it doesn't have an adapter for. Treat it as a convenience for dual-model workflows, not a guaranteed-stable part of the pack — double-check that what it mirrors matches what you intend before relying on a result.
 
 Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. Useful for models with dual model workflows such as Wan 2.2, Ideogram4, or 2nd-pass setups. There are two ways to feed it (a wire always wins over the picker):
 
