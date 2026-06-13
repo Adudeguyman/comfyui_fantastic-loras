@@ -2,9 +2,24 @@
 
 A ComfyUI custom node pack for stacking, lora testing (with a XY plotter with a grid output and a custom comparison node), and mirroring LoRAs for multi-model workflows.
 
+## Overview
+
 - **Loaders** — stack multiple LoRAs onto one or several models (such as workflows for Ideogram4), with a folder filter, favourites, and randomizer lines (`Fantastic Lora Loader` / `Fantastic Lora Loader (Multi-Model)`).
 - **Plotter** — sweep your LoRA stack across a grid, optionally layering global LoRAs and control/baseline cells (`Fantastic Lora Plotter`, `Fantastic Plotter Global Lora`, `Fantastic Plotter Image Saver`, `Fantastic Plotter Grid Viewer`).
 - **Mimic** — mirror or wire in LoRAs from other loaders (including rgthree's Power Lora Loader, Efficiency/Comfyroll stackers, and stock loaders) onto an independent model/clip path for use in dual-model workflows (like Ideogram4), with a High/Low mode for split models like Wan 2.2, and a Subgraph Companion helper for crossing subgraph boundaries (`Fantastic Lora Mimic`, `Fantastic Lora Mimic Subgraph Companion`).
+
+## Install
+
+**ComfyUI-Manager (recommended):** open the Manager, choose **Install Custom Nodes**, search for **Fantastic Loras**, and install. Restart ComfyUI when prompted.
+
+**Manual:**
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/Adudeguyman/comfyui_fantastic-loras
+```
+
+Restart ComfyUI and hard-refresh the browser (Ctrl+Shift+R). No Python dependencies beyond ComfyUI itself.
 
 ## Nodes
 
@@ -24,15 +39,6 @@ Outputs: `MODEL`, `CLIP`. When CLIP isn't connected the CLIP output passes `None
 Same as above, plus up to 4 additional optional MODEL inputs. Use this when running multiple samplers with different models — patch all of them through one unified lora stack. Internal class name `FantasticLoraLoaderMulti`.
 
 A compact **Model paths: N / 5  ➕ ➖** bar lets you add and remove model input/output pairs dynamically. Each extra model is patched with the same lora stack (model strength only); the shared CLIP is patched once via the primary path.
-
-## Install
-
-```bash
-cd ~/ComfyUI2/custom_nodes
-git clone https://github.com/YOUR_USERNAME/comfyui_fantastic-loras
-```
-
-Restart ComfyUI and hard-refresh the browser (Ctrl+Shift+R). No Python dependencies beyond ComfyUI itself.
 
 ## Using the nodes
 
