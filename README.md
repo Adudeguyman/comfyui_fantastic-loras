@@ -1,10 +1,14 @@
 # comfyui_fantastic-loras
 
-A ComfyUI custom node pack for stacking multiple LoRAs, with a built-in folder filter, favourites system, randomizer lines, and multi-model support. Based on the underlying Power Lora Loader node by rgthree.
+A ComfyUI custom node pack for stacking, lora testing (with a XY plotter with a grid output and a custom comparison node), and mirroring LoRAs for multi-model workflows.
+
+- **Loaders** — stack multiple LoRAs onto one or several models (such as workflows for Ideogram4), with a folder filter, favourites, and randomizer lines (`Fantastic Lora Loader` / `Fantastic Lora Loader (Multi-Model)`).
+- **Plotter** — sweep your LoRA stack across a grid, optionally layering global LoRAs and control/baseline cells (`Fantastic Lora Plotter`, `Fantastic Plotter Global Lora`, `Fantastic Plotter Image Saver`, `Fantastic Plotter Grid Viewer`).
+- **Mimic** — mirror or wire in LoRAs from other loaders (including rgthree's Power Lora Loader, Efficiency/Comfyroll stackers, and stock loaders) onto an independent model/clip path for use in dual-model workflows (like Ideogram4), with a High/Low mode for split models like Wan 2.2, and a Subgraph Companion helper for crossing subgraph boundaries (`Fantastic Lora Mimic`, `Fantastic Lora Mimic Subgraph Companion`).
 
 ## Nodes
 
-Both nodes appear in the add-node menu under **loaders** (search "fantastic lora").
+All nodes appear in the add-node menu under **loaders** (search "fantastic lora").
 
 ### Fantastic Lora Loader 📁
 Single model + optional CLIP. Internal class name `FantasticLoraLoader`.
@@ -114,7 +118,7 @@ The 📂 icon on each randomizer line is a **subset** of whatever the node's �
 
 Internal class name `FantasticLoraPlotter`. Found in **loaders** alongside the other nodes.
 
-The Plotter is a sweep node: instead of applying all enabled loras as a single combined stack, it applies each lora **individually** to the base model and emits the results as a list — one generation per cell. Connect it to a KSampler → VAE Decode → Fantastic Plotter Image Saver (see below) and ComfyUI will automatically run the downstream graph once per cell, producing a grid of images.
+The Plotter is a lora testing "sweep" node: instead of applying all enabled loras as a single combined stack, it applies each lora **individually** to the base model and emits the results as a list — one generation per cell. Connect it to a KSampler → VAE Decode → Fantastic Plotter Image Saver (see below) and ComfyUI will automatically run the downstream graph once per cell, producing a grid of images.
 
 Inputs are identical to the Multi-Model loader: a primary MODEL + optional CLIP, plus up to four additional optional MODEL paths. The stack UI is the same — add, reorder, enable/disable, randomize. There's also an optional **`global_loras`** input — connect a Fantastic Plotter Global Lora node here to apply a fixed set of "background" loras to every swept cell in addition to the cell's own lora/strength. The Plotter has a **🌐 Add Global Lora node (connected)** button that drops one into the graph (to the left of the Plotter) with its output already wired to this input; the button greys out to "Global Lora node connected" once one is attached.
 
@@ -244,7 +248,7 @@ The node is freely resizable; the grid scrolls inside it. A standalone `grid_vie
 
 Internal class name `FantasticLoraMimic`. Found in **loaders**. *(Proof-of-concept.)*
 
-Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. There are two ways to feed it (a wire always wins over the picker):
+Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. Useful for models with dual model workflows such as Wan 2.2, Ideogram4, or 2nd-pass setups. There are two ways to feed it (a wire always wins over the picker):
 
 **1. Wire (cooperating nodes).** Connect any **`LORA_STACK`** output into the Mimic's `lora_stack` input. Our `Fantastic Lora Loader` and `Fantastic Lora Loader (Multi-Model)` now emit a `lora_stack` output, and the Mimic also accepts the common Efficiency-style `LORA_STACK` (list of `(name, model_strength, clip_strength)`), so third-party stackers work too. The Mimic re-emits the resolved stack on its own `lora_stack` output for chaining.
 
