@@ -570,18 +570,18 @@ class GridViewer {
     const r = fromEl.getBoundingClientRect();
     const ar = this.aspect || 1;
 
-    const pad = 22, capH = 46;
-    const availW = Math.max(80, rootRect.width - pad * 2);
+    const pad = 22, capH = 40, sideW = 132, gap = 8;
+    const availW = Math.max(80, rootRect.width - pad * 2 - sideW - gap);
     const availH = Math.max(80, rootRect.height - pad * 2 - capH);
     let imgW = availW, imgH = imgW / ar;
     if (imgH > availH) { imgH = availH; imgW = imgH * ar; }
-    const panelW = imgW;
+    const panelW = imgW + gap + sideW;
     const panelH = imgH + capH;
     const targetLeft = (rootRect.width - panelW) / 2;
     const targetTop = (rootRect.height - panelH) / 2;
 
     const panel = el("div",
-      "position:absolute;display:flex;flex-direction:column;background:" + BAR_BG + ";" +
+      "position:absolute;display:flex;flex-direction:row;background:" + BAR_BG + ";" +
       "border:1px solid " + BORDER + ";border-radius:8px;overflow:hidden;box-sizing:border-box;" +
       "transition:all .22s cubic-bezier(.2,.7,.3,1);");
     panel.style.left = (r.left - rootRect.left) + "px";
@@ -590,32 +590,37 @@ class GridViewer {
     panel.style.height = r.height + "px";
     panel.style.opacity = ".5";
 
+    // left: image stacked over a metadata caption bar (full width of this column)
+    const main = el("div", "flex:1 1 auto;min-width:0;display:flex;flex-direction:column;");
     const img = el("img",
       "flex:1 1 auto;min-height:0;width:100%;object-fit:contain;display:block;background:#06181a;",
       { src: viewURL(c), draggable: false });
-
-    // caption bar: metadata on the left, save controls on the right
     const cap = el("div",
-      "flex:none;height:" + capH + "px;display:flex;align-items:center;gap:10px;padding:0 10px;" +
-      "font-size:12px;line-height:1.4;");
-    const metaSpan = el("div",
-      "flex:1 1 auto;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;");
-    metaSpan.innerHTML = this._metaHTML(c);
-    cap.appendChild(metaSpan);
+      "flex:none;height:" + capH + "px;display:flex;align-items:center;padding:0 10px;" +
+      "font-size:12px;line-height:1.4;overflow:hidden;");
+    cap.innerHTML = this._metaHTML(c);
+    main.appendChild(img);
+    main.appendChild(cap);
 
-    const cbLabel = el("label",
-      "display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;font-size:11px;opacity:.9;flex:none;");
-    const cb = el("input", "cursor:pointer;", { type: "checkbox", checked: true });
-    cbLabel.appendChild(cb);
-    cbLabel.appendChild(el("span", "", { textContent: "incl. metadata bar" }));
-    cbLabel.onclick = (e) => e.stopPropagation();
+    // right: save controls, off to the side so they never overlap the metadata
+    const side = el("div",
+      "flex:none;width:" + sideW + "px;display:flex;flex-direction:column;align-items:stretch;" +
+      "justify-content:flex-end;gap:8px;padding:10px;border-left:1px solid " + BORDER + ";");
 
     const saveBtn = el("button",
-      "flex:none;background:#14403f;color:" + TEXT_COL + ";border:1px solid " + BORDER + ";" +
-      "border-radius:5px;padding:3px 11px;cursor:pointer;font-size:12px;white-space:nowrap;",
+      "background:#14403f;color:" + TEXT_COL + ";border:1px solid " + BORDER + ";" +
+      "border-radius:5px;padding:5px 0;cursor:pointer;font-size:12px;white-space:nowrap;text-align:center;",
       { textContent: "\u2913 Save", title: "Download this image" });
     saveBtn.onmouseenter = () => (saveBtn.style.background = "#1c5450");
     saveBtn.onmouseleave = () => (saveBtn.style.background = "#14403f");
+
+    const cbLabel = el("label",
+      "display:flex;align-items:flex-start;gap:5px;cursor:pointer;font-size:11px;line-height:1.3;opacity:.9;");
+    const cb = el("input", "cursor:pointer;margin-top:1px;flex:none;", { type: "checkbox", checked: true });
+    cbLabel.appendChild(cb);
+    cbLabel.appendChild(el("span", "", { textContent: "include metadata on output image" }));
+    cbLabel.onclick = (e) => e.stopPropagation();
+
     saveBtn.onclick = async (e) => {
       e.stopPropagation();
       const prev = saveBtn.textContent;
@@ -633,10 +638,10 @@ class GridViewer {
       }
     };
 
-    cap.appendChild(cbLabel);
-    cap.appendChild(saveBtn);
-    panel.appendChild(img);
-    panel.appendChild(cap);
+    side.appendChild(saveBtn);
+    side.appendChild(cbLabel);
+    panel.appendChild(main);
+    panel.appendChild(side);
     o.appendChild(panel);
 
     panel.onclick = (e) => e.stopPropagation();

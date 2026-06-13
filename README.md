@@ -240,6 +240,45 @@ The viewer needs the **individual** cell images, not the Saver's already-compose
 
 The node is freely resizable; the grid scrolls inside it. A standalone `grid_viewer_demo.html` (openable in any browser) is included for previewing the interactions outside ComfyUI.
 
+## Fantastic Lora Mimic 🪞
+
+Internal class name `FantasticLoraMimic`. Found in **loaders**. *(Proof-of-concept.)*
+
+Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. There are two ways to feed it (a wire always wins over the picker):
+
+**1. Wire (cooperating nodes).** Connect any **`LORA_STACK`** output into the Mimic's `lora_stack` input. Our `Fantastic Lora Loader` and `Fantastic Lora Loader (Multi-Model)` now emit a `lora_stack` output, and the Mimic also accepts the common Efficiency-style `LORA_STACK` (list of `(name, model_strength, clip_strength)`), so third-party stackers work too. The Mimic re-emits the resolved stack on its own `lora_stack` output for chaining.
+
+**2. Pick (any node).** With nothing wired, choose a **source** node in the Mimic's UI and it mirrors that node's configured loras into itself — read live from the graph in the frontend, before execution. It can read several loader families: our own stack nodes (they carry a `lora_data` blob); the stock `LoraLoader` / `LoraLoaderModelOnly` (and shape-compatible ones like the pysssss loader); rgthree's `Power Lora Loader`; and numbered-widget stackers like Efficiency `LoRA Stacker` and Comfyroll `CR LoRA Stack`. Controls:
+- **source** — a dropdown of compatible nodes (labelled `#id title`), or **(auto-detect)** which uses the only compatible source when there's exactly one, or **(none)**.
+- **live_mirror** (on by default) — keeps copying as you edit the source; turn off to only update on demand.
+- **↻ Pull now** — copy the source's loras immediately.
+- A status line shows what's currently being mimicked.
+
+Outputs: `MODEL`, `CLIP`, `lora_stack` (the resolved stack, for chaining), and `mimicked` (a STRING summary of what was applied).
+
+### High / Low Model Mode (split models like Wan 2.2)
+
+Wan 2.2 and similar split setups use two models — a high-noise and a low-noise pass — and loras are usually trained as a pair (`coollora_ep19_high.safetensors` / `coollora_ep234_low.safetensors`). Flip the **High / Low Model Mode** switch at the top of the Mimic, and each mirrored lora gains companion controls so you can feed the *other* half's lora onto this Mimic's model:
+
+- **🔎 find companion** opens a ranked menu of the closest-matching lora names — best matches first, the original omitted. It ignores the noise token and volatile epoch/step/version numbers when matching, so `..._ep19_high` still finds `..._ep234_low`. A `low`/`high` tag and a filter box help you pick; you can also type to search any lora.
+- The chosen companion **replaces** the original on this model and gets its **own strength**. The original name stays visible but dimmed.
+- **also apply original** stacks the original on top of the companion too — handy for a shared speed-up lora that's identical on both halves.
+- **use source lora** applies the original lora on this model as-is, with no companion — useful when a lora has no real counterpart for the other half. While active, the find-companion search is disabled (it shows "✓ using source lora"); toggle it off to search again. Any companion you'd already picked is kept but unused while this is on.
+- No companion chosen yet and "use source lora" off → the original is applied as a fallback, so nothing silently drops.
+
+Companion choices, strengths, and the mode toggle persist with the workflow. High/Low mode only affects the *picker* path; if you feed the Mimic a `LORA_STACK` wire, wire the half you want directly.
+
+### Fantastic Lora Mimic Subgraph Companion 🧩 (the "sniffer")
+
+The Mimic's picker reads nodes in its own graph scope, so it can't see lora loaders buried inside a **subgraph** (those live in the subgraph's own nested graph). This companion node bridges that boundary. Place it in the **same scope as the sources** — it scans every compatible lora loader/stacker there (our nodes, stock, pysssss, rgthree, Efficiency/Comfyroll), combines their enabled loras, and emits them as a single `LORA_STACK`. Because `LORA_STACK` wires pass cleanly through subgraph input/output slots, that stack reaches a Mimic on the other side:
+
+- **Sources buried, Mimic outside:** put the sniffer inside the subgraph, wire its `lora_stack` out through a subgraph output to the Mimic's `lora_stack` input.
+- **Mimic buried, sources outside:** put the sniffer outside with the sources, wire its `lora_stack` into a subgraph input, then to the Mimic inside.
+
+It has an optional `lora_stack` passthrough input (merged first) so sniffers can be chained or fed an existing stack. The node shows a live readout of what it's forwarding. Note: a wired stack uses the Mimic's flat wire path, so the Mimic's per-source grouping and High/Low companion UI don't apply to sniffer-forwarded loras — for those features, keep the Mimic in the same scope as the sources. Cooperating sources that already output `LORA_STACK` (our loaders, ecosystem stackers) don't need the sniffer at all — wire their stack through the boundary directly.
+
+Notes/limitations (it's a POC): the picker reads *configured* widget values from the graph, so it reflects what a source is set to, not anything a node computes at runtime in Python (our own randomizer is fine — the frontend bakes the rolled pick into `lora_data` before queueing). The picker understands our `lora_data` format, the stock `LoraLoader`/`LoraLoaderModelOnly` (and shape-compatible forks like pysssss's), rgthree's Power Lora Loader, and numbered-widget stackers (Efficiency `LoRA Stacker`, Comfyroll `CR LoRA Stack`); other third-party loaders would need their own small adapter, or can feed the Mimic via a `LORA_STACK` wire instead. Graph-introspection uses informal ComfyUI frontend internals, so it's wrapped defensively.
+
 ## How it works
 
 - **Backend** (`nodes.py`): parses the stack JSON, resolves lora paths via `folder_paths.get_full_path`, loads with `comfy.utils.load_torch_file` (cached per path), applies via `comfy.sd.load_lora_for_models`. The stack is carried in a hidden `lora_data` STRING widget so it reaches Python and serializes with the workflow. CLIP is declared in `INPUT_TYPES["optional"]` so an unconnected input arrives as `None`. Auto-roll lines are re-randomized at execution time; `IS_CHANGED` returns a random token whenever an active auto-roll line exists to prevent ComfyUI from caching the result.
@@ -248,6 +287,7 @@ The node is freely resizable; the grid scrolls inside it. A standalone `grid_vie
 - **API route**: `GET /lora_folder_loader/loras` serves the lora filename list to the frontend.
 - **Frontend** (`web/lora_folder_loader.js`): DOM widgets for lora rows, folder filter panel, lora chooser panel, and per-line randomizer folder panel. Favourites are stored in `localStorage` under the key `fll_favorites`. Tooltips are custom DOM elements (instant, teal-bordered) rather than native browser title attributes. The Plotter adds global-strength controls and a control-image toggle (disabled when a Global Lora node is attached). The Global Lora node uses the same stack UI as the loaders but adds two control toggles.
 - **Grid Viewer frontend** (`web/plotter_grid_viewer.js`): a separate extension. The Python node (`OUTPUT_NODE`) saves each cell to the temp folder and returns `{"ui": {"fl_cells": [...refs+metadata], "fl_global": [...]}}`; the frontend reads this in `onExecuted` and builds the interactive grid in an `addDOMWidget` container. All zoom / filter / compare interaction is pure DOM with no extra round-trips to the server.
+- **Mimic frontend** (`web/lora_mimic.js`): a separate extension covering both the Mimic and its Subgraph Companion. The Mimic's UI state (selected sources, per-lora link/companion/force flags, group-bypass overrides, High/Low mode) lives on the node instance and is serialized into the same hidden `lora_data` widget as a JSON object (`{loras, mimicSources, groupForced, highLow}`); a live-mirror timer (`tick`) reconciles against the source nodes' widgets and re-renders. On the Python side, `_expand_mimic_payload` interprets that JSON (handling High/Low companions and the `useOriginal`/`forced` overrides) when nothing is wired, while a connected `LORA_STACK` wire (via `_normalize_stack`) takes precedence and is applied flat. Source-type adapters (stock/pysssss, rgthree Power Lora Loader, Efficiency/Comfyroll numbered stackers, our own `lora_data` nodes) all live in `readSourceLoras`.
 
 ## Notes
 

@@ -300,6 +300,93 @@ def _apply_global_chain(model, clip, globals_list):
     return m, c
 
 
+def _stack_list_from_data(lora_data):
+    """Build a LORA_STACK [(name, model_s, clip_s), ...] from a lora_data payload.
+
+    Only enabled, concretely-named lines are included. This is the format the
+    wider ComfyUI ecosystem (Efficiency Nodes etc.) uses for LORA_STACK, so it
+    lets our loaders feed a Mimic — or anything else that consumes LORA_STACK."""
+    entries, _ = _parse_payload(lora_data)
+    out = []
+    for e in entries:
+        if e["on"] and e["name"] and e["name"] not in ("None", "NONE"):
+            out.append((e["name"], float(e["model"]), float(e["clip"])))
+    return out
+
+
+def _expand_mimic_payload(lora_data):
+    """Expand the Mimic's picker payload into [(name, model_s, clip_s), ...].
+
+    Like _stack_list_from_data, but understands High/Low Model Mode: when the
+    payload has highLow=true and a line has a companion lora, the companion is
+    applied in place of the original (and the original too, if keepOriginal)."""
+    try:
+        data = json.loads(lora_data) if lora_data else {}
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, list):
+        loras, high_low = data, False
+    elif isinstance(data, dict):
+        loras, high_low = data.get("loras", []), bool(data.get("highLow"))
+    else:
+        return []
+
+    def _f(v, dflt):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return dflt
+
+    out = []
+    for e in loras:
+        if not isinstance(e, dict) or not e.get("on", True):
+            continue
+        name = e.get("name")
+        comp = e.get("companion") if isinstance(e.get("companion"), dict) else None
+        # useOriginal forces the source lora as-is, even if a companion is stored
+        if high_low and comp and comp.get("name") and not e.get("removed") and not e.get("useOriginal"):
+            cn = comp.get("name")
+            if cn and cn not in ("None", "NONE"):
+                cm = _f(comp.get("model"), 1.0)
+                out.append((cn, cm, _f(comp.get("clip"), cm)))
+            if e.get("keepOriginal") and name and name not in ("None", "NONE"):
+                out.append((name, _f(e.get("model"), 1.0), _f(e.get("clip"), 1.0)))
+        elif name and name not in ("None", "NONE"):
+            out.append((name, _f(e.get("model"), 1.0), _f(e.get("clip"), 1.0)))
+    return out
+
+
+def _normalize_stack(lora_stack):
+    """Coerce an incoming LORA_STACK into [(name, model_s, clip_s), ...].
+
+    Accepts the common tuple form (name, model_s, clip_s) used by Efficiency-style
+    stackers, the 2-tuple (name, strength), and a few dict shapes, so the Mimic is
+    tolerant of whatever a cooperating node emits."""
+    out = []
+    for item in (lora_stack or []):
+        name = None; ms = 1.0; cs = None
+        try:
+            if isinstance(item, (list, tuple)):
+                if not item:
+                    continue
+                name = item[0]
+                ms = float(item[1]) if len(item) > 1 and item[1] is not None else 1.0
+                cs = float(item[2]) if len(item) > 2 and item[2] is not None else ms
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("lora") or item.get("lora_name")
+                ms = float(item.get("model", item.get("strength_model", 1.0)))
+                cs = float(item.get("clip", item.get("strength_clip", ms)))
+            else:
+                continue
+        except (ValueError, TypeError, IndexError):
+            continue
+        if cs is None:
+            cs = ms
+        if name and name not in ("None", "NONE"):
+            out.append((name, ms, cs))
+    return out
+
+
 _LORA_DATA_INPUT = (
     "STRING",
     {"default": "{}", "multiline": False,
@@ -319,8 +406,8 @@ class FantasticLoraLoader:
             "optional": {"clip": ("CLIP",)},
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP")
-    RETURN_NAMES = ("MODEL", "CLIP")
+    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK")
+    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack")
     FUNCTION = "load"
     CATEGORY = "loaders"
     TITLE = "Fantastic Lora Loader"
@@ -334,7 +421,7 @@ class FantasticLoraLoader:
 
     def load(self, model, lora_data, clip=None):
         model, clip = _apply_stack(model, clip, lora_data)
-        return (model, clip)
+        return (model, clip, _stack_list_from_data(lora_data))
 
 
 # ---------------------------------------------------------------------------
@@ -355,8 +442,8 @@ class FantasticLoraLoaderMulti:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "MODEL", "MODEL", "MODEL", "MODEL")
-    RETURN_NAMES = ("MODEL", "CLIP", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
+    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK", "MODEL", "MODEL", "MODEL", "MODEL")
+    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
     FUNCTION = "load"
     CATEGORY = "loaders"
     TITLE = "Fantastic Lora Loader (Multi-Model)"
@@ -371,7 +458,7 @@ class FantasticLoraLoaderMulti:
         extras = []
         for m in (model_2, model_3, model_4, model_5):
             extras.append(_apply_stack(m, None, lora_data)[0] if m is not None else None)
-        return (primary_m, patched_clip, *extras)
+        return (primary_m, patched_clip, _stack_list_from_data(lora_data), *extras)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1286,112 @@ class FantasticPlotterGridViewer:
         }}
 
 
+# ===========================================================================
+# Fantastic Lora Mimic
+# ===========================================================================
+# Applies a set of loras (read from another node, or via a LORA_STACK wire) onto
+# its OWN model/clip — without ever taking the source's MODEL path, so the
+# source's patched model never interferes. Two ways to feed it:
+#   • Wire: connect any LORA_STACK output (our loaders, or Efficiency-style
+#     stackers) into the lora_stack input. A connected wire always wins.
+#   • Pick: with nothing wired, the frontend mirrors a chosen source node's
+#     configured loras into this node's hidden lora_data widget (see web/
+#     lora_mimic.js), so Python just reads lora_data.
+
+class FantasticLoraMimic:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
+            "optional": {
+                "clip": ("CLIP",),
+                "lora_stack": ("LORA_STACK",),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack", "mimicked")
+    FUNCTION = "apply"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Lora Mimic"
+    DESCRIPTION = ("Applies loras read from another node (or a LORA_STACK wire) onto this "
+                   "node's own model/clip, without taking the source's model path — so the "
+                   "source's patched model can't interfere. Connect a LORA_STACK, or pick a "
+                   "source node in the UI and it mirrors that node's loras. It also re-emits "
+                   "the resolved LORA_STACK for chaining.")
+
+    @classmethod
+    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, lora_stack=None, **kwargs):
+        # Re-run when either the mirrored picker data or the wired stack changes.
+        return f"{lora_data}|{lora_stack}"
+
+    def apply(self, model, lora_data, clip=None, lora_stack=None):
+        # A connected wire (even an empty one) wins; otherwise use the mirrored
+        # picker data baked into lora_data by the frontend.
+        if lora_stack is not None:
+            entries = _normalize_stack(lora_stack)
+            source = "wire"
+        else:
+            entries = _expand_mimic_payload(lora_data)
+            source = "picker"
+
+        m, c = model, clip
+        applied = []
+        for (name, ms, cs) in entries:
+            r = _apply_one(m, c, name, ms, cs)
+            if r is not None:
+                m, c = r
+                applied.append(f"{_sanitize_lora_name(name)}_{_format_strength(ms)}")
+            else:
+                print(f"[FantasticLoraMimic] lora not found, skipping: {name}")
+
+        summary = ", ".join(applied) if applied else "(no loras applied)"
+        print(f"[FantasticLoraMimic] mimicked {len(applied)} lora(s) via {source}: {summary}")
+        return (m, c, [(n, ms, cs) for (n, ms, cs) in entries], summary)
+
+
+# ===========================================================================
+# Fantastic Lora Mimic Subgraph Companion  (the "sniffer")
+# ===========================================================================
+# A source-side aggregator: the frontend scans the lora loaders/stackers in this
+# node's OWN graph scope (i.e. the subgraph it's placed in, or the top level),
+# combines their enabled loras, and bakes them into lora_data; this node then
+# emits them as a single LORA_STACK. Because LORA_STACK wires pass cleanly through
+# subgraph input/output slots, this lets a Mimic on the other side of a subgraph
+# boundary receive loras it otherwise couldn't see. An optional incoming
+# lora_stack is merged in first, so sniffers can be chained or fed a passthrough.
+
+class FantasticLoraMimicSubgraphCompanion:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {"lora_data": _LORA_DATA_INPUT},
+            "optional": {"lora_stack": ("LORA_STACK",)},
+        }
+
+    RETURN_TYPES = ("LORA_STACK",)
+    RETURN_NAMES = ("lora_stack",)
+    FUNCTION = "gather"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Lora Mimic Subgraph Companion"
+    DESCRIPTION = ("Place this inside (or beside) a group of lora loaders — including ones "
+                   "buried in a subgraph — and it gathers their loras into a single LORA_STACK "
+                   "output. Wire that out through the subgraph boundary to a Fantastic Lora "
+                   "Mimic's lora_stack input so the Mimic can read loras it otherwise couldn't "
+                   "reach across the boundary. Note: the Mimic applies a wired stack flat, so "
+                   "its per-source grouping and High/Low companion UI don't apply to this path.")
+
+    @classmethod
+    def IS_CHANGED(cls, lora_data="{}", lora_stack=None, **kwargs):
+        return f"{lora_data}|{lora_stack}"
+
+    def gather(self, lora_data, lora_stack=None):
+        out = list(_normalize_stack(lora_stack)) if lora_stack is not None else []
+        out.extend(_stack_list_from_data(lora_data))
+        print(f"[FantasticLoraMimicSubgraphCompanion] emitting {len(out)} lora(s)")
+        return (out,)
+
+
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
@@ -1206,6 +1399,8 @@ NODE_CLASS_MAPPINGS = {
     "FantasticPlotterGlobalLora": FantasticPlotterGlobalLora,
     "FantasticPlotterImageSaver": FantasticPlotterImageSaver,
     "FantasticPlotterGridViewer": FantasticPlotterGridViewer,
+    "FantasticLoraMimic":       FantasticLoraMimic,
+    "FantasticLoraMimicSubgraphCompanion": FantasticLoraMimicSubgraphCompanion,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
@@ -1214,6 +1409,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticPlotterGlobalLora": "Fantastic Plotter Global Lora 🌐",
     "FantasticPlotterImageSaver": "Fantastic Plotter Image Saver 📊",
     "FantasticPlotterGridViewer": "Fantastic Plotter Grid Viewer 🔍",
+    "FantasticLoraMimic":       "Fantastic Lora Mimic 🪞",
+    "FantasticLoraMimicSubgraphCompanion": "Fantastic Lora Mimic Subgraph Companion 🧩",
 }
 
 
