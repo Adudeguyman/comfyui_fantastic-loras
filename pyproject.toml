@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-fantastic-loras"
+description = "Quality-of-life Lora suite, including a stack loader with built-in folder filtering, randomization, favorites, dual-model support, lora XY comparison plot stack and interactive viewer, experimental loader-agnostic Lora mimic for set-and-forget dual-model workflows like Wan 2.2 or Ideogram4."
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Adudeguyman/comfyui_fantastic-loras"
+
+[tool.comfy]
+PublisherId = "adudeguyman"
+DisplayName = "Fantastic Loras"
