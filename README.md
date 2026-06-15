@@ -10,7 +10,7 @@ A ComfyUI custom node pack for stacking, lora testing (with a XY plotter with a 
 
 ## Install
 
-**ComfyUI-Manager (recommended):** open the Manager, choose **Install Custom Nodes**, search for **Fantastic Loras**, and install. Restart ComfyUI when prompted.
+**ComfyUI-Manager (recommended):** open the Manager, choose **Install Custom Nodes**, search for **Fantastic Loras**, and install. Restart ComfyUI when prompted. Requires Comfyui Manager 4.x+, not listed in Legacy versions.
 
 **Manual:**
 
