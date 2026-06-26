@@ -1,9 +1,11 @@
 // Fantastic Lora Loader — frontend UI
 // ------------------------------------
-// Handles two nodes:
-//   FantasticLoraLoader          — single model + optional CLIP
-//   FantasticLoraLoaderMulti     — same UI + dynamic extra MODEL paths
+// Handles the loader and plotter nodes:
+//   FantasticLoraLoaderMulti     — lora stack + dynamic extra MODEL paths
+//   FantasticLoraPlotter         — same UI, sweep stage
 //
+// The loader starts with zero extra model paths (looks like a plain single-
+// model loader) and reveals additional MODEL paths on demand via the ➕ bar.
 // NEW in this version:
 //   • Custom lora chooser DOM panel replaces LiteGraph.ContextMenu, giving
 //     full control over per-item interactions.
@@ -16,16 +18,12 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-const NODE_NAME       = "FantasticLoraLoader";
 const MULTI_NODE_NAME = "FantasticLoraLoaderMulti";
 const PLOT_NODE_NAME  = "FantasticLoraPlotter";
 const SAVER_NODE_NAME = "FantasticPlotterImageSaver";
 const GLOBAL_NODE_NAME = "FantasticPlotterGlobalLora";
 const VIEWER_NODE_NAME = "FantasticPlotterGridViewer";
-const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME, PLOT_NODE_NAME];
-
-// Nodes that use the multi-model UI (stack + dynamic model-path bar).
-const isMultiLike = (name) => name === MULTI_NODE_NAME || name === PLOT_NODE_NAME;
+const ALL_NODE_NAMES  = [MULTI_NODE_NAME, PLOT_NODE_NAME];
 
 const DATA_WIDGET          = "lora_data";
 const NODE_COLOR           = "#0f848a";
@@ -881,26 +879,6 @@ function buildCoreUI(node) {
 // Single-model node UI
 // ===========================================================================
 
-function addUI(node) {
-  if (node.__lflBuilt) return;
-  node.__lflBuilt = true;
-  buildCoreUI(node);
-
-  // 🎲 Add Lora Randomizer — single-model node only (for now)
-  const randBtn = node.addWidget("button", "lfl_add_rand", null, async () => {
-    const entry = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, folders: null };
-    const pick = await pickRandomLora(node, entry);
-    if (pick != null) entry.name = pick;
-    node.__loraStack.push(entry);
-    node.__lflCommit();
-  });
-  randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
-  if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
-
-  node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
-  snapHeight(node);
-}
-
 // ===========================================================================
 // Global Lora node UI — stack (no randomizer) + two control toggles
 // ===========================================================================
@@ -1227,10 +1205,10 @@ function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
   barWidget.serializeValue = () => undefined;
   barWidget.computeSize = function (width) { return [width, 26]; };
 
-  // On fresh creation (count still 0 after stripAutoExtraSlots) optionally add
-  // one pair. The Multi-Model node starts with 2 paths (autoAddPair=true); the
-  // Plotter starts with a single path (autoAddPair=false). Workflow loads skip
-  // this because onConfigure syncs extra_model_count from restored slots.
+  // On fresh creation the loader and plotter both start with zero extra paths
+  // (autoAddPair=false), so this just draws the model bar. The autoAddPair hook
+  // is kept for callers that want a path pre-added. Workflow loads skip the add
+  // because onConfigure syncs extra_model_count from restored slots.
   if (autoAddPair && node.properties.extra_model_count === 0) addModelPair(node);
   else updateModelBar(node);
 
@@ -1494,15 +1472,16 @@ app.registerExtension({
       return;
     }
 
-    const isMulti   = isMultiLike(nm);
     const isPlotter = nm === PLOT_NODE_NAME;
 
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       origOnNodeCreated?.apply(this, arguments);
       this.size = [DEFAULT_WIDTH, 180];
-      // Plotter uses the multi-model UI but starts with a single model path.
-      try { isMulti ? addMultiUI(this, { autoAddPair: !isPlotter, isPlotter }) : addUI(this); }
+      // Loader and plotter both use the multi-model UI and start with zero
+      // extra model paths — pixel-identical to a plain single-model loader
+      // until the user adds paths via the ➕ bar.
+      try { addMultiUI(this, { autoAddPair: false, isPlotter }); }
       catch (err) { console.warn("[FantasticLoraLoader] UI build failed", err); }
     };
 
@@ -1519,13 +1498,9 @@ app.registerExtension({
     nodeType.prototype.onConfigure = function (info) {
       origOnConfigure?.apply(this, arguments);
       try {
-        if (isMulti) {
-          if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: !isPlotter, isPlotter });
-          this.properties.extra_model_count = countExtraModelInputs(this);
-          updateModelBar(this);
-        } else {
-          if (!this.__lflBuilt) addUI(this);
-        }
+        if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: false, isPlotter });
+        this.properties.extra_model_count = countExtraModelInputs(this);
+        updateModelBar(this);
         loadStackFromData(this);
         if (isPlotter) { updatePlotterLabels(this); updatePlotterControlState(this); }
         // Serialized node width already reflects any randomizer bump — sync the

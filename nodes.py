@@ -1,11 +1,11 @@
 """
 Fantastic Lora Loader — standalone ComfyUI custom nodes.
 
-Two nodes:
-  FantasticLoraLoader          — single model + optional CLIP
-                                  (+ randomizer / auto-roll lines)
-  FantasticLoraLoaderMulti     — primary model + optional CLIP
-                                  + up to 4 additional optional models
+Loader node:
+  FantasticLoraLoaderMulti     — primary model + optional CLIP, plus up to 4
+                                  additional optional models (added on demand)
+                                  + randomizer / auto-roll lines.
+                                  Display name: "Fantastic Lora Loader".
 
 The lora stack lives in a hidden "lora_data" STRING widget managed by the
 frontend.  Its JSON shape is:
@@ -397,38 +397,14 @@ _LORA_DATA_INPUT = (
 
 
 # ---------------------------------------------------------------------------
-# Node: Fantastic Lora Loader (single model)
+# Node: Fantastic Lora Loader
 # ---------------------------------------------------------------------------
-
-class FantasticLoraLoader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
-            "optional": {"clip": ("CLIP",)},
-        }
-
-    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK")
-    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack")
-    FUNCTION = "load"
-    CATEGORY = "loaders"
-    TITLE = "Fantastic Lora Loader"
-
-    @classmethod
-    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
-        # The frontend bakes a fresh random pick into lora_data on every queue,
-        # so the data itself changes when auto-roll lines re-roll — no need to
-        # force a random token. Re-execution happens naturally.
-        return lora_data
-
-    def load(self, model, lora_data, clip=None):
-        model, clip = _apply_stack(model, clip, lora_data)
-        return (model, clip, _stack_list_from_data(lora_data))
-
-
-# ---------------------------------------------------------------------------
-# Node: Fantastic Lora Loader (Multi-Model)
-# ---------------------------------------------------------------------------
+#
+# A primary MODEL + optional CLIP, plus up to four additional optional MODEL
+# paths (added on demand from the node's ➕ model bar). The same lora stack is
+# applied to every connected model path; the primary path also patches CLIP.
+# With no extra paths added, the node behaves exactly like a single-model
+# loader — three outputs, the extra MODEL 2-5 slots stay hidden.
 
 class FantasticLoraLoaderMulti:
     @classmethod
@@ -448,7 +424,7 @@ class FantasticLoraLoaderMulti:
     RETURN_NAMES = ("MODEL", "CLIP", "lora_stack", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
     FUNCTION = "load"
     CATEGORY = "loaders"
-    TITLE = "Fantastic Lora Loader (Multi-Model)"
+    TITLE = "Fantastic Lora Loader"
 
     @classmethod
     def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
@@ -1812,7 +1788,6 @@ class FantasticLoraMimicSubgraphCompanion:
 
 
 NODE_CLASS_MAPPINGS = {
-    "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
     "FantasticPlotterGlobalLora": FantasticPlotterGlobalLora,
@@ -1822,8 +1797,7 @@ NODE_CLASS_MAPPINGS = {
     "FantasticLoraMimicSubgraphCompanion": FantasticLoraMimicSubgraphCompanion,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
-    "FantasticLoraLoaderMulti": "Fantastic Lora Loader (Multi-Model) 📁",
+    "FantasticLoraLoaderMulti": "Fantastic Lora Loader 📁",
     "FantasticLoraPlotter":     "Fantastic Lora Plotter 📊",
     "FantasticPlotterGlobalLora": "Fantastic Plotter Global Lora 🌐",
     "FantasticPlotterImageSaver": "Fantastic Plotter Image Saver 📊",
