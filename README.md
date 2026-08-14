@@ -1,16 +1,66 @@
-# comfyui_fantastic-loras
+# Fantastic Loras 2.0
 
-A ComfyUI custom node pack for stacking, lora testing (with a XY plotter with a grid output and a custom comparison node), and mirroring LoRAs for multi-model workflows.
+A LoRA toolkit for ComfyUI: pick which LoRA subfolders a node draws from so you're only ever searching the models you're working with, stack up to 12 LoRAs across several models from one node, and run a proper XY LoRA test bench in a single queue.
 
-## Overview
+![version](https://img.shields.io/badge/version-2.0.0-0a6166) ![nodes 2.0](https://img.shields.io/badge/Nodes%202.0-compatible-7ec87e) ![license](https://img.shields.io/badge/license-MIT-blue)
 
-- **Loaders** — stack multiple LoRAs onto one or several models (such as workflows for Ideogram4), with a folder filter, favourites, and randomizer lines (`Fantastic Lora Loader` / `Fantastic Lora Loader (Multi-Model)`).
-- **Plotter** — sweep your LoRA stack across a grid, optionally layering global LoRAs and control/baseline cells (`Fantastic Lora Plotter`, `Fantastic Plotter Global Lora`, `Fantastic Plotter Image Saver`, `Fantastic Plotter Grid Viewer`).
-- **Mimic** — mirror or wire in LoRAs from other loaders (including rgthree's Power Lora Loader, Efficiency/Comfyroll stackers, and stock loaders) onto an independent model/clip path for use in dual-model workflows (like Ideogram4), with a High/Low mode for split models like Wan 2.2, and a Subgraph Companion helper for crossing subgraph boundaries (`Fantastic Lora Mimic`, `Fantastic Lora Mimic Subgraph Companion`).
+<p align="center">
+  <img src="screenshots/main_loader.png" alt="The Fantastic Lora Loader node, showing its 12 lora slots and preset bar" width="760"><br>
+  <em>The Fantastic Lora Loader with 12 lora slots and presets</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/main_theme.png" alt="The same loader node in an alternate colour theme" width="760"><br>
+  <em>Now with Themes!</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/folders.png" alt="The folder picker open, with a search box and a list of lora subfolders" width="520"><br>
+  <em>Filter which subdirectories are used when searching for loras</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/lorapicker.png" alt="The lora picker open, filtered to one folder, with a search box and starred favourites at the top" width="620"><br>
+  <em>Search for a Lora from only your selected folders. Save your favorites for quick access</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/lorasettings.png" alt="The per-lora options panel, showing model routing rows with individual strength controls" width="380"><br>
+  <em>Adjust loras strength for each connected model</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/plotter.jpg" alt="The Fantastic Lora Plotter node with three loras queued, a global strength sweep, and its run summary" width="760"><br>
+  <em>Pick your Loras and the strengths to try, add a control image, and queue once — every combination generates on its own</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/gridviewer.png" alt="The Grid Viewer showing a grid of generated comparison images" width="760"><br>
+  <em>Effortlessly generate multiple iterations to compare Loras and their strengths. Rearrange the output as you see fit</em>
+</p>
+
+<p align="center">
+  <img src="screenshots/grids.jpg" alt="Side by side comparison of the overlay-label grid and the classic border-label grid" width="860"><br>
+  <em>Choose between modern and classic grid outputs</em>
+</p>
+
+---
+
+## What it does
+
+**One loader instead of a chain of them.** Twelve LoRA slots in a single node, feeding up to five separate MODEL outputs. Each LoRA can go to all five models, or just one, or to different models at different strengths — so a two-pass workflow where the refiner needs your detail LoRA at 0.4 and the base pass wants it at 1.0 is one node, not two loaders and a mental note. Slot order is apply order and you drag slots to change it. A footer prints exactly what each model output will receive, in order, so you can confirm the wiring matches your intent without tracing wires.
+
+Alongside that: named presets that save and reload your whole stack (or merge into it without wiping what's there), folder filtering for people whose `loras` directory holds dozens of model subfolders, and randomizer slots that roll a different LoRA each queue — useful for rediscovering things buried in a large collection.
+
+**An XY LoRA test bench that runs in one queue.** The Plotter takes the same slot grid, but instead of stacking your LoRAs it tests them against each other — LoRAs on one axis, strengths on the other, exactly the XY plot you'd build by hand. It emits one MODEL per test cell as a list output, so ComfyUI runs your sampler once per cell automatically — you hit Queue once and get the whole comparison, no batch loops or manual re-queueing. Feed the results to the Image Saver for a single labelled grid image — choose between a modern text-overlay layout or a classic A1111-style grid with labels down the margins — or to the Grid Viewer to browse them interactively on the canvas. It can also hold a set of LoRAs constant across every cell, and include a no-LoRA baseline so you can see what each one is actually contributing.
+
+**Mirror LoRA selections that live somewhere else.** The Mimic exists for when the LoRA list is authored in a node that isn't this one — rgthree's Power Lora Loader, the stock loader, Efficiency or Comfyroll stackers — and you want that same list applied to a *different* model path. It reads the source's configured LoRAs and applies them to its own MODEL and CLIP, so you're not taking a wire from a model that's already been modified. Each mirrored LoRA can track the source live or be unlinked for an independent strength.
+
+Two cases it's specifically built for: **split high/low models** like Wan 2.2, where LoRAs come as `..._high` / `..._low` pairs and it can find and substitute the matching half automatically; and **subgraphs**, where a companion node bridges the boundary so a Mimic outside can see loaders buried inside (or vice versa). It's the experimental corner of the pack — it reads other nodes' settings by inspecting the graph rather than through any official interface, so verify it mirrored what you expected before trusting a long run.
 
 ## Install
 
-**ComfyUI-Manager (recommended):** open the Manager, choose **Install Custom Nodes**, search for **Fantastic Loras**, and install. Restart ComfyUI when prompted. Requires Comfyui Manager 4.x+, not listed in Legacy versions.
+**ComfyUI-Manager (easiest):** open the Manager → **Install Custom Nodes** → search **Fantastic Loras** → Install → restart when prompted.
 
 **Manual:**
 
@@ -19,143 +69,173 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/Adudeguyman/comfyui_fantastic-loras
 ```
 
-Restart ComfyUI and hard-refresh the browser (Ctrl+Shift+R). No Python dependencies beyond ComfyUI itself.
+Restart ComfyUI, then hard-refresh your browser (Ctrl+Shift+R). Nothing else to install.
 
-## Nodes
+Two ready-made workflows are in the `example_workflows` folder — drag either onto the ComfyUI canvas to try things out.
 
-All nodes appear in the add-node menu under **loaders** (search "fantastic lora").
+**Nodes 2.0 ready.** Everything works under both the classic canvas and the newer Nodes 2.0 renderer, and you can switch between them at any time without breaking a saved workflow. The node panels are real interface elements rather than canvas drawings, so they behave the same either way.
 
-### Fantastic Lora Loader 📁
-Single model + optional CLIP. Internal class name `FantasticLoraLoader`.
+## Quick start
 
-| Input | Required? | |
-|---|---|---|
-| `MODEL` | yes | model to patch |
-| `CLIP` | **optional** | connect to apply clip strengths and get a patched `CLIP` back; leave unconnected for model-only |
+1. Add **Fantastic Lora Loader 📁** (double-click the canvas, search "fantastic").
+2. Wire your **MODEL** into it and its output onward to your sampler. Wire **CLIP** too if your setup uses text-encoder LoRA weights — for models where LoRAs only touch the diffusion model, you can leave it unconnected.
+3. Click **Add lora…** and pick one. It lands in the first empty slot.
+4. Adjust its strength with **− +** or by scrolling over the number.
+5. Queue as normal.
 
-Outputs: `MODEL`, `CLIP`. When CLIP isn't connected the CLIP output passes `None`.
-
-### Fantastic Lora Loader (Multi-Model) 📁
-Same as above, plus up to 4 additional optional MODEL inputs. Use this when running multiple samplers with different models — patch all of them through one unified lora stack. Internal class name `FantasticLoraLoaderMulti`.
-
-A compact **Model paths: N / 5  ➕ ➖** bar lets you add and remove model input/output pairs dynamically. Each extra model is patched with the same lora stack (model strength only); the shared CLIP is patched once via the primary path.
-
-## Using the nodes
-
-Each node has:
-
-- **📁 Folders** — opens the folder filter (see below).
-- **➕ Add Lora** — opens the lora chooser (filtered by your enabled folders) to append a lora to the stack.
-- **🎲 Add Lora Randomizer** — adds a randomizer line (see below).
-- One row per lora: an **enable checkbox**, the **lora name** (click to swap), a single **S** (strength) field that applies to both model and clip simultaneously, plus **▲ ▼** to reorder and **✕** to remove.
-
-The S field tracks the CLIP connection live: when nothing is wired into CLIP it shows a dim `(no CLIP)` note and clip strength is ignored. LoRAs apply top-to-bottom; disabled and zero-strength rows are skipped. The whole stack saves and loads with the workflow.
-
-> **Tip:** Hovering any icon on a lora row shows a tooltip explaining what it does and its current state.
-
-
-## Folder filter
-
-Click **📁 Folders** to open a stay-open tree panel:
-
-- **All (no filter)** / **None** reset or clear everything.
-- Each row is a folder with a checkbox and lora count. Parent folders are tri-state aggregates — clicking one toggles every folder beneath it; mixed states show as indeterminate. Carets expand/collapse branches.
-- A folder that contains its own loras **and** subfolders gets an italic *(files here)* child row, so `flux/styles` can be toggled independently of loose files in `flux/`.
-- `(root)` = loras sitting directly in `models/loras`.
-- The filter is **per-node** and saves with the workflow. The button label shows `n/total` enabled folders.
-- Filtering is by exact containing folder — enabling a parent is a shortcut for enabling all its children, not a wildcard that auto-includes future subfolders.
-
-Stored in `node.properties["Enabled Lora Folders"]`:
-
-| Value | Meaning |
-|---|---|
-| `null` | No filter (all loras). |
-| `{ "version": 2, "folders": ["flux/styles", "(root)"] }` | Exact enabled-folder list. |
-| `["flux"]` (legacy v1 array) | Matches that folder plus everything nested under it; auto-upgraded to v2 on first toggle. |
-
-
-## Lora chooser & favorites
-
-Clicking **➕ Add Lora** or any lora name in the stack opens a custom chooser panel:
-
-- **☆ / ★ star button** next to each lora name — click it to toggle that lora as a favourite. The panel stays open so you can star several at once.
-- **Favourites float to the top** of the list, separated from the rest by a thin rule, sorted alphabetically within each group.
-- **Favourites are global** — stored in your browser's `localStorage` so they're shared across all nodes and persist between sessions.
-- **Live search bar** — auto-focused when the panel opens; start typing to filter the list. Both the favourites section and the main list filter simultaneously.
-
-
-## Lora Randomizer
-
-Clicking **🎲 Add Lora Randomizer** adds a special randomizer line. On creation it immediately rolls a random lora from your node's enabled folders. Randomizer lines work like normal lora rows but have four extra controls on the left and right:
-
-```
-[✓] 🎲 🔓 🔄  flux/styles/ anime.safetensors   S [1.00]  📂 ▲ ▼ ✕
-```
-
-
-### Randomizer controls
-
-| Icon | Name | Behaviour |
-|---|---|---|
-| 🎲 | **Dice** | Manually re-rolls a new random lora from this line's folder pool. Avoids re-picking the current lora when alternatives exist. Dimmed and disabled while the line is locked. |
-| 🔓 / 🔒 | **Lock** | Click 🔓 to freeze the lora on this line — neither the dice nor auto-roll can change it. Click 🔒 to unlock and re-enable randomization. |
-| 🔄 | **Auto-roll** | When **on** (full brightness), the backend picks a fresh random lora from this line's folder pool on **every queued generation**. When **off** (dimmed ~30%), the lora stays fixed between runs. The lock overrides auto-roll — a locked line is never changed regardless of the 🔄 state. |
-| 📂 | **Folder scope** | Opens a per-line panel listing the folders currently enabled in the node's 📁 filter. Check or uncheck folders to narrow which ones this line randomizes from. Each randomizer line keeps its own independent selection — one line can pull only from `flux/styles` while another pulls from `ideogram4`. |
-
-### How auto-roll works
-
-Auto-roll happens **at execution time in the backend**, not in the UI. When any active auto-roll line exists the node reports itself as changed on every queue (`IS_CHANGED` returns a random token), so ComfyUI always re-executes rather than serving a cached result. The roll uses the same folder-intersection logic as the manual dice: the node's enabled-folder set is intersected with the line's own 📂 selection to build the pool.
-
-Note: because the roll is backend-side, the lora name displayed on the node face reflects the last manually-rolled pick, not the one used in the most recent generation.
-
-### Per-line folder scope vs. node folder filter
-
-The 📂 icon on each randomizer line is a **subset** of whatever the node's 📁 filter currently allows — you can't roll from a folder that the node filter has excluded. If the node filter changes, lines that had that folder selected will simply have a smaller (or empty) pool until you re-enable it.
-
-
-
-- Dismiss with **✕**, **Esc**, or by clicking outside the panel.
-
-
+That's the whole basic loop. Everything below is optional.
 
 ---
 
-## Fantastic Lora Plotter 📊
+## The nodes
 
-Internal class name `FantasticLoraPlotter`. Found in **loaders** alongside the other nodes.
-
-The Plotter is a lora testing "sweep" node: instead of applying all enabled loras as a single combined stack, it applies each lora **individually** to the base model and emits the results as a list — one generation per cell. Connect it to a KSampler → VAE Decode → Fantastic Plotter Image Saver (see below) and ComfyUI will automatically run the downstream graph once per cell, producing a grid of images.
-
-Inputs are identical to the Multi-Model loader: a primary MODEL + optional CLIP, plus up to four additional optional MODEL paths. The stack UI is the same — add, reorder, enable/disable, randomize. There's also an optional **`global_loras`** input — connect a Fantastic Plotter Global Lora node here to apply a fixed set of "background" loras to every swept cell in addition to the cell's own lora/strength. The Plotter has a **🌐 Add Global Lora node (connected)** button that drops one into the graph (to the left of the Plotter) with its output already wired to this input; the button greys out to "Global Lora node connected" once one is attached.
-
-### Strength modes
-
-The Plotter adds two buttons below the lora stack:
-
-**📊 Strength mode** toggles between:
-
-| Mode | Behaviour |
+| Node | What it's for |
 |---|---|
-| **Per-line** (default) | Each enabled lora produces one cell at its own stack-row strength. 2 loras = 2 cells. |
-| **Global (sweep)** | Per-line strengths are ignored. Every enabled lora is swept across the global strength list. 2 loras × 3 strengths = 6 cells, ordered lora-major (lora 1 at each strength, then lora 2). Set your saver's column count to the number of strengths to get a true XY grid: loras as rows, strengths as columns. |
+| **Fantastic Lora Loader 📁** | The main one. Stack LoRAs onto one or several models. |
+| **Fantastic Lora Plotter 📊** | XY test bench — sweep LoRAs against strengths and get a comparison grid. |
+| **Fantastic Plotter Global Lora 🌐** | LoRAs applied to *every* image in a comparison. |
+| **Fantastic Plotter Image Saver 📊** | Turns the comparison into one labelled grid image. |
+| **Fantastic Plotter Grid Viewer 🔍** | Browse the results interactively, zoom, and pick winners. |
+| **Fantastic Lora Mimic 🪞** | Mirror a LoRA list authored in another loader onto an independent model path. |
 
-**🎚 Global strengths** opens a popup with 10 individual number fields. Blanks are skipped; order and duplicates are preserved. The button face shows the active list. Both the mode and the strength list serialize inside `lora_data` and save with the workflow.
-
-Per-line strength inputs are greyed out while Global mode is active.
-
-### Control Image
-
-The Plotter has a **Control Image** toggle that adds a baseline generation with zero loras applied, so you can see the pure base model. When a Fantastic Plotter Global Lora node is attached to the `global_loras` input, this toggle is disabled — control is instead driven from the Global Lora node, which has its own two control options (see below).
-
-### Multi-model sweep
-
-The optional MODEL 2–5 paths run the same sweep in parallel — each extra model produces its own list of patched results at the same lora/strength combinations as the primary path. Leave them unconnected to ignore them.
-
-### Metadata output
-
-The `metadata` output is a list of strings, one per cell, in the format `<lora_name>_<strength>` (e.g. `raegram3_1.0`). Wire this to the Fantastic Plotter Image Saver to label each cell automatically.
+All of them appear under **loaders** in the add-node menu.
 
 ---
+
+## Using the loader
+
+The loader is one self-contained panel inside the node.
+
+### The top strip
+
+- **Add lora…** — opens the picker. Type to search; ☆ stars a LoRA so it floats to the top next time.
+- **🎲 Add random** — adds a slot that picks a random LoRA for you (see [Randomizer](#randomizer)).
+- **n / 12** — how many of the 12 slots are filled.
+- **chains N/5 − +** — how many models this node feeds (see [Multiple models](#multiple-models)).
+- **.ext** — show or hide the `.safetensors` on the end of every name.
+- **Theme** — four colour schemes: Fantastic Teal, Boring Blue, Like, TEAL Teal, and Accountant. Changing it restyles the panel *and* the node colour across every node in the pack. If you've hand-picked a colour for a node yourself, the theme leaves it alone.
+
+### The LoRA slots
+
+Twelve slots in two columns. Click any empty one to add a LoRA. Each filled slot shows:
+
+- **● green dot** — click to disable this LoRA without removing it.
+- **number** — the order it's applied in. Reading order: left to right, then down.
+- **folder path** above the **LoRA name** — click the name to swap it for a different one.
+- **M1 M2 …** — which models this LoRA is feeding, when you're using more than one.
+- **− 1.00 +** — the strength. Click the steppers, scroll over it, or type a number. This is the base strength every model uses unless you override one individually under ⚙.
+- **⚙** — per-model routing and **per-model strengths**, plus randomizer settings. This is where you set a LoRA to 1.0 on one model and 0.4 on another.
+- **☰** — drag this to move the LoRA to a different slot.
+- **✕** — remove it.
+
+At the bottom, a footer spells out exactly what each model will receive, in order — handy for confirming things are wired the way you think.
+
+### The ⚙ options
+
+- **Model routing** — one row per model, each showing the checkpoint actually wired into it. Toggle a model's dot to include or exclude this LoRA from it.
+- **Per-model strength** — each routed row has its own strength field. Leave them alone and they follow the chip's base strength, so changing the chip changes all of them. Type a value into one and that model breaks away and keeps its own — the base no longer drags it along. This is how you run a detail LoRA at 1.0 on the base pass and 0.4 on the refiner.
+- **Randomizer settings** — for random slots only: roll, lock, auto-roll, and which folders this slot draws from.
+- **Remove lora**.
+
+New LoRAs start routed to every model at the base strength, so you only need to open this when you want something different.
+
+---
+
+## Presets
+
+Save a set of LoRAs and reload it later. The **PRESET** row sits just under the top strip.
+
+- **Save** — names the current set and stores it. If the name's taken, it asks before overwriting rather than quietly replacing it. If you have random slots, it asks whether to keep them random or freeze them to whatever they rolled.
+- **Load** — replaces everything: LoRAs, strengths, folder filter, and model count.
+- **+ Add to stack** — merges a preset's LoRAs into what you already have, leaving everything else alone. Duplicates are skipped, and if it won't all fit in 12 slots it tells you what didn't make it.
+- **★** — favourite a preset so it pins to the top of the list.
+- **⋮** — Overwrite with what's currently on the node, Rename, Duplicate, or Delete.
+- The **category** dropdown groups presets however you like (by model, by project, by mood).
+
+If you change anything after loading, the preset name turns **orange italic and says "(modified)"** so you know your current setup no longer matches what's saved. That covers everything a preset stores — the LoRAs, their order, strengths, enable states and routing, plus the folder filter and the model count.
+
+Presets are files on disk in `ComfyUI/user/fantastic-loras/presets/`, so they're shared by every workflow and survive updates.
+
+---
+
+## Filtering by folder
+
+If you have hundreds of LoRAs, the **FOLDERS** bar narrows things down. Every node has one.
+
+Click it to open the picker: type to search, use **all** / **none** for bulk changes, and ☆ star folders you use constantly so they pin to the top. Selected folders show as chips you can remove with ✕.
+
+The filter controls what the LoRA picker offers *and* what the randomizer draws from, so the two never disagree. It's saved per node, with the workflow.
+
+One thing to know: folders are exact. Picking `flux` gives you LoRAs sitting directly in `flux`, not everything nested beneath it — tick the subfolders you want too.
+
+---
+
+## Randomizer
+
+**🎲 Add random** adds a slot that picks a LoRA for you. Great for discovering things you'd forgotten you had.
+
+On the slot itself:
+
+- **🎲** — roll a new LoRA right now.
+- **🔓 / 🔒** — lock it to keep the current pick from changing. A locked slot's dice greys out.
+- **⚙ → Randomizer** — turn on **auto-roll** (a fresh pick every time you queue), or narrow which folders *this slot* draws from.
+
+Per-slot folder scope is a subset of the node's folder filter — a random slot can never pull from a folder the node has filtered out.
+
+**Auto-roll** picks the new LoRA when you hit Queue, so what you see on the node is what's about to be generated.
+
+---
+
+## Multiple models
+
+Some workflows run more than one model — a high and low pass, a refiner, or two checkpoints being compared. The **chains** control adds up to 5.
+
+Each extra model gets its own MODEL input and output. There's a single CLIP input shared by all of them, and it stays optional — chains with no CLIP connected simply apply the model half of each LoRA. By default every LoRA feeds every model; use **⚙ → Model routing** when you want a LoRA on only one of them, or at different strengths on each.
+
+---
+
+## The XY LoRA test bench (the Plotter)
+
+The Plotter uses the same slot grid as the loader, but the meaning changes: each slot is a **test cell**, not a layer. Add five LoRAs and you're asking for five images, each with one LoRA applied to the base model — not one image with all five stacked.
+
+### Wiring it
+
+Wire `MODEL` into your sampler exactly like a normal loader, and `CLIP` too if your model uses it. The `metadata` output carries a label for each cell — send it to the **Image Saver** along with your generated images, and it does the rest.
+
+The trick that makes this work in one queue: `MODEL` and `metadata` are **list outputs**. ComfyUI runs everything downstream once per item, so a 12-cell sweep runs your sampler 12 times off a single Queue press. You don't batch anything or re-queue by hand — but everything downstream of the Plotter does run 12 times, so a heavy upscale chain in that path costs you 12 upscales.
+
+**Fix your seed** before you start. A comparison with a random seed per cell tells you nothing about the LoRAs, since you're also changing the noise.
+
+### Per-line vs Global strength
+
+**Per-line** runs each LoRA once, at whatever strength you set on its chip. Good for "which of these twelve do I actually like."
+
+**Global** runs *every* LoRA at *every* strength in a shared list — this is the classic XY plot: LoRAs down the Y axis, strengths across the X. Set the list with **🎚 strengths** (`0.5, 0.75, 1.0`). Chip strengths grey out in this mode, since the shared list is what's being swept.
+
+### Baselines and constants
+
+**Control image** adds one cell with no LoRAs at all — the raw base model. It's the reference that makes everything else legible, and it's cheap. Leave it on.
+
+**🌐 Add Global Lora** spawns and wires a Global Lora node: LoRAs there apply to *every* cell, on top of whatever's being tested. This is how you isolate one variable — hold your style and detail LoRAs constant while character LoRAs sweep. That node has its own two baseline toggles (pure base model, and globals-only), which take over from the Plotter's own control toggle while it's connected.
+
+### Sweeping across more than one model
+
+The Plotter carries the same **chains** control as the loader, with `MODEL 2`–`MODEL 5` outputs. Each one runs the same sweep on a different checkpoint, so you can ask "how does this LoRA set behave on these two base models" and get both grids from a single queue.
+
+Unlike the loader, there's **no per-LoRA routing here** — every LoRA is tested against every connected model, since the point is comparison. The `M1 M2 …` tags on each chip are telling you that, not offering a choice. The footer lists each chain with the checkpoint currently wired into it (or *not connected*), and the ⚙ modal shows the same list per LoRA along with its sweep strength.
+
+### Two grid layouts
+
+The Image Saver composes everything into one image, in whichever style you prefer:
+
+- **Overlay** — a modern look. Each cell keeps its own small label drawn in the corner, so cells stay self-describing however the grid is cropped or shared.
+- **Classic** — the A1111-style XY grid. Cells stay clean and unmarked, with LoRA names printed down the left margin and strength values across the top. Needs a complete LoRA × strength rectangle, so use Global sweep mode; if the cells don't form a clean grid it falls back to Overlay and says so in the console.
+
+Toggle with the **🖼 Grid mode** button on the Image Saver.
+
+### Watch the count
+
+The SWEEP footer does the arithmetic live: `4 lora lines × 3 strengths = 12 images + 1 control · 2 model chains`. Read it before queueing. The multiplication gets away from people — six LoRAs at four strengths across two models is 48 generations plus baselines.
 
 ## Fantastic Plotter Image Saver 📊
 
@@ -165,9 +245,9 @@ Internal class name `FantasticPlotterImageSaver`. Combines three nodes into one:
 2. **Image List to Image Batch** (comfyui-impact-pack) — resizes cells to a common size and stacks them into a batch
 3. **FL Image Batch To Grid** (comfyui_fill-nodes) — composes the batch into a single grid image
 
-Connect the Plotter's `MODEL` list → KSampler → VAE Decode → `images`, and the Plotter's `metadata` list → `metadata`. The node outputs the composed `grid` IMAGE (pass it to any Save Image node), plus three passthroughs — `images` (the per-cell list it received, clean/full-res), `metadata`, and `global_loras_info` — so a Grid Viewer (or anything needing the raw cells) can hang off this node instead of re-tapping the source wires.
+Feed it your generated images and the Plotter's `metadata` output. It gives back a composed `grid` image for any Save Image node, and passes the individual cells straight through — so a Grid Viewer can hang off this node rather than re-tapping earlier wires.
 
-The node also has an **🔍 Add Grid Viewer (connected)** button: click it to drop a Fantastic Plotter Grid Viewer into the graph just to the right of the Saver, with its `images`, `metadata`, and `global_loras_info` inputs already wired to the Saver's matching passthrough outputs. (If the button can't find those outputs, the Saver node predates them — delete and re-add it.)
+The **🔍 Add Grid Viewer (connected)** button drops a Grid Viewer beside the Saver with everything already wired.
 
 ### Controls
 
@@ -188,7 +268,7 @@ The node also has an **🔍 Add Grid Viewer (connected)** button: click it to dr
 
 **Overlay (default):** the metadata label is drawn as a semi-transparent box in the top-right corner of each cell image. The full grid is then composed automatically.
 
-**Classic (border labels):** cells are kept clean. The lora names are printed down the left margin and the strength values are printed across the top — matching the classic XY plot layout. This mode requires a complete lora × strength rectangle (i.e. Global sweep mode on the Plotter); if the metadata doesn't form a clean grid it falls back to Overlay with a console note.
+**Classic (border labels):** the A1111-style XY grid. Cells are kept clean, with lora names printed down the left margin and strength values across the top. This mode requires a complete lora × strength rectangle (i.e. Global sweep mode on the Plotter); if the metadata doesn't form a clean grid it falls back to Overlay with a console note.
 
 ### Auto column detection
 
@@ -200,13 +280,13 @@ One special case: when you're testing several loras at a **single shared strengt
 
 ## Fantastic Plotter Global Lora 🌐
 
-Internal class name `FantasticPlotterGlobalLora`. Found in **loaders** alongside the other nodes.
-
-A companion to the Fantastic Lora Plotter. This node lets you define a set of "global" loras that get applied to every swept cell **in addition to** the cell's own lora. This is useful for exploring how a style lora (e.g., `painterly.safetensors`) interacts with different character or subject loras — the character lora sweeps while the style stays constant.
+Holds LoRAs that apply to **every** image in a comparison, on top of whatever the Plotter is testing. If you're comparing character LoRAs but always want your style LoRA active, it goes here — the characters vary, the style stays put.
 
 ### Stack and strength
 
-The Global Lora node has the full lora-stack UI: folder filter, favourites, add/remove/reorder loras, per-line strength controls, enable/disable checkboxes. There is **no randomizer** — the list stays fixed for the run.
+It uses a simple row list rather than the slot grid: **➕ Add Lora**, then one row per LoRA with an enable box, the name (click to swap), a strength field, and arrows to reorder. It has the same FOLDERS bar as every other node. There's no randomizer here — the list stays fixed for the whole run.
+
+Each LoRA runs at its own fixed strength on every image. So with `painterly` at 0.8 and `texture` at 0.5, both apply at those strengths to every cell while the Plotter's own LoRAs sweep.
 
 Each enabled lora runs at its own per-line strength (e.g., if you add `painterly` with strength 0.8 and `texture` with strength 0.5, both run at those fixed strengths on every swept cell). When connected to the Plotter's `global_loras` input, the Plotter's own stack loras sweep across their strengths while these globals stay constant.
 
@@ -225,7 +305,7 @@ Enable both and the grid gains two control-image rows at the top, each repeated 
 
 When a Global Lora node is connected to the Plotter's `global_loras` input:
 
-- The Plotter's own **Control Image** toggle is **disabled** and relabeled "Set control on Global Lora Node" — control is now driven entirely by the Global Lora node's two toggles.
+- The Plotter's own **Control Image** toggle is **disabled** and relabeled "Control via Global node" — control is now driven entirely by the Global Lora node's two toggles.
 - Disconnecting the Global Lora node re-enables the Plotter's own control toggle.
 - The global loras are applied **after** each swept cell's own lora, stacking on top of it. For example, if the Plotter is sweeping `character_v2` at strengths 0.5 and 1.0, and the Global node has `style_painterly` at 0.8, the saver sees four cells: character_v2 + painterly at 0.5, character_v2 + painterly at 1.0, and (if both controls are on) pure base, and painterly-only.
 
@@ -235,13 +315,11 @@ Internal class name `FantasticPlotterGridViewer`. Found in **loaders**. This is 
 
 ### How to wire it
 
-The viewer needs the **individual** cell images, not the Saver's already-composed grid (you can't pull cells back out of a flattened image). The easiest way to wire it is straight off the **Image Saver**, which passes the per-cell data through:
+Connect the matching outputs from the **Image Saver** — `images`, `metadata`, and optionally `global_loras_info`. Easier still, use the Saver's **🔍 Add Grid Viewer (connected)** button and it wires itself.
 
-- `images` ← the Saver's **`images`** output (the per-cell list it received, passed through clean/full-res — *not* the composed `grid`)
-- `metadata` ← the Saver's **`metadata`** output
-- `global_loras_info` (optional) ← the Saver's **`global_loras_info`** output
+The one thing to get right: the viewer needs the **individual cells**, not the Saver's composed `grid`. You can't pull cells back out of a flattened image. The Saver's `images` output is the per-cell list passed through at full resolution, which is what you want here.
 
-(You can also tap those three directly from the VAE Decode + Plotter if you prefer; the Saver passthrough just keeps everything coming from one node.) Connect VAE Decode → Image Saver, then Image Saver → Grid Viewer. The Saver still gives you a flat PNG via its `grid` output to save; the Viewer gives you the interactive board.
+You can run both — the Saver's `grid` output for a flat PNG to keep, the Viewer for browsing.
 
 ### Interactions
 
@@ -287,6 +365,11 @@ Internal class name `FantasticLoraMimic`. Found in **loaders**.
 
 > ⚠️ **Experimental.** The Mimic node (and its Subgraph Companion) is still a proof-of-concept. It reads other nodes' configured loras through informal ComfyUI frontend internals and covers a fixed set of loader families, so it can break with ComfyUI updates or with loaders it doesn't have an adapter for. Treat it as a convenience for dual-model workflows, not a guaranteed-stable part of the pack — double-check that what it mirrors matches what you intend before relying on a result.
 
+<p align="center">
+  <img src="screenshots/loramimic.png" alt="A Fantastic Lora Mimic node mirroring two loras from an rgthree Power Lora Loader beside it" width="700"><br>
+  <em>Wirelessly mirror Loras from other nodes. For whatever reason. Experimental.</em>
+</p>
+
 Applies a set of loras onto **its own** `model`/`clip` — without ever taking the source's MODEL path. The point: you can reproduce the loras another node is using on a *separate* model pipeline, with no risk of inheriting that node's already-patched model. Useful for models with dual model workflows such as Wan 2.2, Ideogram4, or 2nd-pass setups. There are two ways to feed it (if a wire is connected it always wins over the picker):
 
 **1. Pick (any node) — recommended.** With nothing wired, choose a **source** node in the Mimic's UI and it mirrors that node's configured loras into itself — read live from the graph in the frontend, before execution. This is the fuller-featured path, giving you per-lora control: each mirrored lora can either **directly mimic (link)** the source — its strength tracks the source live, so you set it once on the source and forget it — or be **unlinked for fine control**, letting you override that lora's strength on the Mimic independently of the source. It can read several loader families: our own stack nodes (they carry a `lora_data` blob); the stock `LoraLoader` / `LoraLoaderModelOnly` (and shape-compatible ones like the pysssss loader); rgthree's `Power Lora Loader`; and numbered-widget stackers like Efficiency `LoRA Stacker` and Comfyroll `CR LoRA Stack`. Controls:
@@ -295,7 +378,7 @@ Applies a set of loras onto **its own** `model`/`clip` — without ever taking t
 - **↻ Pull now** — copy the source's loras immediately.
 - A status line shows what's currently being mimicked.
 
-**2. Wire (cooperating nodes).** Connect any **`LORA_STACK`** output into the Mimic's `lora_stack` input. Our `Fantastic Lora Loader` and `Fantastic Lora Loader (Multi-Model)` emit a `lora_stack` output, and the Mimic also accepts the common Efficiency-style `LORA_STACK` (list of `(name, model_strength, clip_strength)`), so third-party stackers work too. The Mimic re-emits the resolved stack on its own `lora_stack` output for chaining. **Note the tradeoff:** a `LORA_STACK` is only resolved tuples computed when the graph runs, with no per-lora link/strength metadata, so the wire path **can't** offer the picker's strength controls — it's hardwired to directly mimic whatever the connected node produces, applied flat. To change a wired lora's strength, adjust it on the upstream node, or use the picker instead.
+**2. Wire (cooperating nodes).** Connect any **`LORA_STACK`** output into the Mimic's `lora_stack` input. Our `Fantastic Lora Loader` emits a `lora_stack` output, and the Mimic also accepts the common Efficiency-style `LORA_STACK` (list of `(name, model_strength, clip_strength)`), so third-party stackers work too. The Mimic re-emits the resolved stack on its own `lora_stack` output for chaining. **Note the tradeoff:** a `LORA_STACK` is only resolved tuples computed when the graph runs, with no per-lora link/strength metadata, so the wire path **can't** offer the picker's strength controls — it's hardwired to directly mimic whatever the connected node produces, applied flat. To change a wired lora's strength, adjust it on the upstream node, or use the picker instead.
 
 Outputs: `MODEL`, `CLIP`, `lora_stack` (the resolved stack, for chaining), and `mimicked` (a STRING summary of what was applied).
 
@@ -322,18 +405,54 @@ It has an optional `lora_stack` passthrough input (merged first) so sniffers can
 
 Notes/limitations (it's a POC): the picker reads *configured* widget values from the graph, so it reflects what a source is set to, not anything a node computes at runtime in Python (our own randomizer is fine — the frontend bakes the rolled pick into `lora_data` before queueing). The picker understands our `lora_data` format, the stock `LoraLoader`/`LoraLoaderModelOnly` (and shape-compatible forks like pysssss's), rgthree's Power Lora Loader, and numbered-widget stackers (Efficiency `LoRA Stacker`, Comfyroll `CR LoRA Stack`); other third-party loaders would need their own small adapter, or can feed the Mimic via a `LORA_STACK` wire instead. Graph-introspection uses informal ComfyUI frontend internals, so it's wrapped defensively.
 
-## How it works
+---
 
-- **Backend** (`nodes.py`): parses the stack JSON, resolves lora paths via `folder_paths.get_full_path`, loads with `comfy.utils.load_torch_file` (cached per path), applies via `comfy.sd.load_lora_for_models`. The stack is carried in a hidden `lora_data` STRING widget so it reaches Python and serializes with the workflow. CLIP is declared in `INPUT_TYPES["optional"]` so an unconnected input arrives as `None`. Auto-roll lines are re-randomized at execution time; `IS_CHANGED` returns a random token whenever an active auto-roll line exists to prevent ComfyUI from caching the result.
-  - **Plotter sweep:** the Plotter applies each enabled lora individually to a copy of the base model (not stacked), emitting one model+metadata pair per cell. If a Global Lora node is attached, its loras are then stacked on top of each swept cell's result. Control images (baseline generations with zero or global-only loras) are appended as extra cells.
-  - **Image Saver:** receives lists of images and metadata, splits control cells out, optionally constrains size, then renders either an overlay-label style or a classic XY-grid layout (with control rows at the top) into a single grid image. Control cell metadata (`control` and `control_global`) are handled as special labels.
-- **API route**: `GET /lora_folder_loader/loras` serves the lora filename list to the frontend.
-- **Frontend** (`web/lora_folder_loader.js`): DOM widgets for lora rows, folder filter panel, lora chooser panel, and per-line randomizer folder panel. Favourites are stored in `localStorage` under the key `fll_favorites`. Tooltips are custom DOM elements (instant, teal-bordered) rather than native browser title attributes. The Plotter adds global-strength controls and a control-image toggle (disabled when a Global Lora node is attached). The Global Lora node uses the same stack UI as the loaders but adds two control toggles.
-- **Grid Viewer frontend** (`web/plotter_grid_viewer.js`): a separate extension. The Python node (`OUTPUT_NODE`) saves each cell to the temp folder and returns `{"ui": {"fl_cells": [...refs+metadata], "fl_global": [...]}}`; the frontend reads this in `onExecuted` and builds the interactive grid in an `addDOMWidget` container. All zoom / filter / compare interaction is pure DOM with no extra round-trips to the server.
-- **Mimic frontend** (`web/lora_mimic.js`): a separate extension covering both the Mimic and its Subgraph Companion. The Mimic's UI state (selected sources, per-lora link/companion/force flags, group-bypass overrides, High/Low mode) lives on the node instance and is serialized into the same hidden `lora_data` widget as a JSON object (`{loras, mimicSources, groupForced, highLow}`); a live-mirror timer (`tick`) reconciles against the source nodes' widgets and re-renders. On the Python side, `_expand_mimic_payload` interprets that JSON (handling High/Low companions and the `useOriginal`/`forced` overrides) when nothing is wired, while a connected `LORA_STACK` wire (via `_normalize_stack`) takes precedence and is applied flat. Source-type adapters (stock/pysssss, rgthree Power Lora Loader, Efficiency/Comfyroll numbered stackers, our own `lora_data` nodes) all live in `readSourceLoras`.
+## Where your settings live
 
-## Notes
+| What | Where |
+|---|---|
+| Presets | `ComfyUI/user/fantastic-loras/presets/` |
+| Favourites, theme, `.ext` toggle | `ComfyUI/user/fantastic-loras/prefs.json` |
+| Grid Viewer archive defaults | `ComfyUI/user/fantastic-loras/archive_defaults.json` |
+| Your LoRA stack, folder filter, strengths | Saved inside the workflow itself |
 
-- With an explicit folder selection, loras added to disk later aren't auto-included — open the panel and tick the new folder; it re-reads disk each time it opens.
-- A lora referenced in a saved workflow but missing on disk is skipped with a console warning rather than failing the run.
-- The node widens slightly when one or more randomizer lines are present to accommodate the extra icons, and shrinks back when all randomizer lines are removed.
+The first three follow your ComfyUI install, so they're the same in every workflow and survive updates. The last one travels with the workflow file, so sharing a workflow shares its LoRA setup.
+
+## Good to know
+
+- **A LoRA that's missing from disk is skipped**, with a note in the console — a workflow referencing a deleted LoRA still runs.
+- **Loading a preset tells you** if any of its LoRAs have since been deleted.
+- **Disabled or zero-strength LoRAs cost nothing** — they're skipped entirely, not applied at 0.
+- **Nodes resize themselves** to fit their contents. If one looks too small after an update, it'll correct itself on the next redraw.
+- **Both renderers behave identically** — if something looks wrong after switching between the classic canvas and Nodes 2.0, a browser refresh sorts it.
+
+## Troubleshooting
+
+**A node is blank, or buttons do nothing.** Hard-refresh the browser (Ctrl+Shift+R). Browsers cache the old code aggressively.
+
+**Presets or favourites aren't saving.** These need a ComfyUI *restart* (not just a refresh) after installing or updating, since the pack adds server routes at startup.
+
+**A new LoRA folder isn't showing up.** Open the FOLDERS picker — it re-reads the disk each time it opens. If you have an explicit folder selection, tick the new folder to include it.
+
+**The comparison grid is enormous.** Check the SWEEP footer count before queueing; LoRAs × strengths multiplies fast.
+
+## Upgrading from v1
+
+The old single-model **Fantastic Lora Loader** node has been replaced by the multi-model one (which is now just called **Fantastic Lora Loader 📁**). Old workflows using the single-model node will need it swapped for the new one — your LoRA list, strengths, and folder filter all carry over.
+
+Favourites and theme choice from v1 lived in your browser and don't migrate to the new on-disk settings; you'll want to re-star your regulars once.
+
+## Under the hood
+
+For the curious, or anyone wanting to build on this:
+
+- LoRA stacks are stored as JSON in a hidden widget on the node, which is how they serialize with the workflow.
+- Each model chain gets an independent copy of the base model, so LoRAs on one never leak into another.
+- LoRAs are applied through ComfyUI's own `comfy.sd.load_lora_for_models`, the same path the stock loader uses, with the loaded file cached per path.
+- Auto-roll happens in the browser at queue time rather than during execution — this keeps the generation path identical to a normal run.
+- The Plotter applies each LoRA individually to a copy of the base model rather than stacking them, emitting one model and metadata pair per cell.
+- The panels are plain DOM inside the node body, which is why they work under both renderers.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

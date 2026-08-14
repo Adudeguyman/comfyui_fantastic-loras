@@ -1,11 +1,11 @@
 """
 Fantastic Lora Loader — standalone ComfyUI custom nodes.
 
-Two nodes:
-  FantasticLoraLoader          — single model + optional CLIP
-                                  (+ randomizer / auto-roll lines)
-  FantasticLoraLoaderMulti     — primary model + optional CLIP
-                                  + up to 4 additional optional models
+Loader node:
+  FantasticLoraLoaderMulti     — primary model + optional CLIP, plus up to 4
+                                  additional optional models (added on demand)
+                                  + randomizer / auto-roll lines.
+                                  Display name: "Fantastic Lora Loader".
 
 The lora stack lives in a hidden "lora_data" STRING widget managed by the
 frontend.  Its JSON shape is:
@@ -48,7 +48,7 @@ _ROOT_LABEL = "(root)"
 
 
 def _load_lora_sd(path: str):
-    """Return the lora state dict for `path`.
+    """Return (state_dict, metadata) for the lora at `path`.
 
     IMPORTANT: returns a *shallow copy* of the cached dict, never the cached
     object itself. comfy.lora.load_lora() may remove keys from the dict it is
@@ -57,12 +57,30 @@ def _load_lora_sd(path: str):
     drained dict and patch the model incompletely, degrading output quality.
     A shallow copy is cheap (it copies tensor references, not tensor data) and
     keeps the cached original pristine for every run.
+
+    Metadata is loaded once alongside the state dict (mirroring the stock
+    LoraLoader) and passed through to load_lora_for_models, which attaches it
+    to the patched model/clip for downstream introspection.
     """
-    sd = _LORA_SD_CACHE.get(path)
-    if sd is None:
-        sd = comfy.utils.load_torch_file(path, safe_load=True)
-        _LORA_SD_CACHE[path] = sd
-    return dict(sd)
+    cached = _LORA_SD_CACHE.get(path)
+    if cached is None:
+        try:
+            sd, meta = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+        except TypeError:  # very old comfy without return_metadata
+            sd, meta = comfy.utils.load_torch_file(path, safe_load=True), None
+        cached = (sd, meta)
+        _LORA_SD_CACHE[path] = cached
+    return dict(cached[0]), cached[1]
+
+
+def _apply_lora_to(model, clip, path: str, model_s: float, clip_s: float):
+    """load_lora_for_models with metadata pass-through (stock-loader parity),
+    falling back gracefully on comfy versions without the kwarg."""
+    sd, meta = _load_lora_sd(path)
+    try:
+        return comfy.sd.load_lora_for_models(model, clip, sd, model_s, clip_s, lora_metadata=meta)
+    except TypeError:
+        return comfy.sd.load_lora_for_models(model, clip, sd, model_s, clip_s)
 
 
 def _folder_of(f: str) -> str:
@@ -108,7 +126,8 @@ def _parse_payload(lora_data: str):
             model_s = float(e.get("model", 1.0))
             clip_s = float(e.get("clip", 1.0))
         item = {"on": bool(e.get("on", True)), "name": name,
-                "model": model_s, "clip": clip_s}
+                "model": model_s, "clip": clip_s,
+                "targets": _normalize_targets(e.get("targets"))}
         if is_random:
             item["random"] = True
             item["autoRoll"] = bool(e.get("autoRoll"))
@@ -123,6 +142,72 @@ def _parse_stack(lora_data: str) -> list:
     return _parse_payload(lora_data)[0]
 
 
+# ---------------------------------------------------------------------------
+# Per-model targeting (lora_data v2)
+# ---------------------------------------------------------------------------
+#
+# v1 entry: {on, name, model, clip, ...}  — one model strength, applied to the
+#           primary model and (in the multi node) every connected extra model.
+#
+# v2 entry: adds an optional "targets" map describing WHICH model paths the lora
+#           applies to and at WHAT model strength per path:
+#               "targets": {"1": 1.0, "2": 0.6}
+#           Keys are 1-based model-path indices (1 = primary, which also carries
+#           the shared CLIP). A path absent from the map is NOT patched by that
+#           lora (a broken connection in the graph view). An empty map means the
+#           lora is connected to nothing and is inert.
+#
+# When "targets" is absent (every entry the current frontend emits), the lora is
+# "uniform": it applies to every connected chain at its single `model` strength —
+# byte-for-byte the v1 behaviour. Each chain is an independent pipeline; the
+# per-chain strength patches BOTH that chain's UNet and its CLIP (one value).
+# There is one CLIP input shared as the source — each chain patches its own
+# independent copy of it (patching clones internally), so what a lora does on
+# chain 2 cannot affect chain 1. A chain patches CLIP only when a source clip is
+# provided; with no clip wired, every chain is model-only.
+
+def _normalize_targets(raw):
+    """Normalize a v2 per-model targets map.
+
+    Accepts {"1": 1.0, "2": 0.6} (path index -> model strength) or a bare list
+    of indices [1, 2] (membership only; strength falls back to the entry's
+    uniform `model`). Returns {int: float|None}, an empty dict (explicitly
+    connected to nothing), or None (no targets key -> uniform)."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    elif isinstance(raw, list):
+        items = [(k, None) for k in raw]
+    else:
+        return None
+    out = {}
+    for k, v in items:
+        try:
+            idx = int(k)
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= idx <= 5):
+            continue
+        try:
+            out[idx] = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            out[idx] = None
+    return out
+
+
+def _entry_strength_for_path(e, path_index: int):
+    """Model strength this entry applies at on the given 1-based path index, or
+    None if the entry does not target that path."""
+    targets = e.get("targets")
+    if targets is None:
+        return float(e.get("model", 1.0))   # uniform: applies to every path
+    if path_index in targets:
+        v = targets[path_index]
+        return float(v) if v is not None else float(e.get("model", 1.0))
+    return None
+
+
 def _all_lora_files():
     try:
         return [str(f).replace(os.sep, "/") for f in folder_paths.get_filename_list("loras")]
@@ -131,23 +216,20 @@ def _all_lora_files():
         return []
 
 
-def _apply_stack_collect(model, clip, lora_data: str):
-    """Apply the lora stack to (model, clip) and report what was applied.
+def _apply_chain_collect(model, clip, entries, chain_index: int):
+    """Apply the parsed entries to ONE independent chain. Returns (model, clip,
+    applied).
 
-    Returns (model, clip, applied) where `applied` is a list of
-    (name, model_strength, clip_strength) in application order — exactly the
-    loras that were patched in (post dedup / not-found skips). The plotter uses
-    this to build metadata that reflects the real stack, including auto-rolled
-    picks (which the frontend has already baked into `name` at queue time).
+    A chain is a self-contained (model, clip) pair. For each enabled entry that
+    targets this chain, the chain's UNet AND its CLIP are patched at the same
+    per-chain strength (one value per chain). CLIP is patched only when a clip is
+    actually wired to this chain; a model-only chain (clip is None) patches just
+    the UNet. Chains never share state — patching chain 2 cannot affect chain 1.
+    Each resolved file is applied at most once per chain (dedup guard).
 
-    Every entry — normal or randomizer — is applied by its concrete `name`.
-    Randomizer/auto-roll lines are rolled in the frontend at queue time and
-    arrive here with a concrete name already baked in, so they traverse the
-    exact same code path as a normal lora line. Each resolved path is applied
-    at most once per call.
+    `chain_index` is 1-based (1 = the primary model/clip pair).
     """
-    entries, _enabled = _parse_payload(lora_data)
-    applied_paths: set[str] = set()   # dedup guard
+    applied_paths: set[str] = set()
     applied: list = []
 
     for e in entries:
@@ -158,11 +240,15 @@ def _apply_stack_collect(model, clip, lora_data: str):
         if not name or name in ("None", "NONE"):
             continue
 
-        # Clamp strengths to a sane range to avoid runaway values.
-        model_s = max(-10.0, min(10.0, float(e.get("model", 1.0))))
-        clip_s  = max(-10.0, min(10.0, float(e.get("clip",  1.0))))
+        s = _entry_strength_for_path(e, chain_index)
+        if s is None:
+            continue  # entry does not target this chain (no connection)
 
-        if model_s == 0 and (clip is None or clip_s == 0):
+        s = max(-10.0, min(10.0, float(s)))
+        model_s = s
+        clip_s = s if clip is not None else 0.0
+
+        if model_s == 0 and clip_s == 0:
             continue
 
         path = folder_paths.get_full_path("loras", name)
@@ -170,19 +256,31 @@ def _apply_stack_collect(model, clip, lora_data: str):
             print(f"[FantasticLoraLoader] WARNING: lora not found, skipping: {name}")
             continue
 
-        # Deduplication: skip if this exact file was already applied this run.
         if path in applied_paths:
             print(f"[FantasticLoraLoader] WARNING: duplicate lora entry skipped: {name}")
             continue
         applied_paths.add(path)
 
-        print(f"[FantasticLoraLoader] applying {name}  M={model_s} C={clip_s}")
-        model, clip = comfy.sd.load_lora_for_models(
-            model, clip, _load_lora_sd(path), model_s, clip_s
-        )
+        print(f"[FantasticLoraLoader] applying {name}  chain={chain_index} M={model_s} C={clip_s}")
+        model, clip = _apply_lora_to(model, clip, path, model_s, clip_s)
         applied.append((name, model_s, clip_s))
 
     return model, clip, applied
+
+
+def _apply_stack_collect(model, clip, lora_data: str):
+    """Apply the lora stack to chain 1's (model, clip) and report what was
+    applied, as (name, model_strength, clip_strength) in application order.
+
+    Every entry — normal or randomizer — is applied by its concrete `name`.
+    Randomizer/auto-roll lines are rolled in the frontend at queue time and
+    arrive here with a concrete name already baked in, so they traverse the
+    exact same code path as a normal lora line. The plotter and any single-model
+    consumer use this; it is chain 1 of the per-chain applicator, so v1 (uniform)
+    payloads behave exactly as before.
+    """
+    entries, _enabled = _parse_payload(lora_data)
+    return _apply_chain_collect(model, clip, entries, 1)
 
 
 def _apply_stack(model, clip, lora_data: str):
@@ -234,7 +332,7 @@ def _apply_one(model, clip, name, model_s, clip_s):
         return None
     model_s = max(-10.0, min(10.0, float(model_s)))
     clip_s  = max(-10.0, min(10.0, float(clip_s)))
-    return comfy.sd.load_lora_for_models(model, clip, _load_lora_sd(path), model_s, clip_s)
+    return _apply_lora_to(model, clip, path, model_s, clip_s)
 
 
 def _parse_plot_config(lora_data: str):
@@ -305,14 +403,24 @@ def _apply_global_chain(model, clip, globals_list):
 def _stack_list_from_data(lora_data):
     """Build a LORA_STACK [(name, model_s, clip_s), ...] from a lora_data payload.
 
-    Only enabled, concretely-named lines are included. This is the format the
-    wider ComfyUI ecosystem (Efficiency Nodes etc.) uses for LORA_STACK, so it
-    lets our loaders feed a Mimic — or anything else that consumes LORA_STACK."""
+    Only enabled, concretely-named lines are included. LORA_STACK is a flat,
+    single-model ecosystem format (Efficiency Nodes etc.), so it cannot express
+    per-model strengths: each lora is reported at its PRIMARY-path strength, or —
+    if the lora is wired only to extra paths — at its lowest-indexed target's
+    strength, so nothing silently drops out."""
     entries, _ = _parse_payload(lora_data)
     out = []
     for e in entries:
-        if e["on"] and e["name"] and e["name"] not in ("None", "NONE"):
-            out.append((e["name"], float(e["model"]), float(e["clip"])))
+        if not e["on"] or not e["name"] or e["name"] in ("None", "NONE"):
+            continue
+        ms = _entry_strength_for_path(e, 1)
+        if ms is None:
+            t = e.get("targets")
+            if not t:
+                continue
+            v = t[min(t)]
+            ms = float(v) if v is not None else float(e.get("model", 1.0))
+        out.append((e["name"], float(ms), float(e["clip"])))
     return out
 
 
@@ -397,38 +505,17 @@ _LORA_DATA_INPUT = (
 
 
 # ---------------------------------------------------------------------------
-# Node: Fantastic Lora Loader (single model)
+# Node: Fantastic Lora Loader
 # ---------------------------------------------------------------------------
-
-class FantasticLoraLoader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {"model": ("MODEL",), "lora_data": _LORA_DATA_INPUT},
-            "optional": {"clip": ("CLIP",)},
-        }
-
-    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK")
-    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack")
-    FUNCTION = "load"
-    CATEGORY = "loaders"
-    TITLE = "Fantastic Lora Loader"
-
-    @classmethod
-    def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
-        # The frontend bakes a fresh random pick into lora_data on every queue,
-        # so the data itself changes when auto-roll lines re-roll — no need to
-        # force a random token. Re-execution happens naturally.
-        return lora_data
-
-    def load(self, model, lora_data, clip=None):
-        model, clip = _apply_stack(model, clip, lora_data)
-        return (model, clip, _stack_list_from_data(lora_data))
-
-
-# ---------------------------------------------------------------------------
-# Node: Fantastic Lora Loader (Multi-Model)
-# ---------------------------------------------------------------------------
+#
+# A primary MODEL plus up to four additional optional MODEL inputs (added on
+# demand from the node's ➕ bar), and ONE optional CLIP input shared as the
+# source. Each model forms an independent chain: the lora stack patches that
+# chain's UNet and an independent copy of the single source CLIP, at the
+# per-chain strength. Patching clones internally, so every chain derives its own
+# patched CLIP from the one input without touching any other chain. Outputs are
+# a patched MODEL + CLIP per chain. With no extra chains the node behaves like a
+# plain single-model loader — three outputs, extra slots hidden.
 
 class FantasticLoraLoaderMulti:
     @classmethod
@@ -444,11 +531,15 @@ class FantasticLoraLoaderMulti:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK", "MODEL", "MODEL", "MODEL", "MODEL")
-    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack", "MODEL 2", "MODEL 3", "MODEL 4", "MODEL 5")
+    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK",
+                    "MODEL", "CLIP", "MODEL", "CLIP",
+                    "MODEL", "CLIP", "MODEL", "CLIP")
+    RETURN_NAMES = ("MODEL", "CLIP", "lora_stack",
+                    "MODEL 2", "CLIP 2", "MODEL 3", "CLIP 3",
+                    "MODEL 4", "CLIP 4", "MODEL 5", "CLIP 5")
     FUNCTION = "load"
     CATEGORY = "loaders"
-    TITLE = "Fantastic Lora Loader (Multi-Model)"
+    TITLE = "Fantastic Lora Loader"
 
     @classmethod
     def IS_CHANGED(cls, model=None, lora_data="{}", clip=None, **kwargs):
@@ -456,11 +547,18 @@ class FantasticLoraLoaderMulti:
 
     def load(self, model, lora_data, clip=None,
              model_2=None, model_3=None, model_4=None, model_5=None):
-        primary_m, patched_clip = _apply_stack(model, clip, lora_data)
+        entries, _enabled = _parse_payload(lora_data)
+        # Every chain starts from the SAME source clip; patching clones it, so
+        # each chain's patched clip is independent — chain 2 never affects chain 1.
+        m1, c1, _applied = _apply_chain_collect(model, clip, entries, 1)
         extras = []
-        for m in (model_2, model_3, model_4, model_5):
-            extras.append(_apply_stack(m, None, lora_data)[0] if m is not None else None)
-        return (primary_m, patched_clip, _stack_list_from_data(lora_data), *extras)
+        for idx, m in enumerate((model_2, model_3, model_4, model_5), start=2):
+            if m is None:
+                extras.extend((None, None))
+            else:
+                pm, pc, _a = _apply_chain_collect(m, clip, entries, idx)
+                extras.extend((pm, pc))
+        return (m1, c1, _stack_list_from_data(lora_data), *extras)
 
 
 # ---------------------------------------------------------------------------
@@ -1534,6 +1632,114 @@ def _user_config_dir():
 def _archive_defaults_path():
     return os.path.join(_user_config_dir(), "archive_defaults.json")
 
+
+# --- user prefs (favorites, theme, display toggles) -------------------------
+# One JSON file next to the presets, so favourites survive a browser reset and
+# follow the install rather than the browser profile.
+
+_PREFS_DEFAULT = {
+    "favoriteLoras": [],
+    "favoriteFolders": [],
+    "favoritePresets": [],
+    "theme": "teal",
+    "showExt": False,
+}
+
+
+def _prefs_path():
+    return os.path.join(_user_config_dir(), "prefs.json")
+
+
+def _read_prefs():
+    cfg = dict(_PREFS_DEFAULT)
+    try:
+        with open(_prefs_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k in ("favoriteLoras", "favoriteFolders", "favoritePresets"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    cfg[k] = [str(x) for x in v]
+            if isinstance(data.get("theme"), str):
+                cfg["theme"] = data["theme"]
+            cfg["showExt"] = bool(data.get("showExt", False))
+    except Exception:
+        pass
+    return cfg
+
+
+def _write_prefs(patch):
+    cfg = _read_prefs()
+    if isinstance(patch, dict):
+        for k in ("favoriteLoras", "favoriteFolders", "favoritePresets"):
+            v = patch.get(k)
+            if isinstance(v, list):
+                cfg[k] = [str(x) for x in v]
+        if isinstance(patch.get("theme"), str):
+            cfg["theme"] = patch["theme"]
+        if "showExt" in patch:
+            cfg["showExt"] = bool(patch["showExt"])
+    path = _prefs_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        return None
+    return cfg
+
+
+# --- lora stack presets ----------------------------------------------------
+# Named snapshots of a loader's lora stack (+ folder filter), stored one JSON
+# file per preset so they're easy to inspect, back up, and hand-edit.
+
+def _preset_dir():
+    d = os.path.join(_user_config_dir(), "presets")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _preset_safe_name(name):
+    """Sanitize a user-supplied preset name into a safe single filename."""
+    name = str(name or "").strip()
+    if not name:
+        return "", None
+    name = name.replace("\\", "/").split("/")[-1]
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name).strip(" .")
+    if not name or name in (".", ".."):
+        return "", None
+    name = name[:80]
+    return name, os.path.join(_preset_dir(), name + ".json")
+
+
+def _list_presets():
+    """Return [{"name":..., "category":...}] sorted by category then name."""
+    out = []
+    try:
+        for fn in os.listdir(_preset_dir()):
+            if not fn.endswith(".json"):
+                continue
+            name = fn[:-5]
+            cat, count = "", None
+            try:
+                with open(os.path.join(_preset_dir(), fn), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    cat = str(data.get("category") or "")
+                    if isinstance(data.get("loras"), list):
+                        count = len(data["loras"])
+            except Exception:
+                pass
+            out.append({"name": name, "category": cat, "count": count})
+    except Exception:
+        pass
+    out.sort(key=lambda p: (p["category"].lower(), p["name"].lower()))
+    return out
+
 def _read_archive_defaults():
     try:
         with open(_archive_defaults_path(), "r", encoding="utf-8") as f:
@@ -1812,7 +2018,6 @@ class FantasticLoraMimicSubgraphCompanion:
 
 
 NODE_CLASS_MAPPINGS = {
-    "FantasticLoraLoader":      FantasticLoraLoader,
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
     "FantasticPlotterGlobalLora": FantasticPlotterGlobalLora,
@@ -1822,8 +2027,7 @@ NODE_CLASS_MAPPINGS = {
     "FantasticLoraMimicSubgraphCompanion": FantasticLoraMimicSubgraphCompanion,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FantasticLoraLoader":      "Fantastic Lora Loader 📁",
-    "FantasticLoraLoaderMulti": "Fantastic Lora Loader (Multi-Model) 📁",
+    "FantasticLoraLoaderMulti": "Fantastic Lora Loader 📁",
     "FantasticLoraPlotter":     "Fantastic Lora Plotter 📊",
     "FantasticPlotterGlobalLora": "Fantastic Plotter Global Lora 🌐",
     "FantasticPlotterImageSaver": "Fantastic Plotter Image Saver 📊",
@@ -1871,6 +2075,192 @@ def _register_routes():
         cfg = body.get("defaults", body) if isinstance(body, dict) else {}
         ok = _write_archive_defaults(cfg)
         return _web.json_response({"ok": bool(ok), "defaults": _read_archive_defaults()})
+
+    # --- user prefs -----------------------------------------------------------
+    @PromptServer.instance.routes.get("/fantastic_loras/prefs")
+    async def _prefs_get(_request):
+        from aiohttp import web as _web
+        return _web.json_response({"prefs": _read_prefs()})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/prefs")
+    async def _prefs_set(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        patch = body.get("prefs", body) if isinstance(body, dict) else {}
+        cfg = _write_prefs(patch)
+        return _web.json_response({"ok": cfg is not None, "prefs": cfg or _read_prefs()})
+
+    # --- lora stack presets ---------------------------------------------------
+    @PromptServer.instance.routes.get("/fantastic_loras/presets")
+    async def _presets_list(_request):
+        from aiohttp import web as _web
+        return _web.json_response({"presets": _list_presets()})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/presets/save")
+    async def _presets_save(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_safe_name(body.get("name"))
+        if not path:
+            return _web.json_response({"error": "give the preset a name"}, status=400)
+        loras = body.get("loras")
+        if not isinstance(loras, list):
+            return _web.json_response({"error": "loras must be a list"}, status=400)
+        if os.path.exists(path) and not body.get("overwrite"):
+            return _web.json_response(
+                {"error": "exists", "name": name,
+                 "message": f'A preset named "{name}" already exists.'}, status=409)
+        payload = {
+            "version": 1,
+            "loras": loras,
+            "category": str(body.get("category") or "").strip()[:40],
+            "enabledFolders": body.get("enabledFolders"),
+            "chains": body.get("chains"),
+        }
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=1)
+            os.replace(tmp, path)
+        except Exception as exc:
+            return _web.json_response({"error": f"save failed: {exc}"}, status=500)
+        return _web.json_response({"name": name, "count": len(loras),
+                                   "presets": _list_presets()})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/presets/load")
+    async def _presets_load(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_safe_name(body.get("name"))
+        if not path or not os.path.exists(path):
+            return _web.json_response({"error": "preset not found"}, status=404)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            return _web.json_response({"error": f"unreadable preset: {exc}"}, status=500)
+        loras = data.get("loras") if isinstance(data, dict) else None
+        if not isinstance(loras, list):
+            return _web.json_response({"error": "preset has no lora list"}, status=500)
+        # Report loras that have since been deleted rather than failing later.
+        available = set(_all_lora_files())
+        kept, missing = [], []
+        for e in loras:
+            if not isinstance(e, dict):
+                continue
+            nm = e.get("name") or ""
+            if not nm or e.get("random") or nm in available:
+                kept.append(e)
+            else:
+                missing.append(nm)
+        return _web.json_response({
+            "name": name, "loras": kept, "missing": missing,
+            "category": str(data.get("category") or ""),
+            "enabledFolders": data.get("enabledFolders"),
+            "chains": data.get("chains"),
+        })
+
+    @PromptServer.instance.routes.post("/fantastic_loras/presets/update")
+    async def _presets_update(request):
+        """Rename a preset and/or change its category, leaving its loras alone."""
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_safe_name(body.get("name"))
+        if not path or not os.path.exists(path):
+            return _web.json_response({"error": "preset not found"}, status=404)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            return _web.json_response({"error": f"unreadable preset: {exc}"}, status=500)
+        if not isinstance(data, dict):
+            return _web.json_response({"error": "unreadable preset"}, status=500)
+        if "category" in body:
+            data["category"] = str(body.get("category") or "").strip()[:40]
+        new_name, new_path = name, path
+        if body.get("newName"):
+            new_name, new_path = _preset_safe_name(body.get("newName"))
+            if not new_path:
+                return _web.json_response({"error": "give the preset a name"}, status=400)
+            if new_path != path and os.path.exists(new_path):
+                return _web.json_response(
+                    {"error": "exists", "message": f'A preset named "{new_name}" already exists.'},
+                    status=409)
+        tmp = new_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, new_path)
+            if new_path != path:
+                os.remove(path)
+        except Exception as exc:
+            return _web.json_response({"error": f"update failed: {exc}"}, status=500)
+        return _web.json_response({"name": new_name, "presets": _list_presets()})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/presets/duplicate")
+    async def _presets_duplicate(request):
+        """Copy a preset under a new name. Copies the stored file verbatim, so
+        the duplicate is exact — no pruning of loras missing from disk."""
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_safe_name(body.get("name"))
+        if not path or not os.path.exists(path):
+            return _web.json_response({"error": "preset not found"}, status=404)
+        new_name, new_path = _preset_safe_name(body.get("newName"))
+        if not new_path:
+            return _web.json_response({"error": "give the copy a name"}, status=400)
+        if os.path.exists(new_path):
+            return _web.json_response(
+                {"error": "exists", "name": new_name,
+                 "message": f'A preset named "{new_name}" already exists.'}, status=409)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            return _web.json_response({"error": f"unreadable preset: {exc}"}, status=500)
+        if not isinstance(data, dict):
+            return _web.json_response({"error": "unreadable preset"}, status=500)
+        if "category" in body:
+            data["category"] = str(body.get("category") or "").strip()[:40]
+        tmp = new_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, new_path)
+        except Exception as exc:
+            return _web.json_response({"error": f"duplicate failed: {exc}"}, status=500)
+        return _web.json_response({"name": new_name, "presets": _list_presets()})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/presets/delete")
+    async def _presets_delete(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        name, path = _preset_safe_name(body.get("name"))
+        if not path or not os.path.exists(path):
+            return _web.json_response({"error": "preset not found"}, status=404)
+        try:
+            os.remove(path)
+        except Exception as exc:
+            return _web.json_response({"error": f"delete failed: {exc}"}, status=500)
+        return _web.json_response({"deleted": name, "presets": _list_presets()})
 
     @PromptServer.instance.routes.get("/fantastic_loras/run/{rid}")
     async def _run(request):
