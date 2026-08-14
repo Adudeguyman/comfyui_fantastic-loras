@@ -2,7 +2,7 @@
 
 A LoRA toolkit for ComfyUI: pick which LoRA subfolders a node draws from so you're only ever searching the models you're working with, stack up to 12 LoRAs across several models from one node, and run a proper XY LoRA test bench in a single queue.
 
-![version](https://img.shields.io/badge/version-2.0.0-0a6166) ![nodes 2.0](https://img.shields.io/badge/Nodes%202.0-compatible-7ec87e) ![license](https://img.shields.io/badge/license-MIT-blue)
+![version](https://img.shields.io/badge/version-2.1.0-0a6166) ![nodes 2.0](https://img.shields.io/badge/Nodes%202.0-compatible-7ec87e) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 <p align="center">
   <img src="screenshots/main_loader.png" alt="The Fantastic Lora Loader node, showing its 12 lora slots and preset bar" width="760"><br>
@@ -97,6 +97,7 @@ That's the whole basic loop. Everything below is optional.
 | **Fantastic Plotter Image Saver 📊** | Turns the comparison into one labelled grid image. |
 | **Fantastic Plotter Grid Viewer 🔍** | Browse the results interactively, zoom, and pick winners. |
 | **Fantastic Lora Mimic 🪞** | Mirror a LoRA list authored in another loader onto an independent model path. |
+| **Fantastic Any Selector 🎯** | A filename picker with folder filtering, for any loader. |
 
 All of them appear under **loaders** in the add-node menu.
 
@@ -359,6 +360,20 @@ Saved grids reference files by name, so moving the workflow to another machine (
 
 The node is freely resizable; the grid scrolls inside it. A standalone `grid_viewer_demo.html` (openable in any browser) is included for previewing the interactions outside ComfyUI.
 
+## Fantastic Any Selector 🎯
+
+A filename picker that works with **any** loader, not just LoRA ones — and brings the folder filter with it.
+
+Easiest way in: **right-click any loader** and pick **🎯 Add Fantastic Any Selector**. It spawns one beside the node, opens the right input, and wires it up. Or add it yourself and drag its **name** output onto a loader's converted model / clip / vae / upscale input. It works out which folder that loader draws from, offers you that folder's files behind the same chip filter bar as the rest of the pack, and passes the chosen filename along. It never loads anything itself.
+
+- **Presets** — the **Presets** button lists what's saved for this folder; **Save** names the current pick *and* its folder filter. They're stored **per folder category**, so a selector wired to a VAE loader only ever offers VAE presets, and one on a diffusion model loader only offers those. Saving over an existing name asks first; ✕ on a row in the list deletes it. Rewiring to a different category swaps the list to that folder's presets.
+- **Folder filter** — the same chip bar, filtered to whichever category it detected. Each category keeps its own filter and its own ★ favourites, so a selector pointed at `diffusion_models` doesn't inherit your `vae` choices.
+- **One connection at a time.** Wiring the output somewhere else moves it rather than adding a second link, which keeps the category unambiguous. Need two loaders on different files? Use two selectors.
+- **Unwired**, it says so and does nothing — it can't guess a category without a target.
+- Changing what it's wired into clears the selection, since a filename from one category won't validate against another.
+
+The output connects to any input by design, which means ComfyUI won't type-check that link. Wire it somewhere nonsensical and it'll be allowed, then fail when you queue. That's the trade for one node covering every category. The filename itself is passed as an ordinary string, so receiving loaders compare it exactly as they would their own widget value.
+
 ## Fantastic Lora Mimic 🪞
 
 Internal class name `FantasticLoraMimic`. Found in **loaders**.
@@ -411,7 +426,8 @@ Notes/limitations (it's a POC): the picker reads *configured* widget values from
 
 | What | Where |
 |---|---|
-| Presets | `ComfyUI/user/fantastic-loras/presets/` |
+| Presets (lora stacks) | `ComfyUI/user/fantastic-loras/presets/` |
+| Presets (Any Selector) | `ComfyUI/user/fantastic-loras/selector_presets/<category>/` |
 | Favourites, theme, `.ext` toggle | `ComfyUI/user/fantastic-loras/prefs.json` |
 | Grid Viewer archive defaults | `ComfyUI/user/fantastic-loras/archive_defaults.json` |
 | Your LoRA stack, folder filter, strengths | Saved inside the workflow itself |
@@ -435,6 +451,12 @@ The first three follow your ComfyUI install, so they're the same in every workfl
 **A new LoRA folder isn't showing up.** Open the FOLDERS picker — it re-reads the disk each time it opens. If you have an explicit folder selection, tick the new folder to include it.
 
 **The comparison grid is enormous.** Check the SWEEP footer count before queueing; LoRAs × strengths multiplies fast.
+
+## What's new in 2.1
+
+- **Fantastic Any Selector 🎯** — a filename picker for any loader, with folder filtering and per-category presets. Right-click a loader to add one already wired.
+- The Plotter's Grid Viewer now labels its hidden rows and hidden columns separately, below the grid.
+- Panels of overlapping pack nodes stack correctly when clicked.
 
 ## Upgrading from v1
 

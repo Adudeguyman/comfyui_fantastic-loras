@@ -25,7 +25,7 @@ const GLOBAL_NODE_NAME = "FantasticPlotterGlobalLora";
 const VIEWER_NODE_NAME = "FantasticPlotterGridViewer";
 const ALL_NODE_NAMES  = [MULTI_NODE_NAME, PLOT_NODE_NAME];
 // Every node in the pack that the theme picker recolours.
-const SV_THEMED_NODES = new Set([MULTI_NODE_NAME, PLOT_NODE_NAME, SAVER_NODE_NAME, GLOBAL_NODE_NAME, VIEWER_NODE_NAME]);
+const SV_THEMED_NODES = new Set([MULTI_NODE_NAME, PLOT_NODE_NAME, SAVER_NODE_NAME, GLOBAL_NODE_NAME, VIEWER_NODE_NAME, "FantasticAnySelector"]);
 
 const DATA_WIDGET          = "lora_data";
 const NODE_COLOR           = "#0f848a";
@@ -80,7 +80,10 @@ function savePrefs(patch) {
 
 function repaintSlotNodes() {
   try {
-    for (const n of (app.graph?._nodes || [])) if (n.__lflView === "slots") n.__lflRender?.();
+    for (const n of (app.graph?._nodes || [])) {
+      if (n.__lflView === "slots") n.__lflRender?.();
+      n.__asRender?.();          // Any Selector panels show filenames too
+    }
   } catch (_) {}
 }
 
@@ -1112,6 +1115,7 @@ function svSetTheme(name) {
       if (!SV_THEMED_NODES.has(cls)) continue;
       svApplyNodeColors(n);
       if (n.__lflView === "slots") n.__lflRender?.();
+      n.__asRender?.();
     }
     app.graph?.setDirtyCanvas?.(true, true);
   } catch (_) {}
@@ -1718,12 +1722,23 @@ function closeThemeMenu() { if (openThemeMenu) { openThemeMenu.dispose(); openTh
 
 function svExtButton() {
   const on = svShowExt();
-  const b = svBtn(".ext", on ? "Filenames show their extension — click to hide it" : "Filenames hide their extension — click to show it",
-    () => svSetShowExt(!svShowExt()));
-  b.style.padding = "3px 8px";
-  b.style.fontFamily = "ui-monospace,monospace";
-  if (on) { b.style.borderColor = SV.accent; b.style.color = SV.text; }
-  else { b.style.color = SV.mut; }
+  const b = document.createElement("button"); b.dataset.ctl = "1";
+  b.title = on ? "Filenames show their extension — click to hide it"
+               : "Filenames hide their extension — click to show it";
+  b.style.cssText = `background:${on ? SV.btnBorder : SV.btn};border:1px solid ${on ? SV.accent : SV.btnBorder};` +
+    `color:${on ? SV.text : SV.mut};border-radius:6px;padding:3px 8px;font:12px ui-monospace,monospace;` +
+    `cursor:pointer;flex:none;display:inline-flex;align-items:center;gap:5px;`;
+  // A dot, matching the power dial elsewhere — colour alone on a small label
+  // was too subtle to read at a glance.
+  const dot = document.createElement("span"); dot.textContent = "●";
+  dot.style.cssText = `font-size:9px;line-height:1;color:${on ? SV.green : SV.mut};`;
+  b.appendChild(dot);
+  const lb = document.createElement("span"); lb.textContent = ".ext";
+  b.appendChild(lb);
+  b.addEventListener("mouseenter", () => { if (!on) b.style.background = SV.btnHover; });
+  b.addEventListener("mouseleave", () => { b.style.background = on ? SV.btnBorder : SV.btn; });
+  b.addEventListener("pointerdown", e => e.stopPropagation());
+  b.addEventListener("click", (e) => { e.stopPropagation(); svSetShowExt(!svShowExt()); });
   return b;
 }
 
@@ -3469,3 +3484,973 @@ app.registerExtension({
 
 // Exported for unit tests
 export { folderOf, baseName, collectUnits, buildTree, subtreeUnits, subtreeFileTotal, sortedChildren, getEffectiveEnabledSet, normPath, ROOT_LABEL };
+
+// ===========================================================================
+// Fantastic Any Selector 🎯
+// A filename picker that adopts the category of whatever loader it's wired
+// into. Single-link: connecting elsewhere moves the wire rather than adding a
+// second, so the category is never ambiguous.
+// ===========================================================================
+
+const AS_NODE_NAME = "FantasticAnySelector";
+const AS_PROP_FOLDERS = "Enabled Folders";
+
+// input-name → folder_paths category, for the common loaders. Falls back to
+// fingerprinting the target's own option list when the name isn't known.
+const AS_NAME_MAP = {
+  ckpt_name: "checkpoints", unet_name: "diffusion_models", vae_name: "vae",
+  clip_name: "text_encoders", clip_name1: "text_encoders", clip_name2: "text_encoders",
+  clip_name3: "text_encoders", lora_name: "loras", control_net_name: "controlnet",
+  style_model_name: "style_models", upscale_model_name: "upscale_models",
+  gligen_name: "gligen", model_name: "upscale_models", clip_vision_name: "clip_vision",
+};
+
+const asFileCache = new Map();          // category -> string[]
+async function asFilesFor(category) {
+  if (!category) return [];
+  if (asFileCache.has(category)) return asFileCache.get(category);
+  try {
+    const r = await api.fetchApi("/fantastic_loras/files?category=" + encodeURIComponent(category));
+    const d = await r.json();
+    const files = d.files || [];
+    asFileCache.set(category, files);
+    return files;
+  } catch (_) { return []; }
+}
+
+function asFolderOf(path) {
+  const p = normPath(path || "");
+  const i = p.lastIndexOf("/");
+  return i < 0 ? ROOT_LABEL : p.slice(0, i);
+}
+function asFoldersIn(files) {
+  const m = new Map();
+  for (const f of files) {
+    const k = asFolderOf(f);
+    m.set(k, (m.get(k) || 0) + 1);
+  }
+  return [...m.keys()].sort();
+}
+
+function asEnabled(node) {
+  const v = node.properties?.[AS_PROP_FOLDERS];
+  if (v == null) return null;                       // null = all
+  if (Array.isArray(v)) return new Set(v.map(normPath));
+  if (v && Array.isArray(v.folders)) return new Set(v.folders.map(normPath));
+  return null;
+}
+function asSetEnabled(node, setOrNull) {
+  node.properties = node.properties || {};
+  node.properties[AS_PROP_FOLDERS] = setOrNull == null ? null : { version: 2, folders: [...setOrNull].sort() };
+  node.__asRender?.();
+  node.setDirtyCanvas(true, true);
+}
+function asVisibleFiles(node, files) {
+  const en = asEnabled(node);
+  if (en == null) return files;
+  if (!en.size) return [];
+  return files.filter(f => en.has(asFolderOf(f)));
+}
+
+function asWidget(node, name) { return (node.widgets || []).find(w => w.name === name); }
+function asGet(node, name) { const w = asWidget(node, name); return w ? String(w.value ?? "") : ""; }
+function asSet(node, name, val) {
+  const w = asWidget(node, name);
+  if (w) { w.value = val; }
+}
+
+// ---- category detection from the connected target -------------------------
+async function asDetectCategory(node) {
+  const links = (node.outputs?.[0]?.links) || [];
+  if (!links.length) return "";
+  try {
+    const lk = app.graph.links[links[0]];
+    if (!lk) return "";
+    const target = app.graph.getNodeById(lk.target_id);
+    if (!target) return "";
+    const inp = target.inputs?.[lk.target_slot];
+    const iname = inp?.name || "";
+    if (AS_NAME_MAP[iname]) return AS_NAME_MAP[iname];
+    // Unknown input name: fingerprint the target's original option list.
+    const def = (await asObjectInfo(target.comfyClass || target.type)) || {};
+    const req = def.input?.required || {};
+    const spec = req[iname];
+    const opts = Array.isArray(spec) && Array.isArray(spec[0]) ? spec[0] : null;
+    if (opts && opts.length) {
+      for (const cat of await asCategories()) {
+        const files = await asFilesFor(cat);
+        if (files.length && files.length === opts.length && files[0] === opts[0]) return cat;
+      }
+    }
+  } catch (_) {}
+  return "";
+}
+
+let asCatsCache = null;
+async function asCategories() {
+  if (asCatsCache) return asCatsCache;
+  try {
+    const r = await api.fetchApi("/fantastic_loras/categories");
+    const d = await r.json();
+    asCatsCache = d.categories || [];
+  } catch (_) { asCatsCache = []; }
+  return asCatsCache;
+}
+const asDefCache = new Map();
+async function asObjectInfo(cls) {
+  if (!cls) return null;
+  if (asDefCache.has(cls)) return asDefCache.get(cls);
+  try {
+    const r = await api.fetchApi("/object_info/" + encodeURIComponent(cls));
+    const d = await r.json();
+    const def = d[cls] || null;
+    asDefCache.set(cls, def);
+    return def;
+  } catch (_) { return null; }
+}
+
+// ---- file chooser ---------------------------------------------------------
+let asOpenChooser = null;
+function asCloseChooser() { if (asOpenChooser) { asOpenChooser.dispose(); asOpenChooser = null; } }
+
+async function asShowChooser(node, anchor) {
+  asCloseChooser();
+  const cat = asGet(node, "category");
+  if (!cat) { svToast("Wire this into a loader first.", true); return; }
+  const files = asVisibleFiles(node, await asFilesFor(cat));
+  const favKey = "as:" + cat;
+
+  const panel = document.createElement("div");
+  panel.style.cssText = `position:fixed;z-index:10002;background:${SV.inset};border:1px solid ${SV.border2};border-radius:8px;` +
+    `display:flex;flex-direction:column;max-height:60vh;min-width:380px;max-width:560px;font:12px Arial,sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.55);`;
+  const r = anchor.getBoundingClientRect();
+  panel.style.left = Math.round(Math.min(r.left, window.innerWidth - 580)) + "px";
+  panel.style.top = Math.round(r.bottom + 5) + "px";
+
+  const head = document.createElement("div");
+  head.style.cssText = `display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid ${SV.border2};`;
+  const sin = document.createElement("input");
+  sin.type = "text"; sin.placeholder = `Filter ${cat}…`;
+  sin.style.cssText = `flex:1;min-width:0;background:${SV.panel};border:1px solid ${SV.btnBorder};color:${SV.text};border-radius:5px;padding:4px 8px;font:12px Arial,sans-serif;outline:none;`;
+  sin.addEventListener("pointerdown", e => e.stopPropagation());
+  head.appendChild(sin);
+  panel.appendChild(head);
+
+  const list = document.createElement("div");
+  list.style.cssText = "overflow:auto;flex:1;";
+  panel.appendChild(list);
+
+  const build = () => {
+    list.textContent = "";
+    const favs = new Set((FLL_PREFS.favoriteLoras || []).filter(f => f.startsWith(favKey + "|")).map(f => f.slice(favKey.length + 1)));
+    const q = sin.value.trim().toLowerCase();
+    const shown = files.filter(f => !q || f.toLowerCase().includes(q));
+    if (!shown.length) {
+      const em = document.createElement("div");
+      em.textContent = files.length ? "Nothing matches" : "No files in the enabled folders";
+      em.style.cssText = `padding:12px;font-size:11px;color:${SV.ghost};font-style:italic;`;
+      list.appendChild(em); return;
+    }
+    const fav = shown.filter(f => favs.has(f)), rest = shown.filter(f => !favs.has(f));
+    const row = (f) => {
+      const el = document.createElement("div");
+      const sel = f === asGet(node, "selection");
+      el.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-bottom:1px solid ${SV.border2};${sel ? `background:${SV.rowOn};` : ""}`;
+      const st = document.createElement("span");
+      const isFav = favs.has(f);
+      st.textContent = isFav ? "★" : "☆";
+      st.style.cssText = `flex:none;font-size:12px;color:${isFav ? "#e0c04c" : SV.ghost};cursor:pointer;`;
+      st.addEventListener("pointerdown", e => e.stopPropagation());
+      st.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const all = new Set(FLL_PREFS.favoriteLoras || []);
+        const key = favKey + "|" + f;
+        all.has(key) ? all.delete(key) : all.add(key);
+        savePrefs({ favoriteLoras: [...all] });
+        build();
+      });
+      el.appendChild(st);
+      const folder = asFolderOf(f);
+      const base = f.slice(f.lastIndexOf("/") + 1);
+      const lbl = document.createElement("span");
+      lbl.innerHTML = (folder !== ROOT_LABEL ? `<span style="color:${SV.faint}">${flgEscape(folder)}/</span>` : "") +
+        `<span style="color:${sel ? SV.text : SV.dim}">${flgEscape(svShowExt() ? base : base.replace(/\.[^.]+$/, ""))}</span>`;
+      lbl.style.cssText = "flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      el.appendChild(lbl);
+      if (sel) { const ck = document.createElement("span"); ck.textContent = "✓"; ck.style.cssText = `flex:none;color:${SV.accent};font-size:11px;`; el.appendChild(ck); }
+      el.addEventListener("mouseenter", () => el.style.background = SV.rowHover);
+      el.addEventListener("mouseleave", () => el.style.background = sel ? SV.rowOn : "");
+      el.addEventListener("pointerdown", e => e.stopPropagation());
+      el.addEventListener("click", (e) => {
+        e.stopPropagation(); asCloseChooser();
+        asSet(node, "selection", f);
+        node.__asRender?.(); node.setDirtyCanvas(true, true);
+      });
+      list.appendChild(el);
+    };
+    if (fav.length) {
+      const h = document.createElement("div"); h.textContent = "★ FAVORITES";
+      h.style.cssText = `padding:5px 10px 3px;font-size:10px;letter-spacing:.06em;color:${SV.faint};position:sticky;top:0;background:${SV.inset};border-bottom:1px solid ${SV.border2};`;
+      list.appendChild(h);
+      fav.forEach(row);
+    }
+    rest.forEach(row);
+  };
+  sin.addEventListener("input", build);
+  sin.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Escape") asCloseChooser(); });
+  build();
+  document.body.appendChild(panel);
+  setTimeout(() => sin.focus(), 0);
+  const away = (ev) => { if (!panel.contains(ev.target) && !anchor.contains(ev.target)) asCloseChooser(); };
+  setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+  asOpenChooser = { dispose: () => { window.removeEventListener("pointerdown", away, true); panel.remove(); } };
+}
+
+// ---- folder chip bar (category-aware) -------------------------------------
+let asOpenFolders = null;
+function asCloseFolders() { if (asOpenFolders) { asOpenFolders.dispose(); asOpenFolders = null; } }
+
+async function asShowFolderDropdown(node, anchor) {
+  asCloseFolders();
+  const cat = asGet(node, "category");
+  const units = asFoldersIn(await asFilesFor(cat));
+  const panel = document.createElement("div");
+  panel.style.cssText = `position:fixed;z-index:10002;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;` +
+    `display:flex;flex-direction:column;max-height:320px;min-width:280px;max-width:420px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);`;
+  const r = anchor.getBoundingClientRect();
+  panel.style.left = Math.round(Math.min(r.left, window.innerWidth - 440)) + "px";
+  panel.style.top = Math.round(r.bottom + 4) + "px";
+
+  const bar = document.createElement("div");
+  bar.style.cssText = `display:flex;align-items:center;gap:6px;padding:7px 8px;border-bottom:1px solid ${SV.border2};flex:none;`;
+  const sin = document.createElement("input");
+  sin.type = "text"; sin.placeholder = "Type to search folders…";
+  sin.style.cssText = `flex:1;min-width:0;background:${SV.panel};border:1px solid ${SV.btnBorder};color:${SV.text};border-radius:5px;padding:4px 8px;font:12px Arial,sans-serif;outline:none;`;
+  sin.addEventListener("pointerdown", e => e.stopPropagation());
+  bar.appendChild(sin);
+  for (const [label, fn] of [["all", () => asSetEnabled(node, null)], ["none", () => asSetEnabled(node, new Set())]]) {
+    const b = document.createElement("span"); b.textContent = label;
+    b.style.cssText = `flex:none;font-size:11px;color:${SV.mut};cursor:pointer;text-decoration:underline;`;
+    b.addEventListener("pointerdown", e => e.stopPropagation());
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(); build(); });
+    bar.appendChild(b);
+  }
+  panel.appendChild(bar);
+  const list = document.createElement("div");
+  list.style.cssText = "overflow:auto;flex:1;";
+  panel.appendChild(list);
+
+  const build = () => {
+    list.textContent = "";
+    const en = asEnabled(node);
+    const favs = new Set(FLL_PREFS.favoriteFolders || []);
+    const q = sin.value.trim().toLowerCase();
+    const shown = units.filter(u => !q || u.toLowerCase().includes(q));
+    if (!shown.length) {
+      const em = document.createElement("div"); em.textContent = "No folders match";
+      em.style.cssText = `padding:10px;font-size:11px;color:${SV.ghost};font-style:italic;`;
+      list.appendChild(em); return;
+    }
+    const mk = (u) => {
+      const on = en == null || en.has(u);
+      const el = document.createElement("div");
+      el.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-bottom:1px solid ${SV.border2};color:${on ? SV.text : SV.mut};${on ? `background:${SV.rowOn};` : ""}`;
+      const st = document.createElement("span");
+      const key = "as:" + cat + "|" + u;
+      const isFav = favs.has(key);
+      st.textContent = isFav ? "★" : "☆";
+      st.style.cssText = `flex:none;font-size:12px;color:${isFav ? "#e0c04c" : SV.ghost};cursor:pointer;`;
+      st.addEventListener("pointerdown", e => e.stopPropagation());
+      st.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const all = new Set(FLL_PREFS.favoriteFolders || []);
+        all.has(key) ? all.delete(key) : all.add(key);
+        savePrefs({ favoriteFolders: [...all] });
+        build();
+      });
+      el.appendChild(st);
+      const lbl = document.createElement("span"); lbl.textContent = u;
+      lbl.style.cssText = "flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      el.appendChild(lbl);
+      if (on) { const ck = document.createElement("span"); ck.textContent = "✓"; ck.style.cssText = `color:${SV.accent};font-size:11px;flex:none;`; el.appendChild(ck); }
+      el.addEventListener("mouseenter", () => el.style.background = SV.rowHover);
+      el.addEventListener("mouseleave", () => el.style.background = on ? SV.rowOn : "");
+      el.addEventListener("pointerdown", e => e.stopPropagation());
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const cur = asEnabled(node);
+        let next;
+        if (cur == null) next = new Set([u]);
+        else { next = new Set(cur); next.has(u) ? next.delete(u) : next.add(u); }
+        asSetEnabled(node, next.size === units.length ? null : next);
+        build();
+      });
+      list.appendChild(el);
+    };
+    const fav = shown.filter(u => favs.has("as:" + cat + "|" + u));
+    const rest = shown.filter(u => !favs.has("as:" + cat + "|" + u));
+    if (fav.length) {
+      const h = document.createElement("div"); h.textContent = "★ FAVORITES";
+      h.style.cssText = `padding:5px 10px 3px;font-size:10px;letter-spacing:.06em;color:${SV.faint};position:sticky;top:0;background:${SV.inset};`;
+      list.appendChild(h); fav.forEach(mk);
+    }
+    rest.forEach(mk);
+  };
+  sin.addEventListener("input", build);
+  sin.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Escape") asCloseFolders(); });
+  build();
+  document.body.appendChild(panel);
+  setTimeout(() => sin.focus(), 0);
+  const away = (ev) => { if (!panel.contains(ev.target) && !anchor.contains(ev.target)) asCloseFolders(); };
+  setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+  asOpenFolders = { dispose: () => { window.removeEventListener("pointerdown", away, true); panel.remove(); } };
+}
+
+// ---- selector presets (per category) --------------------------------------
+const asPresetCache = new Map();          // category -> [{name, selection, enabledFolders}]
+
+async function asPresetApi(path, body) {
+  const opts = body
+    ? { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }
+    : {};
+  const resp = await api.fetchApi("/fantastic_loras/sel_presets" + path, opts);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) { const e = new Error(data.message || data.error || `failed (${resp.status})`); e.code = data.error; throw e; }
+  return data;
+}
+
+async function asLoadPresets(node, category) {
+  if (!category) return [];
+  if (asPresetCache.has(category)) return asPresetCache.get(category);
+  try {
+    const d = await asPresetApi("?category=" + encodeURIComponent(category));
+    asPresetCache.set(category, d.presets || []);
+  } catch (_) { asPresetCache.set(category, []); }
+  node.__asRender?.();
+  return asPresetCache.get(category);
+}
+
+let asOpenPresetMenu = null;
+function asClosePresetMenu() { if (asOpenPresetMenu) { asOpenPresetMenu.dispose(); asOpenPresetMenu = null; } }
+
+function asShowPresetMenu(node, anchor, list) {
+  asClosePresetMenu();
+  const menu = document.createElement("div");
+  menu.style.cssText = `position:fixed;z-index:10004;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;` +
+    `min-width:240px;max-width:380px;max-height:300px;overflow:auto;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);`;
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.round(Math.min(r.left, window.innerWidth - 400)) + "px";
+  menu.style.top = Math.round(r.bottom + 4) + "px";
+  if (!list.length) {
+    const em = document.createElement("div");
+    em.textContent = "No presets saved for this folder yet";
+    em.style.cssText = `padding:10px;font-size:11px;color:${SV.ghost};font-style:italic;`;
+    menu.appendChild(em);
+  }
+  for (const pr of list) {
+    const row = document.createElement("div");
+    const sel = pr.name === node.__asPresetName;
+    row.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-bottom:1px solid ${SV.border2};${sel ? `background:${SV.rowOn};` : ""}`;
+    const nm = document.createElement("span"); nm.textContent = pr.name;
+    nm.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:${SV.text};`;
+    row.appendChild(nm);
+    const sub = document.createElement("span");
+    sub.textContent = svFileLabel(pr.selection || "");
+    sub.style.cssText = `flex:none;max-width:150px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10px;color:${SV.faint};`;
+    row.appendChild(sub);
+    const del = document.createElement("span"); del.dataset.stop = "1"; del.textContent = "✕";
+    del.title = "Delete this preset";
+    del.style.cssText = `flex:none;cursor:pointer;color:${SV.mut};font-size:11px;`;
+    del.addEventListener("mouseenter", () => del.style.color = SV.danger);
+    del.addEventListener("mouseleave", () => del.style.color = SV.mut);
+    del.addEventListener("pointerdown", e => e.stopPropagation());
+    del.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const cat = asGet(node, "category");
+      try {
+        const d = await asPresetApi("/delete", { category: cat, name: pr.name });
+        asPresetCache.set(cat, d.presets || []);
+        if (node.__asPresetName === pr.name) node.__asPresetName = "";
+        asClosePresetMenu(); node.__asRender?.();
+        svToast(`Deleted “${pr.name}”`);
+      } catch (err) { svToast(String(err.message || err), true); }
+    });
+    row.appendChild(del);
+    row.addEventListener("mouseenter", () => row.style.background = SV.rowHover);
+    row.addEventListener("mouseleave", () => row.style.background = sel ? SV.rowOn : "");
+    row.addEventListener("pointerdown", e => e.stopPropagation());
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("[data-stop]")) return;
+      e.stopPropagation(); asClosePresetMenu();
+      asSet(node, "selection", pr.selection || "");
+      if (pr.enabledFolders !== undefined) {
+        asSetEnabled(node, pr.enabledFolders == null ? null : new Set(pr.enabledFolders.map(normPath)));
+      }
+      node.__asPresetName = pr.name;
+      node.__asRender?.(); node.setDirtyCanvas(true, true);
+      svToast(`Loaded “${pr.name}”`);
+    });
+    menu.appendChild(row);
+  }
+  document.body.appendChild(menu);
+  const away = (ev) => { if (!menu.contains(ev.target) && !anchor.contains(ev.target)) asClosePresetMenu(); };
+  setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+  asOpenPresetMenu = { dispose: () => { window.removeEventListener("pointerdown", away, true); menu.remove(); } };
+}
+
+// ---- the node panel -------------------------------------------------------
+function asRenderPanel(node, root) {
+  root.textContent = "";
+  root.style.cssText = "display:flex;flex-direction:column;font:12px Arial,sans-serif;width:100%;box-sizing:border-box;padding:2px 0;";
+  const panel = document.createElement("div");
+  panel.style.cssText = `background:${SV.panel};border:1px solid ${SV.border};border-radius:8px;padding:9px;` +
+    `box-sizing:border-box;width:100%;max-width:100%;min-width:0;`;
+  root.appendChild(panel);
+
+  const cat = asGet(node, "category");
+  const sel = asGet(node, "selection");
+
+  if (!cat) {
+    const hint = document.createElement("div");
+    hint.innerHTML = `<div style="font-size:12px;color:${SV.dim};margin-bottom:3px;">Wire me into a loader</div>` +
+      `<div style="font-size:11px;color:${SV.faint};line-height:1.45;">Drag the <b>name</b> output onto a loader's model / clip / vae input. ` +
+      `I'll work out which folder to search and show a filtered picker.</div>`;
+    hint.style.cssText = `border:1px dashed ${SV.dashed};border-radius:6px;padding:10px 12px;background:${SV.inset};` +
+      `box-sizing:border-box;width:100%;min-width:0;overflow-wrap:anywhere;`;
+    panel.appendChild(hint);
+    svMeasureAsPanel(node, panel);
+    return;
+  }
+
+  // category strip
+  const strip = document.createElement("div");
+  strip.style.cssText = "display:flex;align-items:center;gap:7px;margin-bottom:8px;";
+  const tag = document.createElement("span"); tag.textContent = cat;
+  tag.style.cssText = `flex:none;font:10px ui-monospace,monospace;color:${SV.badgeFg};background:${SV.badgeBg};border-radius:3px;padding:2px 7px;`;
+  tag.title = "Detected from the loader this is wired into";
+  strip.appendChild(tag);
+  const sp = document.createElement("span"); sp.style.flex = "1"; strip.appendChild(sp);
+  strip.appendChild(svExtButton());
+  strip.appendChild(svThemeButton());
+  panel.appendChild(strip);
+
+  // ---- preset row (per category) ----
+  const presets = asPresetCache.get(cat);
+  if (presets === undefined) asLoadPresets(node, cat);
+
+  if (node.__asPresetMode === "save") {
+    const pr = document.createElement("div");
+    pr.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:8px;";
+    const tg = document.createElement("span"); tg.textContent = "SAVE AS";
+    tg.style.cssText = `flex:none;font-size:10px;letter-spacing:.08em;color:${SV.faint};`;
+    pr.appendChild(tg);
+    const inp = svSmallInput("preset name…", node.__asPresetName || "");
+    inp.style.cssText += "flex:1;min-width:0;";
+    pr.appendChild(inp);
+    const cancel = () => { node.__asPresetMode = null; node.__asOverwrite = null; node.__asRender?.(); };
+    const doSave = async (overwrite) => {
+      const nm = inp.value.trim();
+      if (!nm) { svToast("Give the preset a name.", true); inp.focus(); return; }
+      try {
+        const d = await asPresetApi("/save", {
+          category: cat, name: nm, overwrite: !!overwrite,
+          selection: asGet(node, "selection"),
+          enabledFolders: (() => { const e2 = asEnabled(node); return e2 == null ? null : [...e2]; })(),
+        });
+        asPresetCache.set(cat, d.presets || []);
+        node.__asPresetName = d.name; node.__asPresetMode = null; node.__asOverwrite = null;
+        svToast(`Saved “${d.name}” for ${cat}`);
+        node.__asRender?.();
+      } catch (err) {
+        if (err.code === "exists") { node.__asOverwrite = nm; node.__asPresetMode = "overwrite"; node.__asRender?.(); }
+        else svToast(String(err.message || err), true);
+      }
+    };
+    inp.addEventListener("keydown", e => { if (e.key === "Enter") doSave(false); if (e.key === "Escape") cancel(); });
+    const ok = svBtn("Save", "", () => doSave(false)); ok.style.padding = "3px 10px"; pr.appendChild(ok);
+    const no = svBtn("Cancel", "", cancel); no.style.padding = "3px 10px"; pr.appendChild(no);
+    panel.appendChild(pr);
+    setTimeout(() => inp.focus(), 0);
+  } else if (node.__asPresetMode === "overwrite") {
+    const pr = document.createElement("div");
+    pr.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:8px;";
+    const q = document.createElement("span");
+    q.textContent = `“${node.__asOverwrite}” exists — overwrite?`;
+    q.style.cssText = `flex:1;min-width:0;font-size:12px;color:#e0a94c;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+    pr.appendChild(q);
+    const yes = svBtn("Overwrite", "", async () => {
+      try {
+        const d = await asPresetApi("/save", {
+          category: cat, name: node.__asOverwrite, overwrite: true,
+          selection: asGet(node, "selection"),
+          enabledFolders: (() => { const e2 = asEnabled(node); return e2 == null ? null : [...e2]; })(),
+        });
+        asPresetCache.set(cat, d.presets || []);
+        node.__asPresetName = d.name; node.__asPresetMode = null; node.__asOverwrite = null;
+        svToast(`Updated “${d.name}”`); node.__asRender?.();
+      } catch (err) { svToast(String(err.message || err), true); }
+    });
+    yes.style.padding = "3px 10px"; yes.style.borderColor = "#e0a94c"; yes.style.color = "#e0a94c";
+    pr.appendChild(yes);
+    const back = svBtn("Rename", "", () => { node.__asPresetMode = "save"; node.__asRender?.(); });
+    back.style.padding = "3px 10px"; pr.appendChild(back);
+    panel.appendChild(pr);
+  } else {
+    const pr = document.createElement("div");
+    pr.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:8px;";
+    const tg = document.createElement("span"); tg.textContent = "PRESET";
+    tg.style.cssText = `flex:none;font-size:10px;letter-spacing:.08em;color:${SV.faint};`;
+    pr.appendChild(tg);
+    const list = presets || [];
+    const pick = document.createElement("button"); pick.dataset.stop = "1";
+    pick.style.cssText = `flex:none;background:${SV.btn};border:1px solid ${SV.btnBorder};color:${SV.btnText};` +
+      `border-radius:6px;padding:3px 10px;font:12px Arial,sans-serif;cursor:pointer;` +
+      `display:inline-flex;align-items:center;gap:6px;`;
+    const pl = document.createElement("span");
+    pl.textContent = list.length ? `Presets (${list.length})` : "Presets";
+    pick.appendChild(pl);
+    const car = document.createElement("span"); car.textContent = "▾";
+    car.style.cssText = `color:${SV.mut};font-size:10px;`; pick.appendChild(car);
+    pick.title = `Presets saved for the ${cat} folder`;
+    pick.addEventListener("mouseenter", () => pick.style.background = SV.btnHover);
+    pick.addEventListener("mouseleave", () => pick.style.background = SV.btn);
+    pick.addEventListener("pointerdown", e => e.stopPropagation());
+    pick.addEventListener("click", (e) => { e.stopPropagation(); asShowPresetMenu(node, pick, list); });
+    pr.appendChild(pick);
+
+    // Loaded preset name sits beside the button, so the row still says what's active.
+    const active = document.createElement("span");
+    active.textContent = node.__asPresetName || "";
+    active.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;` +
+      `font-size:11px;color:${SV.dim};`;
+    pr.appendChild(active);
+    const save = svBtn("Save", "Save this pick and folder filter as a preset for " + cat, () => {
+      node.__asPresetMode = "save"; node.__asRender?.();
+    });
+    save.style.padding = "3px 10px"; pr.appendChild(save);
+    panel.appendChild(pr);
+  }
+
+  // folders chip bar
+  const fb = document.createElement("div");
+  fb.style.cssText = "display:flex;align-items:center;gap:7px;margin-bottom:8px;";
+  const flabel = document.createElement("span"); flabel.textContent = "FOLDERS";
+  flabel.style.cssText = `flex:none;font-size:10px;letter-spacing:.08em;color:${SV.faint};`;
+  fb.appendChild(flabel);
+  const fbox = document.createElement("div"); fbox.dataset.ctl = "1";
+  fbox.style.cssText = `flex:1;min-width:0;min-height:24px;display:flex;flex-wrap:wrap;align-items:center;gap:5px;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;padding:3px 7px;cursor:pointer;`;
+  const en = asEnabled(node);
+  const chip = (text, onX, accent) => {
+    const c = document.createElement("span");
+    c.style.cssText = `display:inline-flex;align-items:center;gap:5px;background:${SV.btn};border:1px solid ${accent || SV.btnBorder};color:${accent || SV.text};border-radius:4px;padding:1px 7px;font-size:11px;`;
+    c.appendChild(document.createTextNode(text));
+    if (onX) {
+      const x = document.createElement("span"); x.dataset.ctl = "1"; x.dataset.stop = "1"; x.textContent = "✕";
+      x.style.cssText = `cursor:pointer;color:${SV.mut};font-size:10px;`;
+      x.addEventListener("mouseenter", () => x.style.color = SV.danger);
+      x.addEventListener("mouseleave", () => x.style.color = SV.mut);
+      x.addEventListener("pointerdown", e => e.stopPropagation());
+      x.addEventListener("click", (e) => { e.stopPropagation(); onX(); });
+      c.appendChild(x);
+    }
+    return c;
+  };
+  if (en == null) fbox.appendChild(chip("All Folders", () => asSetEnabled(node, new Set())));
+  else if (!en.size) {
+    const none = document.createElement("span");
+    none.innerHTML = `<span style="color:${SV.ghost};font-style:italic;font-size:11px;">No folders selected</span>`;
+    fbox.appendChild(none);
+    const link = document.createElement("span"); link.textContent = "select all";
+    link.dataset.ctl = "1"; link.dataset.stop = "1";
+    link.style.cssText = `font-size:11px;color:${SV.mut};cursor:pointer;text-decoration:underline;margin-left:6px;`;
+    link.addEventListener("pointerdown", e => e.stopPropagation());
+    link.addEventListener("click", (e) => { e.stopPropagation(); asSetEnabled(node, null); });
+    fbox.appendChild(link);
+  } else {
+    for (const f of [...en].sort()) {
+      fbox.appendChild(chip(f, () => { const n2 = new Set(en); n2.delete(f); asSetEnabled(node, n2); }));
+    }
+  }
+  fbox.addEventListener("pointerdown", e => e.stopPropagation());
+  fbox.addEventListener("click", (e) => {
+    if (e.target.closest("[data-stop]")) return;   // a chip ✕ or link, not the box
+    e.stopPropagation(); asShowFolderDropdown(node, fbox);
+  });
+  fb.appendChild(fbox);
+  panel.appendChild(fb);
+
+  // selection row
+  const row = document.createElement("div");
+  row.dataset.ctl = "1";
+  row.style.cssText = `display:flex;align-items:center;gap:8px;border:1px solid ${sel ? SV.border2 : SV.dashed};border-radius:6px;` +
+    `background:${sel ? SV.inset : SV.slotEmpty};padding:8px 10px;cursor:pointer;min-height:34px;box-sizing:border-box;`;
+  if (sel) {
+    const folder = asFolderOf(sel);
+    const base = sel.slice(sel.lastIndexOf("/") + 1);
+    const txt = document.createElement("div");
+    txt.innerHTML = (folder !== ROOT_LABEL ? `<div style="font-size:10px;color:${SV.faint};">${flgEscape(folder)}/</div>` : "") +
+      `<div style="font-size:12px;color:${SV.text};">${flgEscape(svShowExt() ? base : base.replace(/\.[^.]+$/, ""))}</div>`;
+    txt.style.cssText = "flex:1;min-width:0;overflow:hidden;";
+    row.appendChild(txt);
+    const clr = document.createElement("span"); clr.dataset.ctl = "1"; clr.dataset.stop = "1"; clr.textContent = "✕";
+    clr.title = "Clear the selection";
+    clr.style.cssText = `flex:none;cursor:pointer;color:${SV.danger};font-size:13px;`;
+    clr.addEventListener("mouseenter", () => clr.style.color = SV.dangerHov);
+    clr.addEventListener("mouseleave", () => clr.style.color = SV.danger);
+    clr.addEventListener("pointerdown", e => e.stopPropagation());
+    clr.addEventListener("click", (e) => { e.stopPropagation(); asSet(node, "selection", ""); node.__asRender?.(); node.setDirtyCanvas(true, true); });
+    row.appendChild(clr);
+  } else {
+    const ph = document.createElement("span");
+    ph.textContent = "Choose a file…";
+    ph.style.cssText = `flex:1;font-size:12px;color:${SV.ghost};font-style:italic;`;
+    row.appendChild(ph);
+  }
+  row.addEventListener("pointerdown", e => e.stopPropagation());
+  row.addEventListener("click", (e) => {
+    if (e.target.closest("[data-stop]")) return;   // the clear ✕, not the row
+    e.stopPropagation(); asShowChooser(node, row);
+  });
+  panel.appendChild(row);
+  svMeasureAsPanel(node, panel);
+}
+
+const AS_MIN_W = 380;
+// Fit the node to the panel. Runs once per content change, not per redraw:
+// dragging the node re-renders it, and re-measuring on every frame made the
+// node resize while being dragged.
+function svMeasureAsPanel(node, panel) {
+  const sig = panel.textContent.length + "|" + (node.widgets || []).length;
+  if (node.__asFitSig === sig && node.__asMeasuredH && node.size[0] >= AS_MIN_W) return;
+
+  // Width first: the panel wraps text, so its height is only meaningful once
+  // the node is at its final width.
+  if (node.size[0] < AS_MIN_W) {
+    node.setSize([AS_MIN_W, node.size[1]]);
+    node.setDirtyCanvas(true, true);
+  }
+  requestAnimationFrame(() => {
+    try {
+      if (!panel.isConnected) return;
+      const h = panel.offsetHeight;          // layout px, immune to canvas zoom
+      if (h <= 0) return;
+      node.__asFitSig = sig;
+      node.__asMeasuredH = h + 14;           // slack for the node's own chrome
+      const want = node.computeSize();
+      if (Math.abs(node.size[1] - want[1]) > 2) {
+        node.setSize([node.size[0], want[1]]);
+        node.setDirtyCanvas(true, true);
+      }
+    } catch (_) {}
+  });
+}
+
+app.registerExtension({
+  name: "fantastic.any.selector",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData?.name !== AS_NODE_NAME) return;
+    nodeType.color = NODE_COLOR;
+    nodeType.bgcolor = NODE_BGCOLOR;
+
+    const origONC = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = origONC?.apply(this, arguments);
+      try {
+        svApplyNodeColors(this);
+        hideWidget(this, asWidget(this, "selection"));
+        hideWidget(this, asWidget(this, "category"));
+        const dom = document.createElement("div");
+        this.__asRender = () => asRenderPanel(this, dom);
+        const w = this.addDOMWidget("as_panel", "div", dom, { serialize: false });
+        w.serializeValue = () => undefined;
+        w.computeSize = (width) => [width, node_asHeight(this)];
+        if (!this.size || this.size[0] < AS_MIN_W) this.size = [Math.max(this.size?.[0] || 0, AS_MIN_W), this.size?.[1] || 0];
+        this.__asRender();
+      } catch (err) { console.warn("[FantasticAnySelector] init failed", err); }
+      return r;
+    };
+
+    const origCfg = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = origCfg?.apply(this, arguments);
+      try { svApplyNodeColors(this); hideWidget(this, asWidget(this, "selection")); hideWidget(this, asWidget(this, "category")); this.__asRender?.(); } catch (_) {}
+      return r;
+    };
+
+    // Single-link: a new connection replaces the old one, so the category is
+    // never ambiguous. Detect the category from whatever we're now attached to.
+    const origConn = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
+      const r = origConn?.apply(this, arguments);
+      try {
+        if (type === 2 /* output */) {
+          const links = (this.outputs?.[0]?.links) || [];
+          if (connected && links.length > 1) {
+            // Drop everything except the newest — done next tick, since the
+            // graph is mid-update inside this callback.
+            const keep = link_info?.id ?? links[links.length - 1];
+            const drop = links.filter(l => l !== keep);
+            setTimeout(() => {
+              try {
+                for (const id of drop) {
+                  const lk = app.graph.links[id];
+                  if (!lk) continue;
+                  const tgt = app.graph.getNodeById(lk.target_id);
+                  tgt?.disconnectInput(lk.target_slot);
+                }
+                this.setDirtyCanvas(true, true);
+              } catch (_) {}
+            }, 0);
+          }
+          setTimeout(async () => {
+            const cat = await asDetectCategory(this);
+            const prev = asGet(this, "category");
+            if (cat !== prev) {
+              asSet(this, "category", cat);
+              asSet(this, "selection", "");     // stale value would fail validation
+              this.__asPresetName = "";         // presets belong to the old category
+              this.__asPresetMode = null;
+            }
+            this.__asRender?.();
+            this.setDirtyCanvas(true, true);
+          }, 0);
+        }
+      } catch (_) {}
+      return r;
+    };
+  },
+});
+
+function node_asHeight(node) {
+  if (node.__asMeasuredH) return node.__asMeasuredH;
+  return asGet(node, "category") ? 168 : 96;
+}
+
+// ---- "Add Fantastic Any Selector" on any loader's right-click menu --------
+// getExtraMenuOptions is a documented, renderer-agnostic hook, so this works
+// without depending on how the drag-release search box filters slot types.
+
+// Which of a node's widgets/inputs we can serve, as [name, category] pairs.
+function asServableSlots(node) {
+  const out = [];
+  const seen = new Set();
+  for (const w of (node.widgets || [])) {
+    const cat = AS_NAME_MAP[w.name];
+    if (!cat || seen.has(w.name)) continue;
+    // Skip ones already fed by a wire.
+    const inp = (node.inputs || []).find(i => i?.name === w.name);
+    if (inp && inp.link != null) continue;
+    seen.add(w.name);
+    out.push([w.name, cat]);
+  }
+  // Widgets already converted to inputs still count, if unconnected.
+  for (const i of (node.inputs || [])) {
+    const cat = AS_NAME_MAP[i?.name];
+    if (!cat || seen.has(i.name) || i.link != null) continue;
+    seen.add(i.name);
+    out.push([i.name, cat]);
+  }
+  return out;
+}
+
+// Convert a widget to an input if it isn't one already, and return its index.
+function asEnsureInput(node, name) {
+  let idx = (node.inputs || []).findIndex(i => i?.name === name);
+  if (idx >= 0) return idx;
+  const w = (node.widgets || []).find(x => x.name === name);
+  if (!w) return -1;
+  try {
+    if (typeof node.convertWidgetToInput === "function") {
+      node.convertWidgetToInput(w);                    // classic path
+    } else {
+      // Newer frontends expose widget inputs directly; adding the input by the
+      // widget's own type keeps the socket compatible with the widget values.
+      node.addInput(name, w.type === "combo" ? (w.options?.values || "*") : w.type);
+    }
+  } catch (err) {
+    console.warn("[FantasticAnySelector] could not convert widget to input", err);
+  }
+  idx = (node.inputs || []).findIndex(i => i?.name === name);
+  return idx;
+}
+
+function asSpawnFor(node, inputName, category) {
+  const LG = (typeof LiteGraph !== "undefined") ? LiteGraph : window.LiteGraph;
+  const graph = node.graph;
+  if (!LG || !graph) { svToast("Can't add the selector — graph unavailable.", true); return; }
+  const sel = LG.createNode(AS_NODE_NAME);
+  if (!sel) { svToast("Fantastic Any Selector isn't registered — restart ComfyUI.", true); return; }
+  graph.add(sel);
+
+  const w = (sel.size && sel.size[0]) || AS_MIN_W;
+  // Offset each new one so several selectors on the same loader don't stack
+  // invisibly on top of each other.
+  const existing = (node.graph?._nodes || []).filter(n => (n.comfyClass || n.type) === AS_NODE_NAME && n !== sel).length;
+  sel.pos = [node.pos[0] - w - 60, node.pos[1] + (existing % 6) * 30];
+
+  const slot = asEnsureInput(node, inputName);
+  if (slot < 0) { svToast(`Couldn't open an input for ${inputName}.`, true); return; }
+  try {
+    sel.connect(0, node, slot);
+  } catch (err) {
+    console.warn("[FantasticAnySelector] wiring failed", err);
+    svToast("Added the selector, but wiring failed — connect it by hand.", true);
+  }
+  // Category is normally detected on connect; set it now so the panel is
+  // usable immediately even if detection is still in flight.
+  try { asSet(sel, "category", category); sel.__asRender?.(); } catch (_) {}
+  graph.setDirtyCanvas(true, true);
+}
+
+app.registerExtension({
+  name: "fantastic.any.selector.menu",
+  beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData?.name === AS_NODE_NAME) return;      // don't offer it on itself
+    const orig = nodeType.prototype.getExtraMenuOptions;
+    nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+      const r = orig?.apply(this, arguments);
+      try {
+        const slots = asServableSlots(this);
+        if (!slots.length) return r;
+        // One flat entry per servable input rather than a submenu — submenus
+        // need LiteGraph.ContextMenu, which the Vue renderer doesn't provide.
+        // Loaders have one or two of these, so the list stays short.
+        for (const [name, cat] of slots) {
+          options.push({
+            content: slots.length === 1
+              ? `🎯 Add Fantastic Any Selector (${cat})`
+              : `🎯 Add Fantastic Any Selector — ${name}`,
+            callback: () => asSpawnFor(this, name, cat),
+          });
+        }
+      } catch (err) { console.warn("[FantasticAnySelector] menu hook failed", err); }
+      return r;
+    };
+  },
+});
+
+// ===========================================================================
+// DOM widget stacking
+// ---------------------------------------------------------------------------
+// DOM widgets live in an overlay layer whose paint order follows the order the
+// elements were created, not the graph's node order. With two overlapping
+// nodes that both render DOM panels, the one behind can paint over the one in
+// front, and clicks can land on the wrong node. Our nodes are almost entirely
+// DOM, so this shows up badly — raise a node's elements whenever it's touched.
+// ===========================================================================
+
+let flZTop = 1000;
+
+// z-index only applies to POSITIONED elements. ComfyUI wraps a DOM widget in
+// one or more containers, and the widget element itself is usually static —
+// setting z-index on it does nothing. Walk up to the nearest positioned
+// ancestor (stopping before the shared overlay root) and raise that instead.
+function flPositionedHost(el) {
+  let cur = el, hops = 0;
+  while (cur && hops++ < 6) {
+    const pos = getComputedStyle(cur).position;
+    if (pos === "absolute" || pos === "fixed" || pos === "relative") return cur;
+    cur = cur.parentElement;
+  }
+  return el;
+}
+
+function flDomEls(node) {
+  const out = new Set();
+  for (const w of (node.widgets || [])) {
+    if (!w.element) continue;
+    out.add(flPositionedHost(w.element));
+  }
+  return [...out];
+}
+
+// Other packs' DOM widgets (Markdown notes, preview overrides) sit in the same
+// overlay with z-index values we don't control, so a fixed counter can lose to
+// them. Read what's actually in the layer and go one above the highest.
+function flHighestZIn(el) {
+  let top = 0;
+  try {
+    const root = el.closest(".comfy-menu, .graph-canvas-container, body") || document.body;
+    for (const n of root.querySelectorAll("*")) {
+      const z = parseInt(getComputedStyle(n).zIndex, 10);
+      if (!isNaN(z) && z < 100000 && z > top) top = z;   // ignore modal layers
+    }
+  } catch (_) {}
+  return top;
+}
+
+function flRaiseNode(node) {
+  try {
+    const els = flDomEls(node);
+    if (!els.length) return;
+    if (node.__flZ && node.__flZ === flZTop) return;     // already on top
+    flZTop = Math.max(flZTop, flHighestZIn(els[0])) + 1;
+    node.__flZ = flZTop;
+    for (const el of els) {
+      // z-index is ignored on statically positioned elements.
+      if (getComputedStyle(el).position === "static") el.style.position = "relative";
+      el.style.zIndex = String(node.__flZ);
+    }
+  } catch (_) {}
+}
+
+// Any pointer press inside one of our panels raises that node first, so the
+// click lands where it looks like it should.
+function flBindRaise(node, el) {
+  if (!el || el.__flBound) return;
+  el.__flBound = true;
+  el.addEventListener("pointerdown", () => flRaiseNode(node), true);
+}
+
+// Console helper: window.flStackDebug() prints what each pack node's panel is
+// actually stacked at, so a layering problem can be diagnosed from a paste.
+try {
+  window.flStackDebug = () => {
+    const rows = [];
+    for (const n of (app.graph?._nodes || [])) {
+      const cls = n.comfyClass || n.type;
+      for (const el of flDomEls(n)) {
+        const cs = getComputedStyle(el);
+        rows.push(`${String(cls).padEnd(28)} id=${String(n.id).padEnd(5)} ` +
+          `tag=${el.tagName.toLowerCase()}.${(el.className || "").toString().split(" ")[0] || "-"} ` +
+          `pos=${cs.position} z=${cs.zIndex}`);
+      }
+    }
+    console.log(rows.join("\n") || "(no DOM-widget nodes found)");
+    return rows.length + " element(s)";
+  };
+} catch (_) {}
+
+app.registerExtension({
+  name: "fantastic.dom.stacking",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    const nm = nodeData?.name;
+    if (!nm || (!SV_THEMED_NODES.has(nm) && nm !== AS_NODE_NAME)) return;
+
+    // Selecting a node in the graph should bring its panel forward too.
+    const origSel = nodeType.prototype.onSelected;
+    nodeType.prototype.onSelected = function () {
+      const r = origSel?.apply(this, arguments);
+      flRaiseNode(this);
+      return r;
+    };
+
+    // Clicking the node's title bar also raises it — the way out when another
+    // node's panel is covering ours and swallowing clicks.
+    const origMD = nodeType.prototype.onMouseDown;
+    nodeType.prototype.onMouseDown = function () {
+      flRaiseNode(this);
+      return origMD?.apply(this, arguments);
+    };
+
+    // Bind after creation, once the DOM widgets exist.
+    const origONC = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = origONC?.apply(this, arguments);
+      setTimeout(() => {
+        try { for (const el of flDomEls(this)) flBindRaise(this, el); } catch (_) {}
+      }, 0);
+      return r;
+    };
+  },
+});

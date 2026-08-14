@@ -473,12 +473,9 @@ class GridViewer {
     this._table = table;
 
     // header row: corner + strength headers
+    // Hidden-column chips used to sit here in the grid corner, unlabelled and
+    // far from the hidden-row chips. Both now live in one block under the grid.
     const corner = el("div", "min-width:90px;display:flex;flex-direction:column;gap:3px;");
-    if (this.hiddenCols.size) {
-      this.hiddenCols.forEach((s) => corner.appendChild(this._restoreChip(`+ Str ${fmtStrength(s)}`, () => {
-        this.hiddenCols.delete(s); this.render();
-      })));
-    }
     table.appendChild(corner);
 
     for (const s of visStrengths) {
@@ -528,20 +525,37 @@ class GridViewer {
 
     this.scroll.appendChild(table);
 
-    // unified restore area for hidden rows + hidden control rows
-    const hiddenChips = [];
+    // Restore area: hidden rows (loras + control rows) and hidden columns,
+    // each labelled, under a divider so they read as a separate zone rather
+    // than as more grid.
+    const rowChips = [];
     this.hiddenControls.forEach((n) => {
       const lbl = CONTROL_LABELS[n] || n;
-      hiddenChips.push(this._restoreChip("+ " + lbl, () => { this.hiddenControls.delete(n); this.render(); }));
+      rowChips.push(this._restoreChip("+ " + lbl, () => { this.hiddenControls.delete(n); this.render(); }));
     });
     this.hiddenRows.forEach((n) => {
-      hiddenChips.push(this._restoreChip("+ " + n, () => { this.hiddenRows.delete(n); this.render(); }));
+      rowChips.push(this._restoreChip("+ " + n, () => { this.hiddenRows.delete(n); this.render(); }));
     });
-    if (hiddenChips.length) {
-      const wrap = el("div", "margin-top:10px;display:flex;flex-wrap:wrap;gap:4px;align-items:center;");
-      wrap.appendChild(el("span", "opacity:.6;", { textContent: "Hidden:" }));
-      hiddenChips.forEach((ch) => wrap.appendChild(ch));
-      this.scroll.appendChild(wrap);
+    const colChips = [];
+    this.hiddenCols.forEach((s) => {
+      colChips.push(this._restoreChip(`+ Str ${fmtStrength(s)}`, () => { this.hiddenCols.delete(s); this.render(); }));
+    });
+
+    if (rowChips.length || colChips.length) {
+      const panel = el("div", "margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,.14);" +
+        "display:flex;flex-direction:column;gap:6px;");
+      const line = (label, chips, hint) => {
+        if (!chips.length) return;
+        const wrap = el("div", "display:flex;flex-wrap:wrap;gap:4px;align-items:center;");
+        const lb = el("span", "opacity:.6;min-width:118px;", { textContent: label });
+        lb.title = hint;
+        wrap.appendChild(lb);
+        chips.forEach((ch) => wrap.appendChild(ch));
+        panel.appendChild(wrap);
+      };
+      line("Hidden rows:", rowChips, "Loras hidden from the grid — click to bring one back");
+      line("Hidden columns:", colChips, "Strength columns hidden from the grid — click to bring one back");
+      this.scroll.appendChild(panel);
     }
   }
 

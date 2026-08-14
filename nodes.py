@@ -2017,6 +2017,157 @@ class FantasticLoraMimicSubgraphCompanion:
         return (out,)
 
 
+# ===========================================================================
+# Fantastic Any Selector 🎯 — one filename picker for any loader
+# ===========================================================================
+# Wire its output into a loader's converted *_name input. The frontend detects
+# which folder_paths category that input wants, offers that category's files
+# behind the same chip folder bar the lora nodes use, and this node just hands
+# the chosen filename downstream. It never loads anything itself.
+
+
+class _AnyStr(str):
+    """A string that satisfies any input-type check.
+
+    A converted combo input's declared 'type' IS its list of valid values, so a
+    plain STRING output can't connect to one. Comparing equal to everything
+    lets a single node serve every category — at the cost of ComfyUI not
+    type-checking the link, which is why the frontend enforces one link and
+    derives the category from whatever it's attached to.
+    """
+
+    def __eq__(self, _other):
+        return True
+
+    def __ne__(self, _other):
+        return False
+
+    def __hash__(self):
+        return hash(str(self))
+
+
+# NOTE: this class is ONLY ever used as the declared RETURN_TYPES entry. It must
+# never be the runtime value: receiving nodes branch on their input with things
+# like `if vae_name in ["taesd", ...]`, and a value that compares equal to
+# everything silently takes the first branch. That's how a chosen audio VAE
+# ended up loading the taesd approximation instead. Values go out as plain str.
+ANY_TYPE = _AnyStr("*")
+
+
+def _fl_categories():
+    """Known folder_paths categories, so the frontend can offer file lists."""
+    try:
+        return sorted(folder_paths.folder_names_and_paths.keys())
+    except Exception:
+        return ["checkpoints", "loras", "vae", "diffusion_models", "text_encoders"]
+
+
+def _fl_files_for(category):
+    try:
+        return [str(f).replace(os.sep, "/") for f in folder_paths.get_filename_list(category)]
+    except Exception:
+        return []
+
+
+# --- selector presets, namespaced per folder category ----------------------
+# Stored under ComfyUI/user/fantastic-loras/selector_presets/<category>/, so a
+# preset saved while wired to a VAE loader can never show up on a diffusion
+# model selector. Separate from the lora stack presets entirely.
+
+def _sel_preset_dir(category):
+    cat = str(category or "").strip()
+    if not cat or cat not in _fl_categories():
+        return None
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", cat)      # categories are plain words
+    if not safe:
+        return None
+    d = os.path.join(_user_config_dir(), "selector_presets", safe)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        return None
+    return d
+
+
+def _sel_preset_path(category, name):
+    d = _sel_preset_dir(category)
+    if not d:
+        return "", None
+    name = str(name or "").strip().replace("\\", "/").split("/")[-1]
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name).strip(" .")[:80]
+    if not name or name in (".", ".."):
+        return "", None
+    return name, os.path.join(d, name + ".json")
+
+
+def _list_sel_presets(category):
+    d = _sel_preset_dir(category)
+    if not d:
+        return []
+    out = []
+    try:
+        for fn in sorted(os.listdir(d), key=str.lower):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(d, fn), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            out.append({
+                "name": fn[:-5],
+                "selection": str(data.get("selection") or ""),
+                "enabledFolders": data.get("enabledFolders"),
+            })
+    except Exception:
+        pass
+    return out
+
+
+class FantasticAnySelector:
+    """Outputs a filename string for whichever loader it's wired into."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                # Both are driven by the frontend; hidden on the node face.
+                "selection": ("STRING", {"default": "", "multiline": False}),
+                "category": ("STRING", {"default": "", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = (ANY_TYPE,)
+    RETURN_NAMES = ("name",)
+    FUNCTION = "pick"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Any Selector"
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, selection="", category="", **kwargs):
+        if not str(selection or "").strip():
+            return "No file chosen — wire this into a loader and pick one."
+        return True
+
+    def pick(self, selection="", category="", **kwargs):
+        name = str(selection or "").strip()
+        if not name:
+            raise ValueError(
+                "Fantastic Any Selector: nothing selected. Wire the output into a "
+                "loader's converted name input, then choose a file."
+            )
+        # Warn (don't fail) if the file has since vanished — the receiving
+        # loader will give the clearer error about its own list.
+        if category:
+            files = _fl_files_for(category)
+            if files and name not in files:
+                print(f"[FantasticAnySelector] '{name}' is not in '{category}' any more")
+        # Plain str — see the note on ANY_TYPE above.
+        return (str(name),)
+
+
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
@@ -2025,6 +2176,7 @@ NODE_CLASS_MAPPINGS = {
     "FantasticPlotterGridViewer": FantasticPlotterGridViewer,
     "FantasticLoraMimic":       FantasticLoraMimic,
     "FantasticLoraMimicSubgraphCompanion": FantasticLoraMimicSubgraphCompanion,
+    "FantasticAnySelector":     FantasticAnySelector,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoaderMulti": "Fantastic Lora Loader 📁",
@@ -2034,6 +2186,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticPlotterGridViewer": "Fantastic Plotter Grid Viewer 🔍",
     "FantasticLoraMimic":       "Fantastic Lora Mimic 🪞",
     "FantasticLoraMimicSubgraphCompanion": "Fantastic Lora Mimic Subgraph Companion 🧩",
+    "FantasticAnySelector":     "Fantastic Any Selector 🎯",
 }
 
 
@@ -2075,6 +2228,74 @@ def _register_routes():
         cfg = body.get("defaults", body) if isinstance(body, dict) else {}
         ok = _write_archive_defaults(cfg)
         return _web.json_response({"ok": bool(ok), "defaults": _read_archive_defaults()})
+
+    # --- any-selector file lists ---------------------------------------------
+    @PromptServer.instance.routes.get("/fantastic_loras/categories")
+    async def _fl_categories_route(_request):
+        from aiohttp import web as _web
+        return _web.json_response({"categories": _fl_categories()})
+
+    @PromptServer.instance.routes.get("/fantastic_loras/files")
+    async def _fl_files_route(request):
+        from aiohttp import web as _web
+        cat = request.rel_url.query.get("category", "")
+        if not cat or cat not in _fl_categories():
+            return _web.json_response({"error": "unknown category", "files": []}, status=404)
+        return _web.json_response({"category": cat, "files": _fl_files_for(cat)})
+
+    # --- selector presets (per category) --------------------------------------
+    @PromptServer.instance.routes.get("/fantastic_loras/sel_presets")
+    async def _sel_presets_list(request):
+        from aiohttp import web as _web
+        cat = request.rel_url.query.get("category", "")
+        return _web.json_response({"category": cat, "presets": _list_sel_presets(cat)})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/sel_presets/save")
+    async def _sel_presets_save(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        cat = body.get("category", "")
+        name, path = _sel_preset_path(cat, body.get("name"))
+        if not path:
+            return _web.json_response({"error": "give the preset a name"}, status=400)
+        if os.path.exists(path) and not body.get("overwrite"):
+            return _web.json_response(
+                {"error": "exists", "name": name,
+                 "message": f'A preset named "{name}" already exists here.'}, status=409)
+        payload = {
+            "version": 1,
+            "category": cat,
+            "selection": str(body.get("selection") or ""),
+            "enabledFolders": body.get("enabledFolders"),
+        }
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=1)
+            os.replace(tmp, path)
+        except Exception as exc:
+            return _web.json_response({"error": f"save failed: {exc}"}, status=500)
+        return _web.json_response({"name": name, "presets": _list_sel_presets(cat)})
+
+    @PromptServer.instance.routes.post("/fantastic_loras/sel_presets/delete")
+    async def _sel_presets_delete(request):
+        from aiohttp import web as _web
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "expected JSON body"}, status=400)
+        cat = body.get("category", "")
+        name, path = _sel_preset_path(cat, body.get("name"))
+        if not path or not os.path.exists(path):
+            return _web.json_response({"error": "preset not found"}, status=404)
+        try:
+            os.remove(path)
+        except Exception as exc:
+            return _web.json_response({"error": f"delete failed: {exc}"}, status=500)
+        return _web.json_response({"deleted": name, "presets": _list_sel_presets(cat)})
 
     # --- user prefs -----------------------------------------------------------
     @PromptServer.instance.routes.get("/fantastic_loras/prefs")
