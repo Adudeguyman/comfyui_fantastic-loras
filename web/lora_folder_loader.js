@@ -1,9 +1,11 @@
 // Fantastic Lora Loader — frontend UI
 // ------------------------------------
-// Handles two nodes:
-//   FantasticLoraLoader          — single model + optional CLIP
-//   FantasticLoraLoaderMulti     — same UI + dynamic extra MODEL paths
+// Handles the loader and plotter nodes:
+//   FantasticLoraLoaderMulti     — lora stack + dynamic extra MODEL paths
+//   FantasticLoraPlotter         — same UI, sweep stage
 //
+// The loader starts with zero extra model paths (looks like a plain single-
+// model loader) and reveals additional MODEL paths on demand via the ➕ bar.
 // NEW in this version:
 //   • Custom lora chooser DOM panel replaces LiteGraph.ContextMenu, giving
 //     full control over per-item interactions.
@@ -16,16 +18,14 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
-const NODE_NAME       = "FantasticLoraLoader";
 const MULTI_NODE_NAME = "FantasticLoraLoaderMulti";
 const PLOT_NODE_NAME  = "FantasticLoraPlotter";
 const SAVER_NODE_NAME = "FantasticPlotterImageSaver";
 const GLOBAL_NODE_NAME = "FantasticPlotterGlobalLora";
 const VIEWER_NODE_NAME = "FantasticPlotterGridViewer";
-const ALL_NODE_NAMES  = [NODE_NAME, MULTI_NODE_NAME, PLOT_NODE_NAME];
-
-// Nodes that use the multi-model UI (stack + dynamic model-path bar).
-const isMultiLike = (name) => name === MULTI_NODE_NAME || name === PLOT_NODE_NAME;
+const ALL_NODE_NAMES  = [MULTI_NODE_NAME, PLOT_NODE_NAME];
+// Every node in the pack that the theme picker recolours.
+const SV_THEMED_NODES = new Set([MULTI_NODE_NAME, PLOT_NODE_NAME, SAVER_NODE_NAME, GLOBAL_NODE_NAME, VIEWER_NODE_NAME]);
 
 const DATA_WIDGET          = "lora_data";
 const NODE_COLOR           = "#0f848a";
@@ -34,20 +34,58 @@ const DEFAULT_WIDTH        = 560;
 const MAX_EXTRA_MODELS     = 4;
 const PROP_ENABLED_FOLDERS = "Enabled Lora Folders";
 const ROOT_LABEL           = "(root)";
-const FAVORITES_KEY        = "fll_favorites";   // localStorage key
+const PREFS_CACHE_KEY      = "fll_prefs_cache";  // mirrors the server copy
 
 // ===========================================================================
-// Favourites — persisted in localStorage
+// User prefs — favourites, theme and display toggles, stored server side at
+// ComfyUI/user/fantastic-loras/prefs.json so they follow the install rather
+// than the browser profile. localStorage is only a first-paint cache: reads
+// are synchronous off that, writes go to both.
 // ===========================================================================
 
-function loadFavorites() {
-  try { return new Set(JSON.parse(localStorage.getItem(FAVORITES_KEY) || "[]")); }
-  catch (_) { return new Set(); }
+const PREFS_DEFAULT = { favoriteLoras: [], favoriteFolders: [], favoritePresets: [], theme: "teal", showExt: false };
+let FLL_PREFS = (() => {
+  try { return Object.assign({}, PREFS_DEFAULT, JSON.parse(localStorage.getItem(PREFS_CACHE_KEY) || "{}")); }
+  catch (_) { return Object.assign({}, PREFS_DEFAULT); }
+})();
+let prefsLoaded = false;
+
+function cachePrefs() {
+  try { localStorage.setItem(PREFS_CACHE_KEY, JSON.stringify(FLL_PREFS)); } catch (_) {}
 }
 
-function saveFavorites(set) {
-  try { localStorage.setItem(FAVORITES_KEY, JSON.stringify([...set])); } catch (_) {}
+async function loadPrefs() {
+  if (prefsLoaded) return FLL_PREFS;
+  prefsLoaded = true;
+  try {
+    const r = await api.fetchApi("/fantastic_loras/prefs");
+    const d = await r.json();
+    if (d && d.prefs) { FLL_PREFS = Object.assign({}, PREFS_DEFAULT, d.prefs); cachePrefs(); repaintSlotNodes(); }
+  } catch (_) {}
+  return FLL_PREFS;
 }
+
+let prefsSaveTimer = null;
+function savePrefs(patch) {
+  Object.assign(FLL_PREFS, patch);
+  cachePrefs();
+  clearTimeout(prefsSaveTimer);
+  prefsSaveTimer = setTimeout(() => {
+    api.fetchApi("/fantastic_loras/prefs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prefs: FLL_PREFS }),
+    }).catch(() => {});
+  }, 250);
+}
+
+function repaintSlotNodes() {
+  try {
+    for (const n of (app.graph?._nodes || [])) if (n.__lflView === "slots") n.__lflRender?.();
+  } catch (_) {}
+}
+
+function loadFavorites() { return new Set(FLL_PREFS.favoriteLoras || []); }
+function saveFavorites(set) { savePrefs({ favoriteLoras: [...set] }); }
 
 // ===========================================================================
 // Lora list + folder helpers
@@ -170,6 +208,11 @@ function injectStyles() {
   stylesInjected = true;
   const s = document.createElement("style");
   s.textContent = `
+    /* ── slot-view strength field: native spinners steal width and clip the
+         value, so hide them and use the full box for the number ── */
+    input.lfl-str::-webkit-outer-spin-button,
+    input.lfl-str::-webkit-inner-spin-button{-webkit-appearance:none;margin:0;}
+    input.lfl-str{-moz-appearance:textfield;appearance:textfield;}
     /* ── shared chrome ── */
     .lfl-panel,.lfl-chooser{position:fixed;display:flex;flex-direction:column;max-height:70vh;
       background:var(--comfy-menu-bg,#202020);color:var(--fg-color,#ddd);
@@ -256,26 +299,30 @@ function hideTip() { if (tipEl) tipEl.style.display = "none"; }
 let openPanel = null;
 function closeFolderPanel() { if (openPanel) { openPanel.dispose(); openPanel = null; } }
 
-async function showFolderFilterPanel(node, event) {
-  if (openPanel?.node === node) { closeFolderPanel(); return; }
+// Parameterized folder-tree panel. opts: { key, title, allLabel, poolFilter
+// (Set of allowed unit paths, or null = every folder), readSet(allUnits)->Set|null,
+// writeSet(setOrNull, allUnits) }.
+async function showFolderPanelCore(node, event, opts) {
+  if (openPanel?.key === opts.key) { closeFolderPanel(); return; }
   closeFolderPanel();
   injectStyles();
   const files = await getLoraFiles(true);
-  const units = collectUnits(files);
+  let units = collectUnits(files);
+  if (opts.poolFilter) units = new Map([...units].filter(([p]) => opts.poolFilter.has(p)));
   const allUnits = [...units.keys()];
   const tree = buildTree(units);
   node.__plffUpdateFolderBtn?.();
 
   const panel = document.createElement("div"); panel.className = "lfl-panel";
   const header = document.createElement("div"); header.className = "lfl-header";
-  header.innerHTML = `<span class="lfl-title">Lora folder filter</span>`;
+  header.innerHTML = `<span class="lfl-title">${opts.title}</span>`;
   const close = document.createElement("span"); close.className = "lfl-close"; close.textContent = "✕";
   close.addEventListener("click", closeFolderPanel); header.appendChild(close); panel.appendChild(header);
 
   const actions = document.createElement("div"); actions.className = "lfl-actions";
   const mkBtn = (label, fn) => { const b = document.createElement("button"); b.className = "lfl-btn"; b.textContent = label; b.addEventListener("click", fn); actions.appendChild(b); };
-  mkBtn("All (no filter)", () => { setEnabledFolders(node, null); renderTree(); });
-  mkBtn("None", () => { setEnabledFolders(node, new Set()); renderTree(); });
+  mkBtn(opts.allLabel || "All", () => { opts.writeSet(null, allUnits); renderTree(); });
+  mkBtn("None", () => { opts.writeSet(new Set(), allUnits); renderTree(); });
   panel.appendChild(actions);
 
   const treeEl = document.createElement("div"); treeEl.className = "lfl-tree"; panel.appendChild(treeEl);
@@ -283,11 +330,11 @@ async function showFolderFilterPanel(node, event) {
   if (allUnits.length <= 30) { const ex = n => { for (const c of n.children.values()) { expanded.add(c.path); ex(c); } }; ex(tree); }
   else { for (const c of tree.children.values()) expanded.add(c.path); }
 
-  const effSet = () => { const e = getEffectiveEnabledSet(node, allUnits); return e == null ? new Set(allUnits) : e; };
+  const effSet = () => { const e = opts.readSet(allUnits); return e == null ? new Set(allUnits) : e; };
   const toggleUnits = paths => {
     const set = effSet(); const allOn = paths.every(u => set.has(u));
     for (const u of paths) allOn ? set.delete(u) : set.add(u);
-    setEnabledFolders(node, set); renderTree();
+    opts.writeSet(set, allUnits); renderTree();
   };
   const makeRow = ({ caret, caretPath, label, count, virtual, checked, indeterminate, onToggle, title }) => {
     const row = document.createElement("div"); row.className = "lfl-row";
@@ -317,7 +364,7 @@ async function showFolderFilterPanel(node, event) {
   };
   const renderTree = () => {
     treeEl.textContent = "";
-    if (!allUnits.length) { const e = document.createElement("div"); e.className = "lfl-empty"; e.textContent = "No loras found in models/loras."; treeEl.appendChild(e); return; }
+    if (!allUnits.length) { const e = document.createElement("div"); e.className = "lfl-empty"; e.textContent = opts.emptyText || "No loras found in models/loras."; treeEl.appendChild(e); return; }
     const set = effSet(); for (const child of sortedChildren(tree)) renderNode(child, treeEl, set);
   };
   renderTree();
@@ -331,7 +378,7 @@ async function showFolderFilterPanel(node, event) {
   const onPD = e => { if (!panel.contains(e.target)) closeFolderPanel(); };
   const onKD = e => { if (e.key === "Escape") closeFolderPanel(); };
   setTimeout(() => { document.addEventListener("pointerdown", onPD, true); document.addEventListener("keydown", onKD, true); }, 0);
-  openPanel = { el: panel, node, dispose: () => { document.removeEventListener("pointerdown", onPD, true); document.removeEventListener("keydown", onKD, true); panel.remove(); } };
+  openPanel = { el: panel, node, key: opts.key, dispose: () => { document.removeEventListener("pointerdown", onPD, true); document.removeEventListener("keydown", onKD, true); panel.remove(); } };
 }
 
 // ===========================================================================
@@ -341,7 +388,7 @@ async function showFolderFilterPanel(node, event) {
 let openChooserPanel = null;
 function closeChooserPanel() { if (openChooserPanel) { openChooserPanel.dispose(); openChooserPanel = null; } }
 
-async function showLoraChooser(node, event, onChoose) {
+async function showLoraChooser(node, event, onChoose, scopeSet) {
   closeChooserPanel();
   injectStyles();
 
@@ -351,12 +398,22 @@ async function showLoraChooser(node, event, onChoose) {
 
   let loras = files.slice();
   if (enabledSet != null) loras = loras.filter(l => enabledSet.has(folderOf(l)));
+  if (scopeSet != null) loras = loras.filter(l => scopeSet.has(folderOf(l)));
 
   if (!loras.length) {
-    new LiteGraph.ContextMenu(
-      [{ content: "No loras in enabled folders — click 📁 Folders to adjust", disabled: true }],
-      { event, title: "Choose a lora", className: "dark", scale: Math.max(1, app.canvas?.ds?.scale ?? 1) }
-    );
+    // Renderer-agnostic notice (works with or without the LiteGraph global).
+    const note = document.createElement("div");
+    note.textContent = "No loras in enabled folders — adjust the folder filter";
+    note.style.cssText = `position:fixed;z-index:10003;background:${SV.panel};border:1px solid ${SV.btnBorder};color:${SV.text};` +
+      "border-radius:6px;padding:8px 12px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);max-width:280px;";
+    const ex = event && typeof event.clientX === "number" ? event.clientX : (window.innerWidth / 2 - 140);
+    const ey = event && typeof event.clientY === "number" ? event.clientY : 120;
+    note.style.left = Math.min(ex, window.innerWidth - 300) + "px";
+    note.style.top = (ey + 8) + "px";
+    document.body.appendChild(note);
+    const kill = () => { note.remove(); window.removeEventListener("pointerdown", kill, true); };
+    setTimeout(() => window.addEventListener("pointerdown", kill, true), 0);
+    setTimeout(kill, 3500);
     return;
   }
 
@@ -490,7 +547,14 @@ function getDataWidget(node) { return node.widgets?.find(w => w.name === DATA_WI
 
 function hideWidget(node, w) {
   if (!w) return;
+  // Canvas (LiteGraph) renderer: zero size + no-op draw.
   w.computeSize = () => [0, -4]; w.type = "lfl_hidden"; w.hidden = true;
+  // Vue renderer (Nodes 2.0): visibility comes from widget.options.hidden.
+  // Without this the widget still renders (as a generic value input) AND still
+  // occupies layout, so clicks land on invisible widgets. Mutate in place —
+  // replacing the options object would break anything holding a reference.
+  if (!w.options) w.options = {};
+  w.options.hidden = true;
   if (w.element) w.element.style.display = "none";
   w._origDraw = w.draw; w.draw = function () {};
 }
@@ -511,6 +575,7 @@ function effectiveEnabledFoldersArray(node) {
 function syncData(node) {
   const w = getDataWidget(node);
   if (!w) return;
+  // Slot order IS apply order: entries serialize in array order.
   const payload = { loras: node.__loraStack || [], enabledFolders: effectiveEnabledFoldersArray(node) };
   if (node.__isPlotter) {
     payload.plotMode = node.__plotMode === "global" ? "global" : "perline";
@@ -533,6 +598,10 @@ function loadStackFromData(node) {
     stack = entries.filter(e => e && (e.name || e.lora || e.random)).map(e => {
       const s = e.strength != null ? Number(e.strength) : Number(e.model ?? 1);
       const out = { on: e.on !== false, name: e.name || e.lora || "", model: s, clip: e.clip != null && e.strength == null ? Number(e.clip) : s };
+      if (e.targets && typeof e.targets === "object") out.targets = e.targets;
+      if (typeof e.gx === "number") out.gx = e.gx;
+      if (typeof e.gy === "number") out.gy = e.gy;
+      if (e.source) out.source = e.source;
       // Randomizer-line fields (passed through harmlessly by the backend)
       if (e.random) {
         out.random   = true;
@@ -570,6 +639,9 @@ const MIN_NODE_WIDTH   = 320;
 // Widen the node on the 0→n randomizer-line transition, shrink back on n→0.
 // Uses a delta (not a stored width) so manual user resizes are respected.
 function adjustRandWidth(node) {
+  // Slot view has a fixed two-column layout — its width must not jump around
+  // when randomizer lines come and go (that bump is for the classic row list).
+  if (node.__lflView === "slots") { node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length; return; }
   const c = (node.__loraStack || []).filter(e => e.random).length;
   const last = node.__lflLastRandCount ?? 0;
   if (last === 0 && c > 0)      node.size[0] = node.size[0] + RAND_EXTRA_WIDTH;
@@ -717,6 +789,7 @@ function buildRowDOM(node) {
   const commit = () => { syncData(node); render(); adjustRandWidth(node); snapHeight(node); node.setDirtyCanvas(true, true); };
 
   const render = () => {
+    if (node.__lflView === "slots") { renderSlotView(node, root); return; }
     root.textContent = "";
     const stack = node.__loraStack || [], hasClip = clipConnected(node);
     const globalMode = node.__isPlotter && node.__plotMode === "global";
@@ -850,56 +923,1954 @@ function buildRowDOM(node) {
 }
 
 // ===========================================================================
-// Core UI builder (shared between both nodes)
+// Graph editor — free-canvas node interface (the loader's only view)
 // ===========================================================================
+//
+// Three node types on a draggable 2D canvas: folder sources (left) feed lora
+// nodes (middle) which feed model chains (right). Every node is absolutely
+// positioned and freely draggable; wires follow them live. A lora's left wire
+// is its folder source; its right strength tabs are per-chain connections
+// (click to edit, double-click to disconnect) that write the `targets` map the
+// backend honours. Positions persist: lora gx/gy ride in lora_data, folder and
+// model positions in node.properties.lflGraph.
+
+const FLG_CHAIN_COLORS = [null, "#1d9e8f", "#d99a3a", "#9b8cff", "#6fae4f", "#d56fa0"];
+
+function flgChainCount(node) {
+  return Math.min(5, Math.max(1, (node.properties?.extra_model_count || 0) + 1));
+}
+
+function flgEscape(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
+}
+
+function flgHexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+// Effective per-chain strength map. targets absent => uniform (every chain at
+// entry.model). Returns { [chainIdx]: strength } for connected chains only.
+function flgChainMap(entry, chains) {
+  const out = {};
+  const t = entry.targets;
+  if (t && typeof t === "object") {
+    for (let c = 1; c <= chains; c++) if (t[c] != null) out[c] = Number(t[c]);
+  } else {
+    const s = Number(entry.model ?? 1);
+    for (let c = 1; c <= chains; c++) out[c] = s;
+  }
+  return out;
+}
+
+// Materialise an explicit targets map (seeded from the uniform strength across
+// all current chains) so a per-chain edit can be applied without changing the
+// other chains.
+function flgEnsureTargets(entry, chains) {
+  if (!entry.targets || typeof entry.targets !== "object") {
+    const s = Number(entry.model ?? 1), t = {};
+    for (let c = 1; c <= chains; c++) t[c] = s;
+    entry.targets = t;
+  }
+  return entry.targets;
+}
+
+// Best-effort: resolve the display name of whatever MODEL is plugged into a
+// chain input, by tracing the link back (through reroutes) to its source node.
+function flgModelLabel(node, c) {
+  try {
+    const inName = c === 1 ? "model" : "model_" + c;
+    const inp = (node.inputs || []).find(i => i && i.name === inName);
+    if (!inp || inp.link == null) return null;
+    const graph = node.graph; if (!graph) return null;
+    const links = graph.links || graph._links || {};
+    const first = links[inp.link]; if (!first) return null;
+    let origin = graph.getNodeById ? graph.getNodeById(first.origin_id) : null;
+    let guard = 0;
+    while (origin && guard++ < 12) {
+      const t = origin.type || origin.comfyClass || "";
+      if (/reroute/i.test(t) && origin.inputs && origin.inputs[0] && origin.inputs[0].link != null) {
+        const l2 = links[origin.inputs[0].link]; if (!l2) break;
+        origin = graph.getNodeById(l2.origin_id); continue;
+      }
+      break;
+    }
+    if (!origin) return null;
+    const ws = origin.widgets || [];
+    const clean = (v) => v.split(/[\\/]/).pop().replace(/\.(safetensors|ckpt|sft|pt|pth|gguf|bin)$/i, "");
+    let w = ws.find(w => w && typeof w.value === "string" && /(ckpt|checkpoint|unet|model|lora)_?name$/i.test(w.name || ""));
+    if (!w) w = ws.find(w => w && typeof w.value === "string" && /\.(safetensors|ckpt|sft|pt|pth|gguf)$/i.test(w.value));
+    if (w) return clean(w.value);
+    return origin.title || origin.type || origin.comfyClass || null;
+  } catch (_) { return null; }
+}
+
+// ===========================================================================
+// Slot-grid loader UI: media-loader style. A fixed 2x6 grid of lora
+// slots; slot order (reading order) IS the apply order. Folder filtering is a
+// chip combobox over the node-wide enabled-folders property. Per-lora advanced
+// options (model routing, per-chain strengths, randomizer) live in a modal.
+// ===========================================================================
+
+const SLOT_MAX = 12;
+const SLOT_COLS = 2;
+const SV_MIN_W = 860;   // two readable columns, with room for the − + steppers
+
+// -- palette lifted from the MiniMax media loader --------------------------
+// -- themes: each is a tonal ramp off a base colour. Semantic accents (chain
+//    colours, green power dial, purple randomiser, red danger) stay fixed so
+//    they remain distinguishable on every background.
+const SV_THEMES = {
+  teal: {
+    label: "Fantastic Teal", swatch: "#173035", nodeColor: "#1d4a52", nodeBg: "#173035",
+    panel: "#173035", inset: "#122529", slotEmpty: "#152b2f",
+    border: "#1f4249", border2: "#1e3e45", dashed: "#224249",
+    btn: "#1e3e45", btnBorder: "#2b5b64", btnHover: "#265059", btnText: "#dceaec",
+    field: "#14282c", header: "#1a373d", rowOn: "#1a3b42", rowHover: "#20474f",
+    badgeBg: "#1d4650", badgeFg: "#8fd0dc", accent: "#4c9fb0",
+    text: "#e2ecee", dim: "#a6bcc0", mut: "#7c979c", faint: "#688288", ghost: "#587075",
+  },
+  slate: {
+    label: "Boring Blue", swatch: "#191c22", nodeColor: "#2a3140", nodeBg: "#191c22",
+    panel: "#191c22", inset: "#12151b", slotEmpty: "#141820",
+    border: "#2a2f3a", border2: "#2e3440", dashed: "#2b313d",
+    btn: "#2b3140", btnBorder: "#3a4252", btnHover: "#333b4d", btnText: "#d7dbe2",
+    field: "#1b2029", header: "#1b1f27", rowOn: "#1b2230", rowHover: "#20283a",
+    badgeBg: "#233042", badgeFg: "#8fb6e8", accent: "#6f86b8",
+    text: "#dde2ea", dim: "#a9b2c2", mut: "#6b7484", faint: "#5c6472", ghost: "#4d5563",
+  },
+  node: {
+    label: "Like, TEAL Teal", swatch: "#0a6166", nodeColor: "#0f848a", nodeBg: "#0a6166",
+    panel: "#0a6166", inset: "#085256", slotEmpty: "#0a595e",
+    border: "#0e7d84", border2: "#0c757b", dashed: "#107f86",
+    btn: "#0c757b", btnBorder: "#12939b", btnHover: "#0e858c", btnText: "#f0fbfc",
+    field: "#085458", header: "#0b686d", rowOn: "#0a7076", rowHover: "#0c8188",
+    badgeBg: "#0d858c", badgeFg: "#d9f7fa", accent: "#5fe0ea",
+    text: "#f0fbfc", dim: "#c6e6e8", mut: "#a3d3d6", faint: "#92c8cb", ghost: "#82bcbf",
+  },
+  graphite: {
+    label: "Accountant.", swatch: "#2b2b2b", nodeColor: "#3d3d3d", nodeBg: "#2b2b2b",
+    panel: "#2b2b2b", inset: "#212121", slotEmpty: "#262626",
+    border: "#3a3a3a", border2: "#363636", dashed: "#3b3b3b",
+    btn: "#363636", btnBorder: "#4a4a4a", btnHover: "#414141", btnText: "#e0e0e0",
+    field: "#242424", header: "#303030", rowOn: "#343434", rowHover: "#3f3f3f",
+    badgeBg: "#3c4450", badgeFg: "#9fb6c9", accent: "#6f86b8",
+    text: "#e3e3e3", dim: "#adadad", mut: "#858585", faint: "#737373", ghost: "#626262",
+  },
+};
+const SV_THEME_DEFAULT = "teal";
+
+// Live palette. Every render reads these at draw time, so switching themes is
+// just an Object.assign + re-render — no rebuild of the module needed.
+const SV = {
+  green: "#7ec87e", greenHov: "#a8e6a8", purple: "#b48ce8", purpleBorder: "#4c3d6e",
+  danger: "#e08a8a", dangerHov: "#f2adad",
+  cog: "#e0a94c", cogHov: "#f0c980",
+};
+function svThemeName() {
+  const n = FLL_PREFS.theme;
+  return (n && SV_THEMES[n]) ? n : SV_THEME_DEFAULT;
+}
+function svApplyTheme(name) {
+  const t = SV_THEMES[name] || SV_THEMES[SV_THEME_DEFAULT];
+  for (const k of Object.keys(t)) {
+    if (k !== "label" && k !== "swatch" && k !== "nodeColor" && k !== "nodeBg") SV[k] = t[k];
+  }
+}
+svApplyTheme(svThemeName());
+// Pull the authoritative prefs from disk, then re-apply and repaint.
+loadPrefs().then(() => { svApplyTheme(svThemeName()); repaintSlotNodes(); });
+
+// Every theme's node colours, so we can tell "we set this" from "the user
+// picked a custom colour in ComfyUI" and only ever restyle our own.
+function svIsThemeNodeColor(c) {
+  if (!c) return true;
+  const lc = String(c).toLowerCase();
+  if (lc === NODE_COLOR.toLowerCase() || lc === NODE_BGCOLOR.toLowerCase()) return true;
+  return Object.values(SV_THEMES).some(t => t.nodeColor.toLowerCase() === lc || t.nodeBg.toLowerCase() === lc);
+}
+
+// The Vue renderer (Nodes 2.0) reads colour off the node INSTANCE, not the
+// registered class — setting nodeType.color only ever worked on the canvas
+// renderer. Set both here so the node is coloured in either renderer.
+function svApplyNodeColors(node, force) {
+  const t = SV_THEMES[svThemeName()] || SV_THEMES[SV_THEME_DEFAULT];
+  if (!force && !(svIsThemeNodeColor(node.color) && svIsThemeNodeColor(node.bgcolor))) return;
+  node.color = t.nodeColor;
+  node.bgcolor = t.nodeBg;
+  try { node.setDirtyCanvas?.(true, true); } catch (_) {}
+}
+
+function svSetTheme(name) {
+  if (!SV_THEMES[name]) return;
+  savePrefs({ theme: name });
+  svApplyTheme(name);
+  // Repaint every node of ours currently on the canvas: panel + node colours.
+  try {
+    for (const n of (app.graph?._nodes || [])) {
+      const cls = n.comfyClass || n.type;
+      if (!SV_THEMED_NODES.has(cls)) continue;
+      svApplyNodeColors(n);
+      if (n.__lflView === "slots") n.__lflRender?.();
+    }
+    app.graph?.setDirtyCanvas?.(true, true);
+  } catch (_) {}
+}
+const SV_CHAIN_TEXT   = [null, "#4cc3e0", "#e0a94c", "#b48ce8", "#8fd08f", "#e896bd"];
+const SV_CHAIN_BORDER = [null, "#255c6b", "#6b5525", "#4c3d6e", "#3e5c3e", "#6b3350"];
+
+function svBtn(label, title, fn) {
+  const b = document.createElement("button");
+  b.textContent = label; if (title) b.title = title;
+  b.style.cssText = `background:${SV.btn};border:1px solid ${SV.btnBorder};color:${SV.btnText};border-radius:6px;padding:4px 11px;font:12px Arial,sans-serif;cursor:pointer;flex:none;`;
+  b.addEventListener("mouseenter", () => b.style.background = SV.btnHover);
+  b.addEventListener("mouseleave", () => b.style.background = SV.btn);
+  b.addEventListener("pointerdown", e => e.stopPropagation());
+  b.addEventListener("click", (e) => { hideTip(); fn(e); });
+  return b;
+}
+
+function svChainsRouted(entry, chains) {
+  // Which chains this entry feeds: no targets -> all current chains (uniform).
+  const t = entry.targets;
+  if (t == null || typeof t !== "object") { const a = []; for (let c = 1; c <= chains; c++) a.push(c); return a; }
+  return Object.keys(t).map(Number).filter(c => c >= 1 && c <= chains).sort((a, b) => a - b);
+}
+
+function svChainStrength(entry, c) {
+  const t = entry.targets;
+  if (t == null || typeof t !== "object") return Number(entry.model ?? 1);
+  return t[c] != null ? Number(t[c]) : null;
+}
+
+// Base (chip) strength edit: follow-unless-overridden — routed chains whose
+// value equals the old base track the new one; individually-set chains keep.
+function svSetBaseStrength(entry, v) {
+  const old = Number(entry.model ?? 1);
+  entry.model = v; entry.clip = v;
+  const t = entry.targets;
+  if (t && typeof t === "object") for (const k of Object.keys(t)) { if (Number(t[k]) === old) t[k] = v; }
+}
+
+const SV_STEP = 0.05;
+
+// Strength control: − field + . The steppers are the quick adjustment;
+// the field still takes typed values and arrow keys.
+function svStrengthInput(value, onSet, wide, disabled) {
+  injectStyles();
+  const box = document.createElement("span");
+  box.style.cssText = "flex:none;display:inline-flex;align-items:center;gap:2px;";
+
+  const i = document.createElement("input");
+  i.type = "number"; i.step = String(SV_STEP); i.value = Number(value).toFixed(2);
+  i.dataset.ctl = "1"; i.className = "lfl-str";
+  i.style.cssText = `width:${wide ? 52 : 48}px;background:${SV.field};border:1px solid ${SV.border2};color:${SV.text};border-radius:4px;font:12px ui-monospace,monospace;text-align:center;padding:3px 2px;outline:none;flex:none;box-sizing:border-box;`;
+  i.addEventListener("pointerdown", e => e.stopPropagation());
+  i.addEventListener("focus", () => { i.style.borderColor = SV.accent; i.select(); });
+  i.addEventListener("blur", () => { i.style.borderColor = SV.border2; });
+  i.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") i.blur(); });
+  i.addEventListener("change", () => { const v = parseFloat(i.value); if (!isNaN(v)) onSet(v); });
+
+  // Rounded to the step grid so repeated clicks don't accumulate float dust
+  // (0.8 + 0.05 + 0.05 would otherwise drift to 0.9000000000000001).
+  const bump = (dir) => {
+    const cur = parseFloat(i.value);
+    const base = isNaN(cur) ? 0 : cur;
+    const next = Math.round((base + dir * SV_STEP) / SV_STEP) * SV_STEP;
+    const clamped = Math.max(-10, Math.min(10, Math.round(next * 100) / 100));
+    i.value = clamped.toFixed(2);
+    onSet(clamped);
+  };
+  const step = (label, dir, title) => {
+    const b = document.createElement("span"); b.dataset.ctl = "1";
+    b.textContent = label; b.title = title;
+    b.style.cssText = `flex:none;width:17px;text-align:center;border:1px solid ${SV.btnBorder};background:${SV.btn};` +
+      `color:${SV.dim};border-radius:3px;font-size:12px;line-height:17px;height:19px;cursor:pointer;user-select:none;box-sizing:border-box;` +
+      (disabled ? "opacity:.3;cursor:default;" : "");
+    if (!disabled) {
+      b.addEventListener("mouseenter", () => { b.style.background = SV.btnHover; b.style.color = SV.text; });
+      b.addEventListener("mouseleave", () => { b.style.background = SV.btn; b.style.color = SV.dim; });
+      b.addEventListener("pointerdown", e => e.stopPropagation());
+      b.addEventListener("click", (e) => { e.stopPropagation(); bump(dir); });
+    }
+    return b;
+  };
+  // Wheel over the control steps it. The canvas zooms on wheel, so the event
+  // has to be stopped here — and passive:false is required for preventDefault.
+  if (!disabled) {
+    box.addEventListener("wheel", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      bump(e.deltaY < 0 ? +1 : -1);
+    }, { passive: false });
+    box.title = `Scroll to adjust by ${SV_STEP}`;
+  }
+  box.appendChild(step("−", -1, `Decrease by ${SV_STEP}`));
+  box.appendChild(i);
+  box.appendChild(step("+", +1, `Increase by ${SV_STEP}`));
+  box.__input = i;
+  return box;
+}
+
+// ---------------------------------------------------------------------------
+// Folder chip combobox: chips = enabled folder units (null = all). Dropdown
+// lists every unit grouped by its top-level parent; click toggles.
+// ---------------------------------------------------------------------------
+let openFolderCombo = null;
+function closeFolderCombo() { if (openFolderCombo) { openFolderCombo.dispose(); openFolderCombo = null; } }
+
+function loadFolderFavs() { return new Set(FLL_PREFS.favoriteFolders || []); }
+function saveFolderFavs(set) { savePrefs({ favoriteFolders: [...set] }); }
+
+async function svOpenFolderDropdown(node, anchor) {
+  closeFolderCombo(); closeFolderPanel(); closeChooserPanel();
+  const files = await getLoraFiles();
+  const units = [...collectUnits(files).keys()].map(normPath).sort();
+  const favs = loadFolderFavs();
+
+  const panel = document.createElement("div");
+  panel.style.cssText = `position:fixed;z-index:10001;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;min-width:300px;max-width:420px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;max-height:340px;`;
+  const r = anchor.getBoundingClientRect();
+  panel.style.left = Math.round(Math.min(r.left, window.innerWidth - 430)) + "px";
+  panel.style.top = Math.round(r.bottom + 4) + "px";
+
+  // ---- search box ----
+  const sbar = document.createElement("div");
+  sbar.style.cssText = `display:flex;align-items:center;gap:6px;padding:7px 8px;border-bottom:1px solid ${SV.border2};flex:none;`;
+  const sin = document.createElement("input");
+  sin.type = "text"; sin.placeholder = "Type to search folders…";
+  sin.style.cssText = `flex:1;min-width:0;background:${SV.panel};border:1px solid ${SV.btnBorder};color:${SV.text};border-radius:5px;padding:4px 8px;font:12px Arial,sans-serif;outline:none;`;
+  sin.addEventListener("pointerdown", e => e.stopPropagation());
+  sbar.appendChild(sin);
+  const allBtn = document.createElement("span");
+  allBtn.textContent = "all"; allBtn.title = "Select every folder (clears the filter)";
+  allBtn.style.cssText = `flex:none;font-size:11px;color:${SV.mut};cursor:pointer;text-decoration:underline;`;
+  allBtn.addEventListener("pointerdown", e => e.stopPropagation());
+  allBtn.addEventListener("click", (e) => { e.stopPropagation(); setEnabledFolders(node, null); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); rebuild(); });
+  sbar.appendChild(allBtn);
+  const noneBtn = document.createElement("span");
+  noneBtn.textContent = "none"; noneBtn.title = "Deselect every folder";
+  noneBtn.style.cssText = `flex:none;font-size:11px;color:${SV.mut};cursor:pointer;text-decoration:underline;`;
+  noneBtn.addEventListener("pointerdown", e => e.stopPropagation());
+  noneBtn.addEventListener("click", (e) => { e.stopPropagation(); setEnabledFolders(node, new Set()); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); rebuild(); });
+  sbar.appendChild(noneBtn);
+  panel.appendChild(sbar);
+
+  const list = document.createElement("div");
+  list.style.cssText = "overflow:auto;flex:1;";
+  panel.appendChild(list);
+
+  let query = "";
+  const rebuild = () => {
+    list.textContent = "";
+    const eff = getEffectiveEnabledSet(node, units); // null => all enabled
+    const q = query.trim().toLowerCase();
+    const matches = units.filter(u => !q || (u || ROOT_LABEL).toLowerCase().includes(q));
+    if (!matches.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "No folders match “" + query + "”";
+      empty.style.cssText = `padding:10px;font-size:11px;color:${SV.ghost};font-style:italic;`;
+      list.appendChild(empty);
+      return;
+    }
+    const fav = matches.filter(u => favs.has(u));
+    const rest = matches.filter(u => !favs.has(u));
+
+    const addRow = (u) => {
+      const onIt = eff == null || eff.has(u);
+      const row = document.createElement("div");
+      row.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-bottom:1px solid ${SV.border2};color:${onIt ? SV.text : SV.mut};${onIt ? `background:${SV.rowOn};` : ""}`;
+      const star = document.createElement("span");
+      star.textContent = favs.has(u) ? "★" : "☆";
+      star.title = favs.has(u) ? "Unfavorite this folder" : "Favorite this folder (pins it to the top)";
+      star.style.cssText = `flex:none;font-size:12px;color:${favs.has(u) ? "#e0c04c" : SV.ghost};cursor:pointer;`;
+      star.addEventListener("pointerdown", e => e.stopPropagation());
+      star.addEventListener("click", (e) => {
+        e.stopPropagation();
+        favs.has(u) ? favs.delete(u) : favs.add(u);
+        saveFolderFavs(favs); rebuild();
+      });
+      row.appendChild(star);
+      const lbl = document.createElement("span");
+      lbl.textContent = u === "" ? ROOT_LABEL : u;
+      lbl.style.cssText = "flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      row.appendChild(lbl);
+      if (onIt) { const ck = document.createElement("span"); ck.textContent = "✓"; ck.style.cssText = "color:#4cc3e0;font-size:11px;flex:none;"; row.appendChild(ck); }
+      row.addEventListener("mouseenter", () => row.style.background = SV.rowHover);
+      row.addEventListener("mouseleave", () => row.style.background = onIt ? SV.rowOn : "");
+      row.addEventListener("pointerdown", e => e.stopPropagation());
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const cur = getEffectiveEnabledSet(node, units);
+        let next;
+        if (cur == null) next = new Set([u]);                                  // All -> just this one
+        else { next = new Set(cur); if (next.has(u)) next.delete(u); else next.add(u); }
+        if (next.size === units.length) setEnabledFolders(node, null);         // everything -> back to All
+        else setEnabledFolders(node, next);
+        node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); rebuild();
+      });
+      list.appendChild(row);
+    };
+
+    const hdr = (t) => {
+      const h = document.createElement("div"); h.textContent = t;
+      h.style.cssText = `padding:5px 10px 3px;font-size:10px;letter-spacing:.06em;color:${SV.faint};border-bottom:1px solid ${SV.border2};position:sticky;top:0;background:${SV.inset};`;
+      list.appendChild(h);
+    };
+
+    if (fav.length) { hdr("★ FAVORITES"); fav.forEach(addRow); }
+    if (rest.length) {
+      if (q) { if (fav.length) hdr("ALL FOLDERS"); rest.forEach(addRow); }
+      else {
+        // group by top-level folder when not searching
+        let lastTop = null;
+        if (fav.length) hdr("ALL FOLDERS");
+        for (const u of rest) {
+          const top = u.includes("/") ? u.split("/")[0] : ROOT_LABEL;
+          if (top !== lastTop) { lastTop = top; hdr(top); }
+          addRow(u);
+        }
+      }
+    }
+  };
+  sin.addEventListener("input", () => { query = sin.value; rebuild(); });
+  sin.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Escape") closeFolderCombo();
+  });
+  rebuild();
+  document.body.appendChild(panel);
+  setTimeout(() => sin.focus(), 0);
+  const away = (ev) => { if (!panel.contains(ev.target) && !anchor.contains(ev.target)) closeFolderCombo(); };
+  setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+  openFolderCombo = { dispose: () => { window.removeEventListener("pointerdown", away, true); panel.remove(); } };
+}
+
+function svFolderBar(node) {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;align-items:center;gap:6px;";
+  const tag = document.createElement("span");
+  tag.textContent = "FOLDERS";
+  tag.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};flex:none;`;
+  wrap.appendChild(tag);
+
+  const box = document.createElement("div"); box.dataset.ctl = "1";
+  box.style.cssText = `flex:1;display:flex;align-items:center;flex-wrap:wrap;gap:4px;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;padding:4px 8px;cursor:pointer;min-height:24px;`;
+  box.title = "Choose which lora folders this node can see";
+
+  const mkChip = (label, title, onRemove, accent) => {
+    const chip = document.createElement("span"); chip.dataset.ctl = "1";
+    chip.style.cssText = `display:inline-flex;align-items:center;gap:5px;background:${SV.btn};border:1px solid ${accent || SV.btnBorder};color:${accent || SV.text};border-radius:4px;padding:1px 7px;font-size:11px;`;
+    const t = document.createElement("span"); t.textContent = label; chip.appendChild(t);
+    const x = document.createElement("span"); x.textContent = "✕";
+    x.style.cssText = `color:${SV.mut};cursor:pointer;font-size:10px;`;
+    x.title = title;
+    x.addEventListener("pointerdown", e => e.stopPropagation());
+    x.addEventListener("click", (e) => { e.stopPropagation(); onRemove(); });
+    chip.appendChild(x);
+    return chip;
+  };
+
+  const enabled = effectiveEnabledFoldersArray(node); // null => all folders
+  const rawProp = node.properties?.[PROP_ENABLED_FOLDERS];
+
+  if (enabled == null && rawProp == null) {
+    // Default state: a single "All Folders" chip. Its ✕ deselects everything.
+    box.appendChild(mkChip("All Folders", "Deselect all folders", () => {
+      setEnabledFolders(node, new Set()); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.();
+    }));
+  } else if (enabled != null && enabled.length === 0) {
+    const none = document.createElement("span");
+    none.textContent = "No folders selected";
+    none.style.cssText = `font-size:11px;color:${SV.danger};font-style:italic;`;
+    box.appendChild(none);
+    const back = document.createElement("span");
+    back.textContent = "select all";
+    back.dataset.ctl = "1";
+    back.title = "Go back to all folders";
+    back.style.cssText = `margin-left:auto;font-size:11px;color:${SV.mut};cursor:pointer;text-decoration:underline;`;
+    back.addEventListener("pointerdown", e => e.stopPropagation());
+    back.addEventListener("click", (e) => { e.stopPropagation(); setEnabledFolders(node, null); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); });
+    box.appendChild(back);
+  } else {
+    const all = [...(enabled || [])].sort();
+    const shown = all.slice(0, 6);
+    for (const u of shown) {
+      box.appendChild(mkChip(u === "" ? ROOT_LABEL : u, "Remove this folder from the filter", async () => {
+        const files = await getLoraFiles();
+        const units = [...collectUnits(files).keys()].map(normPath);
+        const cur = getEffectiveEnabledSet(node, units) ?? new Set(units);
+        cur.delete(normPath(u));
+        setEnabledFolders(node, cur);   // empty set stays empty (explicit "none")
+        node.__plffUpdateFolderBtn?.(); node.__lflCommit?.();
+      }));
+    }
+    if (all.length > shown.length) {
+      const more = document.createElement("span");
+      more.textContent = "+" + (all.length - shown.length) + " more";
+      more.style.cssText = `font-size:11px;color:${SV.mut};`;
+      box.appendChild(more);
+    }
+    const clr = document.createElement("span"); clr.textContent = "✕";
+    clr.dataset.ctl = "1";
+    clr.title = "Clear filter (back to all folders)";
+    clr.style.cssText = `margin-left:auto;color:${SV.mut};cursor:pointer;font-size:12px;padding:0 2px;`;
+    clr.addEventListener("pointerdown", e => e.stopPropagation());
+    clr.addEventListener("click", (e) => { e.stopPropagation(); setEnabledFolders(node, null); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); });
+    box.appendChild(clr);
+  }
+  box.addEventListener("pointerdown", e => e.stopPropagation());
+  box.addEventListener("click", (e) => { e.stopPropagation(); hideTip(); svOpenFolderDropdown(node, box); });
+  wrap.appendChild(box);
+  return wrap;
+}
+
+// ---------------------------------------------------------------------------
+// Advanced modal: model routing + per-chain strengths + randomizer + remove
+// ---------------------------------------------------------------------------
+let openLoraModal = null;
+function closeLoraModal() { if (openLoraModal) { openLoraModal.dispose(); openLoraModal = null; } }
+
+function svShowLoraModal(node, entry) {
+  closeLoraModal(); closeFolderCombo(); closeChooserPanel(); closeLinePanel();
+  const chains = flgChainCount(node);
+  const over = document.createElement("div");
+  over.style.cssText = "position:fixed;inset:0;z-index:10002;background:rgba(8,10,14,.6);display:flex;align-items:center;justify-content:center;";
+  const box = document.createElement("div");
+  box.style.cssText = `width:min(360px,92vw);background:${SV.panel};border:1px solid ${SV.border};border-radius:10px;font:12px Arial,sans-serif;color:${SV.text};box-shadow:0 14px 40px rgba(0,0,0,.6);`;
+  over.appendChild(box);
+
+  const rebuild = () => {
+    box.textContent = "";
+    // -- header --
+    const hd = document.createElement("div");
+    hd.style.cssText = `display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid ${SV.border};background:${SV.header};border-radius:10px 10px 0 0;`;
+    const dot = document.createElement("span"); dot.textContent = "●";
+    dot.title = entry.on !== false ? "Enabled — click to disable" : "Disabled — click to enable";
+    dot.style.cssText = `cursor:pointer;font-size:11px;color:${entry.on !== false ? SV.green : SV.ghost};`;
+    dot.addEventListener("click", () => { entry.on = entry.on === false; node.__lflCommit(); rebuild(); });
+    hd.appendChild(dot);
+    const nm = document.createElement("div"); nm.style.cssText = "flex:1;min-width:0;line-height:1.25;";
+    const fol = (entry.name || "").includes("/") ? entry.name.slice(0, entry.name.lastIndexOf("/") + 1) : "";
+    const fil = entry.name ? svFileLabel(entry.name) : "(random — not rolled yet)";
+    nm.innerHTML = (fol ? `<div style="font-size:10px;color:${SV.faint};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${flgEscape(fol)}</div>` : "") +
+      `<div style="font-size:12px;color:${SV.text};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${entry.random ? "🎲 " : ""}${flgEscape(fil)}</div>`;
+    hd.appendChild(nm);
+    const cx = document.createElement("span"); cx.textContent = "✕";
+    cx.style.cssText = `cursor:pointer;color:${SV.mut};font-size:14px;padding:0 2px;`;
+    cx.addEventListener("click", closeLoraModal);
+    hd.appendChild(cx);
+    box.appendChild(hd);
+
+    const body = document.createElement("div"); body.style.cssText = "padding:10px 12px;";
+    const sec = (t) => { const s = document.createElement("div"); s.textContent = t; s.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};margin:0 0 6px;`; return s; };
+
+    // -- model routing (loader only: the plotter has no per-lora routing) --
+    if (node.__isPlotter) {
+      // The plotter has no per-lora routing — every lora is tested against
+      // every connected model base — so show what those bases are, plus the
+      // strength that applies when the sweep is in Per-line mode.
+      body.appendChild(sec("APPLIED TO"));
+      for (let c = 1; c <= chains; c++) {
+        const row = document.createElement("div");
+        row.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 8px;margin-bottom:5px;border:1px solid ${SV.border2};border-radius:6px;background:${SV.inset};`;
+        const tag = document.createElement("span"); tag.textContent = "M" + c;
+        tag.style.cssText = `flex:none;font:10px ui-monospace,monospace;color:${SV_CHAIN_TEXT[c] || SV.dim};border:1px solid ${SV_CHAIN_BORDER[c] || SV.border2};border-radius:3px;padding:0 4px;`;
+        row.appendChild(tag);
+        const nm2 = document.createElement("span");
+        const resolved = flgModelLabel(node, c);
+        nm2.textContent = resolved || "— unconnected —";
+        nm2.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:${resolved ? SV.text : SV.ghost};${resolved ? "" : "font-style:italic;"}`;
+        row.appendChild(nm2);
+        body.appendChild(row);
+      }
+      const note = document.createElement("div");
+      note.textContent = "Every lora is swept against each connected model.";
+      note.style.cssText = `font-size:11px;color:${SV.faint};margin:-1px 0 10px;`;
+      body.appendChild(note);
+
+      const globalMode = node.__plotMode === "global";
+      body.appendChild(sec("STRENGTH"));
+      const srow = document.createElement("div");
+      srow.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 8px;margin-bottom:10px;border:1px solid ${SV.border2};border-radius:6px;background:${SV.inset};`;
+      const slab = document.createElement("span");
+      slab.textContent = globalMode ? "Set by the sweep's Global strengths" : "This line's sweep strength";
+      slab.style.cssText = `flex:1;min-width:0;font-size:12px;color:${globalMode ? SV.ghost : SV.dim};${globalMode ? "font-style:italic;" : ""}`;
+      srow.appendChild(slab);
+      const sctl = svStrengthInput(Number(entry.model ?? 1), (v) => {
+        svSetBaseStrength(entry, v); node.__lflCommit();
+      }, true, globalMode);
+      if (globalMode) { if (sctl.__input) sctl.__input.disabled = true; sctl.style.opacity = ".35"; }
+      srow.appendChild(sctl);
+      body.appendChild(srow);
+    }
+
+    if (!node.__isPlotter) {
+    body.appendChild(sec("MODEL ROUTING"));
+    for (let c = 1; c <= chains; c++) {
+      const routed = svChainStrength(entry, c) != null;
+      const row = document.createElement("div");
+      row.style.cssText = `display:flex;align-items:center;gap:8px;border-radius:6px;padding:5px 9px;margin-bottom:5px;` +
+        (routed ? `background:${SV.inset};border:1px solid ${SV_CHAIN_BORDER[c] || SV.border2};`
+                : `background:${SV.slotEmpty};border:1px dashed ${SV.dashed};opacity:.6;`);
+      const d = document.createElement("span"); d.textContent = "●";
+      d.title = routed ? `Routed to Model ${c} — click to disconnect` : `Not routed — click to route to Model ${c}`;
+      d.style.cssText = `cursor:pointer;font-size:11px;color:${routed ? SV.green : SV.ghost};flex:none;`;
+      d.addEventListener("click", () => {
+        if (routed) { const t = flgEnsureTargets(entry, chains); delete t[c]; }
+        else { const t = flgEnsureTargets(entry, chains); t[c] = Number(entry.model ?? 1); }
+        node.__lflCommit(); rebuild();
+      });
+      row.appendChild(d);
+      const mc = document.createElement("span"); mc.textContent = "M" + c;
+      mc.style.cssText = `font:11px ui-monospace,monospace;color:${SV_CHAIN_TEXT[c] || SV.dim};flex:none;`;
+      row.appendChild(mc);
+      const mn = document.createElement("span");
+      const lbl = flgModelLabel(node, c);
+      mn.textContent = lbl || "— unconnected —";
+      mn.style.cssText = `flex:1;min-width:0;font-size:11px;color:${lbl ? SV.dim : SV.ghost};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;${lbl ? "" : "font-style:italic;"}`;
+      row.appendChild(mn);
+      if (routed) {
+        row.appendChild(svStrengthInput(svChainStrength(entry, c), (v) => {
+          flgEnsureTargets(entry, chains)[c] = v; node.__lflCommit();
+        }));
+      } else {
+        const dash = document.createElement("span"); dash.textContent = "—";
+        dash.style.cssText = `color:${SV.ghost};padding:0 18px;`; row.appendChild(dash);
+      }
+      body.appendChild(row);
+    }
+    }
+
+    // -- randomizer --
+    if (entry.random) {
+      body.appendChild(sec("RANDOMIZER"));
+      const rr = document.createElement("div");
+      rr.style.cssText = `display:flex;align-items:center;gap:12px;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;padding:6px 9px;margin-bottom:5px;`;
+      const mk = (txt, title, active, fn) => {
+        const s = document.createElement("span"); s.textContent = txt; s.title = title;
+        s.style.cssText = `cursor:pointer;font-size:13px;line-height:1;user-select:none;opacity:${active ? "1" : ".55"};${active ? "" : "filter:grayscale(.6);"}`;
+        s.addEventListener("click", fn); return s;
+      };
+      rr.appendChild(mk("🎲", entry.locked ? "Locked — unlock to reroll" : "Roll a new pick now", !entry.locked, async () => {
+        if (entry.locked) return;
+        const p = await pickRandomLora(node, entry); if (p != null) { entry.name = p; node.__lflCommit(); rebuild(); }
+      }));
+      rr.appendChild(mk(entry.locked ? "🔒" : "🔓", entry.locked ? "Locked — won't re-roll" : "Unlocked", !!entry.locked, () => { entry.locked = !entry.locked; node.__lflCommit(); rebuild(); }));
+      rr.appendChild(mk("🔄", entry.autoRoll ? "Auto-roll each queue: ON" : "Auto-roll each queue: OFF", !!entry.autoRoll, () => { entry.autoRoll = !entry.autoRoll; node.__lflCommit(); rebuild(); }));
+      const fsc = document.createElement("span");
+      fsc.textContent = "📂 " + (Array.isArray(entry.folders) ? entry.folders.length + " folders" : "all enabled");
+      fsc.title = "Choose which folders this randomizer draws from";
+      fsc.style.cssText = `cursor:pointer;font-size:11px;color:${SV.dim};margin-left:auto;`;
+      fsc.addEventListener("click", (ev) => showLineFolderPanel(node, entry, ev));
+      rr.appendChild(fsc);
+      body.appendChild(rr);
+    }
+
+    // -- footer --
+    const ft = document.createElement("div"); ft.style.cssText = "display:flex;gap:8px;margin-top:10px;";
+    const done = svBtn("Done", "", closeLoraModal); done.style.flex = "1";
+    ft.appendChild(done);
+    const rm = svBtn("Remove lora", "Remove this lora from the node", () => {
+      const i = (node.__loraStack || []).indexOf(entry);
+      if (i >= 0) { node.__loraStack.splice(i, 1); node.__lflCommit(); }
+      closeLoraModal();
+    });
+    rm.style.borderColor = "#4a2a2a"; rm.style.color = SV.danger;
+    ft.appendChild(rm);
+    body.appendChild(ft);
+    box.appendChild(body);
+  };
+  rebuild();
+
+  over.addEventListener("pointerdown", (e) => { if (e.target === over) closeLoraModal(); });
+  document.body.appendChild(over);
+  openLoraModal = { dispose: () => over.remove(), rebuild };
+}
+
+// ---------------------------------------------------------------------------
+// The slot view
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Presets: named snapshots of the lora stack + folder filter, stored server
+// side under ComfyUI/user/fantastic-loras/presets/.
+// ---------------------------------------------------------------------------
+let svPresets = null;   // [{name, category}] cached, refreshed on save/delete
+
+async function svPresetApi(path, body) {
+  const opts = body
+    ? { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } }
+    : {};
+  const resp = await api.fetchApi("/fantastic_loras/presets" + path, opts);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const e = new Error(data.message || data.error || `request failed (${resp.status})`);
+    e.code = data.error; e.status = resp.status;
+    throw e;
+  }
+  return data;
+}
+
+function svToast(msg, bad) {
+  const t = document.createElement("div");
+  t.textContent = msg;
+  t.style.cssText = `position:fixed;z-index:10005;left:50%;bottom:70px;transform:translateX(-50%);background:${SV.panel};` +
+    `border:1px solid ${bad ? "#6b3a3a" : SV.btnBorder};color:${bad ? SV.danger : SV.text};border-radius:6px;` +
+    `padding:8px 14px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);max-width:70vw;`;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), bad ? 5000 : 2600);
+}
+
+function svApplyPreset(node, data) {
+  const stack = (data.loras || []).slice(0, SLOT_MAX).map(e => ({
+    on: e.on !== false, name: e.name || "", model: Number(e.model ?? 1), clip: Number(e.clip ?? e.model ?? 1),
+    ...(e.targets ? { targets: e.targets } : {}),
+    ...(e.random ? { random: true, locked: !!e.locked, autoRoll: !!e.autoRoll, folders: e.folders ?? null } : {}),
+  }));
+  node.__loraStack = stack;
+  if (data.enabledFolders !== undefined) {
+    setEnabledFolders(node, data.enabledFolders == null ? null : new Set(data.enabledFolders.map(normPath)));
+  }
+  // Load applies everything the preset stored, including chain count.
+  if (typeof data.chains === "number") {
+    const want = Math.max(1, Math.min(1 + MAX_EXTRA_MODELS, Math.round(data.chains)));
+    let guard = 0;
+    while (flgChainCount(node) < want && guard++ < 8) addModelPair(node);
+    guard = 0;
+    while (flgChainCount(node) > want && guard++ < 8) removeModelPair(node);
+  }
+  node.__plffUpdateFolderBtn?.();
+  // Mark clean BEFORE committing: commit is what re-renders the bar, so
+  // setting the signature afterwards left it drawn in the dirty state.
+  svMarkClean(node, data.name, data.category || "");
+  node.__lflCommit();
+  if (data.missing && data.missing.length) {
+    svToast(`Loaded “${data.name}” — ${data.missing.length} lora${data.missing.length > 1 ? "s" : ""} no longer on disk were skipped`, true);
+  } else {
+    svToast(`Loaded preset “${data.name}”`);
+  }
+}
+
+const SV_UNCAT = "(uncategorized)";
+
+function svSmallInput(placeholder, value) {
+  const i = document.createElement("input");
+  i.type = "text"; i.placeholder = placeholder; i.value = value || "";
+  i.dataset.ctl = "1";
+  i.style.cssText = `flex:1;min-width:0;background:${SV.inset};border:1px solid ${SV.btnBorder};color:${SV.text};border-radius:5px;padding:3px 7px;font:12px Arial,sans-serif;outline:none;`;
+  i.addEventListener("pointerdown", e => e.stopPropagation());
+  i.addEventListener("keydown", e => e.stopPropagation());
+  return i;
+}
+
+// Category picker for the save form: a dropdown of existing categories plus a
+// "＋ New category…" entry that swaps the control for a text field in place
+// (swapping in place, not re-rendering, so the name field keeps what's typed).
+function svCategoryField(cats, initial, hooks) {
+  const box = document.createElement("span");
+  box.style.cssText = "flex:none;width:170px;display:inline-flex;align-items:center;gap:4px;";
+  let mode = (initial && !cats.includes(initial)) ? "new" : "pick";
+  let current = initial || "";
+
+  const paint = () => {
+    box.textContent = "";
+    if (mode === "pick") {
+      const sel = document.createElement("select"); sel.dataset.ctl = "1";
+      sel.style.cssText = `flex:1;min-width:0;background:${SV.inset};border:1px solid ${SV.border2};color:${SV.text};border-radius:5px;padding:3px 6px;font:12px Arial,sans-serif;outline:none;cursor:pointer;`;
+      sel.title = "Category for this preset";
+      const none = document.createElement("option"); none.value = ""; none.textContent = "(uncategorized)";
+      sel.appendChild(none);
+      for (const c of cats) { const o = document.createElement("option"); o.value = c; o.textContent = c; sel.appendChild(o); }
+      const nw = document.createElement("option"); nw.value = "\u0000new"; nw.textContent = "＋ New category…";
+      sel.appendChild(nw);
+      sel.value = cats.includes(current) ? current : "";
+      sel.addEventListener("pointerdown", e => e.stopPropagation());
+      sel.addEventListener("change", () => {
+        if (sel.value === "\u0000new") { current = ""; mode = "new"; paint(); }
+        else current = sel.value;
+      });
+      box.appendChild(sel);
+    } else {
+      const inp = svSmallInput("new category…", current);
+      inp.style.cssText += "flex:1;min-width:0;";
+      inp.addEventListener("input", () => { current = inp.value; });
+      inp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") hooks?.submit?.();
+        else if (e.key === "Escape") hooks?.cancel?.();
+      });
+      box.appendChild(inp);
+      const back = document.createElement("span"); back.dataset.ctl = "1";
+      back.textContent = "▾"; back.title = "Pick an existing category instead";
+      back.style.cssText = `flex:none;cursor:pointer;color:${SV.mut};font-size:12px;padding:0 2px;`;
+      back.addEventListener("mouseenter", () => back.style.color = SV.text);
+      back.addEventListener("mouseleave", () => back.style.color = SV.mut);
+      back.addEventListener("pointerdown", e => e.stopPropagation());
+      back.addEventListener("click", (e) => { e.stopPropagation(); current = ""; mode = "pick"; paint(); });
+      box.appendChild(back);
+      setTimeout(() => inp.focus(), 0);
+    }
+  };
+  paint();
+  return { el: box, value: () => current.trim() };
+}
+
+let openThemeMenu = null;
+function closeThemeMenu() { if (openThemeMenu) { openThemeMenu.dispose(); openThemeMenu = null; } }
+
+function svExtButton() {
+  const on = svShowExt();
+  const b = svBtn(".ext", on ? "Filenames show their extension — click to hide it" : "Filenames hide their extension — click to show it",
+    () => svSetShowExt(!svShowExt()));
+  b.style.padding = "3px 8px";
+  b.style.fontFamily = "ui-monospace,monospace";
+  if (on) { b.style.borderColor = SV.accent; b.style.color = SV.text; }
+  else { b.style.color = SV.mut; }
+  return b;
+}
+
+function svThemeButton() {
+  const b = document.createElement("button"); b.dataset.ctl = "1";
+  b.title = "Panel theme";
+  b.style.cssText = `background:${SV.btn};border:1px solid ${SV.btnBorder};color:${SV.btnText};border-radius:6px;` +
+    `padding:3px 8px;font:12px Arial,sans-serif;cursor:pointer;flex:none;display:inline-flex;align-items:center;gap:6px;`;
+  const sw = document.createElement("span");
+  sw.style.cssText = `width:11px;height:11px;border-radius:3px;flex:none;background:${(SV_THEMES[svThemeName()] || SV_THEMES[SV_THEME_DEFAULT]).swatch};border:1px solid ${SV.text};display:inline-block;`;
+  b.appendChild(sw);
+  const lb = document.createElement("span"); lb.textContent = "Theme"; b.appendChild(lb);
+  b.addEventListener("mouseenter", () => b.style.background = SV.btnHover);
+  b.addEventListener("mouseleave", () => b.style.background = SV.btn);
+  b.addEventListener("pointerdown", e => e.stopPropagation());
+  b.addEventListener("click", (e) => {
+    e.stopPropagation(); hideTip();
+    if (openThemeMenu) { closeThemeMenu(); return; }
+    const cur = svThemeName();
+    const menu = document.createElement("div");
+    menu.style.cssText = `position:fixed;z-index:10004;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;` +
+      `padding:4px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);min-width:150px;`;
+    const r = b.getBoundingClientRect();
+    menu.style.left = Math.round(Math.min(r.left, window.innerWidth - 170)) + "px";
+    menu.style.top = Math.round(r.bottom + 5) + "px";
+    for (const [key, t] of Object.entries(SV_THEMES)) {
+      const row = document.createElement("div");
+      const on = key === cur;
+      row.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;cursor:pointer;color:${on ? SV.text : SV.dim};${on ? `background:${SV.rowOn};` : ""}`;
+      const sw = document.createElement("span");
+      sw.style.cssText = `flex:none;width:14px;height:14px;border-radius:3px;background:${t.swatch};border:1px solid ${SV.btnBorder};`;
+      row.appendChild(sw);
+      const lb = document.createElement("span"); lb.textContent = t.label; lb.style.flex = "1";
+      row.appendChild(lb);
+      if (on) { const ck = document.createElement("span"); ck.textContent = "✓"; ck.style.cssText = `color:${SV.accent};font-size:11px;`; row.appendChild(ck); }
+      row.addEventListener("mouseenter", () => row.style.background = SV.rowHover);
+      row.addEventListener("mouseleave", () => row.style.background = on ? SV.rowOn : "");
+      row.addEventListener("pointerdown", ev => ev.stopPropagation());
+      row.addEventListener("click", (ev) => { ev.stopPropagation(); closeThemeMenu(); svSetTheme(key); });
+      menu.appendChild(row);
+    }
+    document.body.appendChild(menu);
+    const away = (ev) => { if (!menu.contains(ev.target) && !b.contains(ev.target)) closeThemeMenu(); };
+    setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+    openThemeMenu = { dispose: () => { window.removeEventListener("pointerdown", away, true); menu.remove(); } };
+  });
+  return b;
+}
+
+// --- preset dropdown: favourites pinned, stars, lora counts ----------------
+let openPresetMenu = null;
+function closePresetMenu() { if (openPresetMenu) { openPresetMenu.dispose(); openPresetMenu = null; } }
+
+function svPresetFavs() { return new Set(FLL_PREFS.favoritePresets || []); }
+function svTogglePresetFav(name) {
+  const f = svPresetFavs();
+  f.has(name) ? f.delete(name) : f.add(name);
+  savePrefs({ favoritePresets: [...f] });
+}
+
+function svOpenPresetDropdown(node, anchor, catFilter) {
+  closePresetMenu();
+  const list = svPresets || [];
+  const menu = document.createElement("div");
+  menu.style.cssText = `position:fixed;z-index:10004;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;` +
+    `min-width:260px;max-width:380px;max-height:320px;overflow:auto;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);`;
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.round(Math.min(r.left, window.innerWidth - 390)) + "px";
+  menu.style.top = Math.round(r.bottom + 4) + "px";
+
+  const build = () => {
+    menu.textContent = "";
+    const favs = svPresetFavs();
+    const shown = list.filter(p => catFilter == null || (p.category || "") === catFilter);
+    if (!shown.length) {
+      const em = document.createElement("div");
+      em.textContent = list.length ? "No presets in this category" : "No presets saved yet";
+      em.style.cssText = `padding:10px;font-size:11px;color:${SV.ghost};font-style:italic;`;
+      menu.appendChild(em); return;
+    }
+    const hdr = (t) => {
+      const h = document.createElement("div"); h.textContent = t;
+      h.style.cssText = `padding:5px 10px 3px;font-size:10px;letter-spacing:.06em;color:${SV.faint};position:sticky;top:0;background:${SV.inset};border-bottom:1px solid ${SV.border2};`;
+      menu.appendChild(h);
+    };
+    const row = (p) => {
+      const sel = p.name === node.__svPresetName;
+      const el = document.createElement("div");
+      el.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-bottom:1px solid ${SV.border2};` +
+        (sel ? `background:${SV.rowOn};` : "");
+      const star = document.createElement("span");
+      const isFav = favs.has(p.name);
+      star.textContent = isFav ? "★" : "☆";
+      star.title = isFav ? "Unfavorite" : "Favorite (pins to the top)";
+      star.style.cssText = `flex:none;font-size:12px;cursor:pointer;color:${isFav ? "#e0c04c" : SV.ghost};`;
+      star.addEventListener("pointerdown", e => e.stopPropagation());
+      star.addEventListener("click", (e) => { e.stopPropagation(); svTogglePresetFav(p.name); build(); node.__lflRender?.(); });
+      el.appendChild(star);
+      const nm = document.createElement("span"); nm.textContent = p.name;
+      nm.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:${sel ? SV.text : SV.dim};`;
+      el.appendChild(nm);
+      if (p.count != null) {
+        const c = document.createElement("span"); c.textContent = String(p.count);
+        c.style.cssText = `flex:none;font:10px ui-monospace,monospace;color:${SV.faint};`;
+        el.appendChild(c);
+      }
+      if (sel) { const ck = document.createElement("span"); ck.textContent = "✓"; ck.style.cssText = `flex:none;color:${SV.accent};font-size:11px;`; el.appendChild(ck); }
+      el.addEventListener("mouseenter", () => el.style.background = SV.rowHover);
+      el.addEventListener("mouseleave", () => el.style.background = sel ? SV.rowOn : "");
+      el.addEventListener("pointerdown", e => e.stopPropagation());
+      el.addEventListener("click", (e) => {
+        e.stopPropagation(); closePresetMenu();
+        node.__svPresetName = p.name; node.__svPresetCat = p.category || "";
+        node.__svCleanSig = null;          // nothing loaded yet — not "clean"
+        node.__lflRender?.();
+      });
+      menu.appendChild(el);
+    };
+    const fav = shown.filter(p => favs.has(p.name));
+    const rest = shown.filter(p => !favs.has(p.name));
+    if (fav.length) { hdr("★ FAVORITES"); fav.forEach(row); }
+    if (rest.length) {
+      if (catFilter == null) {
+        let lastCat = null;
+        if (fav.length) { /* section headers below carry the labels */ }
+        for (const p of rest) {
+          const c = p.category || "(uncategorized)";
+          if (c !== lastCat) { lastCat = c; hdr(c.toUpperCase()); }
+          row(p);
+        }
+      } else { if (fav.length) hdr("ALL"); rest.forEach(row); }
+    }
+  };
+  build();
+  document.body.appendChild(menu);
+  const away = (ev) => { if (!menu.contains(ev.target) && !anchor.contains(ev.target)) closePresetMenu(); };
+  setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+  openPresetMenu = { dispose: () => { window.removeEventListener("pointerdown", away, true); menu.remove(); } };
+}
+
+// --- the bar ---------------------------------------------------------------
+function svPresetRow(node) {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;align-items:center;gap:6px;flex-wrap:wrap;";
+
+  if (node.__svPresetMode === "save")   return svPresetSaveForm(node, wrap);
+  if (node.__svPresetMode === "rename") return svPresetRenameForm(node, wrap);
+  if (node.__svPresetMode === "delete") return svPresetDeleteForm(node, wrap);
+  if (node.__svPresetMode === "overwrite") return svPresetOverwriteForm(node, wrap);
+  if (node.__svPresetMode === "duplicate") return svPresetDuplicateForm(node, wrap);
+
+  const tag = document.createElement("span"); tag.textContent = "PRESET";
+  tag.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};flex:none;`;
+  wrap.appendChild(tag);
+
+  if (svPresets == null) {
+    svPresetApi("").then(d => { svPresets = d.presets || []; node.__lflRender?.(); }).catch(() => { svPresets = []; });
+  }
+  const list = svPresets || [];
+  const cats = [...new Set(list.map(p => p.category || ""))].sort();
+
+  // category filter (native select — no extra affordances needed)
+  const catSel = document.createElement("select"); catSel.dataset.ctl = "1";
+  catSel.style.cssText = `flex:none;width:150px;background:${SV.inset};border:1px solid ${SV.border2};color:${SV.text};border-radius:5px;padding:3px 6px;font:12px Arial,sans-serif;outline:none;cursor:pointer;`;
+  catSel.title = "Filter presets by category";
+  const oAll = document.createElement("option"); oAll.value = "*"; oAll.textContent = "all categories"; catSel.appendChild(oAll);
+  for (const c of cats) { const o = document.createElement("option"); o.value = c; o.textContent = c || "(uncategorized)"; catSel.appendChild(o); }
+  catSel.value = (node.__svPresetCatFilter != null && cats.includes(node.__svPresetCatFilter)) ? node.__svPresetCatFilter : "*";
+  catSel.addEventListener("pointerdown", e => e.stopPropagation());
+  catSel.addEventListener("change", () => { node.__svPresetCatFilter = catSel.value === "*" ? null : catSel.value; node.__lflRender?.(); });
+  wrap.appendChild(catSel);
+
+  // preset picker (custom, so favourites + stars fit inside)
+  const dirty = svIsDirty(node);
+  const pick = document.createElement("div"); pick.dataset.ctl = "1";
+  pick.style.cssText = `flex:1;min-width:150px;display:flex;align-items:center;gap:6px;background:${SV.inset};border:1px solid ${SV.border2};border-radius:5px;padding:3px 7px;cursor:pointer;`;
+  const pn = document.createElement("span");
+  pn.textContent = node.__svPresetName ? (node.__svPresetName + (dirty ? " (modified)" : "")) : "load preset…";
+  pn.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;` +
+    (node.__svPresetName
+      ? (dirty ? `color:#e0a94c;font-style:italic;` : `color:${SV.text};`)
+      : `color:${SV.ghost};`);
+  pick.appendChild(pn);
+  const car = document.createElement("span"); car.textContent = "▾";
+  car.style.cssText = `flex:none;color:${SV.mut};font-size:11px;`; pick.appendChild(car);
+  pick.title = dirty
+    ? "The stack has changed since this preset was loaded — Save to update it"
+    : "Choose a preset, then Load or + Add to stack";
+  pick.addEventListener("pointerdown", e => e.stopPropagation());
+  pick.addEventListener("click", (e) => { e.stopPropagation(); hideTip(); svOpenPresetDropdown(node, pick, node.__svPresetCatFilter); });
+  wrap.appendChild(pick);
+
+  // favourite toggle for the selected preset
+  if (node.__svPresetName) {
+    const isFav = svPresetFavs().has(node.__svPresetName);
+    const st = document.createElement("span"); st.dataset.ctl = "1";
+    st.textContent = isFav ? "★" : "☆";
+    st.title = isFav ? "Unfavorite this preset" : "Favorite this preset";
+    st.style.cssText = `flex:none;cursor:pointer;font-size:15px;line-height:1;padding:0 2px;color:${isFav ? "#e0c04c" : SV.mut};`;
+    st.addEventListener("pointerdown", e => e.stopPropagation());
+    st.addEventListener("click", (e) => { e.stopPropagation(); svTogglePresetFav(node.__svPresetName); node.__lflRender?.(); });
+    wrap.appendChild(st);
+  }
+
+  const hasSel = !!node.__svPresetName;
+  const load = svBtn("Load", hasSel ? "Replace the stack (and folder filter + chains) with this preset" : "Choose a preset first", async () => {
+    if (!hasSel) { svToast("Choose a preset first.", true); return; }
+    try {
+      const d = await svPresetApi("/load", { name: node.__svPresetName });
+      svApplyPreset(node, d);
+    } catch (err) { svToast(String(err.message || err), true); }
+  });
+  load.style.padding = "3px 10px";
+  if (!hasSel) { load.style.opacity = ".4"; }
+  wrap.appendChild(load);
+
+  const add = svBtn("+ Add to stack", hasSel ? "Merge this preset's loras into the current stack" : "Choose a preset first", async () => {
+    if (!hasSel) { svToast("Choose a preset first.", true); return; }
+    try {
+      const d = await svPresetApi("/load", { name: node.__svPresetName });
+      const res = svMergeIntoStack(node, d.loras || []);
+      node.__lflCommit();
+      const bits = [`Added ${res.added} lora${res.added === 1 ? "" : "s"}`];
+      if (res.dupes) bits.push(`${res.dupes} already in stack`);
+      if (res.dropped) bits.push(`${res.dropped} didn't fit (12 slot limit)`);
+      if ((d.missing || []).length) bits.push(`${d.missing.length} missing from disk`);
+      svToast(bits.join(" · "), !!(res.dropped || (d.missing || []).length));
+    } catch (err) { svToast(String(err.message || err), true); }
+  });
+  add.style.padding = "3px 10px";
+  if (hasSel) { add.style.borderColor = SV.accent; add.style.color = SV.badgeFg; } else { add.style.opacity = ".4"; }
+  wrap.appendChild(add);
+
+  const save = svBtn("Save", dirty ? "Save the changed stack" : "Save the current stack as a preset", () => {
+    node.__svPresetMode = "save"; node.__lflRender?.();
+  });
+  save.style.padding = "3px 10px";
+  if (dirty) { save.style.borderColor = "#e0a94c"; save.style.color = "#e0a94c"; }
+  wrap.appendChild(save);
+
+  // ⋮ menu — the things you do TO a preset
+  const dots = svBtn("⋮", "Preset actions", (e) => {
+    if (!hasSel) { svToast("Choose a preset first.", true); return; }
+    svOpenPresetActions(node, e.currentTarget);
+  });
+  dots.style.padding = "3px 7px";
+  if (!hasSel) dots.style.opacity = ".4";
+  wrap.appendChild(dots);
+  return wrap;
+}
+
+let openPresetActions = null;
+function closePresetActions() { if (openPresetActions) { openPresetActions.dispose(); openPresetActions = null; } }
+
+function svOpenPresetActions(node, anchor) {
+  closePresetActions();
+  const menu = document.createElement("div");
+  menu.style.cssText = `position:fixed;z-index:10004;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;` +
+    `padding:4px;min-width:210px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);`;
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.round(Math.min(r.left - 150, window.innerWidth - 230)) + "px";
+  menu.style.top = Math.round(r.bottom + 4) + "px";
+  const item = (label, title, danger, fn) => {
+    const el = document.createElement("div");
+    el.textContent = label; el.title = title || "";
+    el.style.cssText = `padding:5px 8px;border-radius:4px;cursor:pointer;color:${danger ? SV.danger : SV.text};` +
+      (danger ? `border-top:1px solid ${SV.border2};margin-top:3px;padding-top:7px;` : "");
+    el.addEventListener("mouseenter", () => el.style.background = SV.rowHover);
+    el.addEventListener("mouseleave", () => el.style.background = "");
+    el.addEventListener("pointerdown", e => e.stopPropagation());
+    el.addEventListener("click", (e) => { e.stopPropagation(); closePresetActions(); fn(); });
+    menu.appendChild(el);
+  };
+  item("Overwrite with current stack", "Update this preset to match what's on the node now", false, async () => {
+    try {
+      const d = await svPresetApi("/save", {
+        name: node.__svPresetName, category: node.__svPresetCat || "",
+        overwrite: true,
+        loras: svPresetLoras(node), enabledFolders: effectiveEnabledFoldersArray(node),
+        chains: flgChainCount(node),
+      });
+      svPresets = d.presets || svPresets;
+      svMarkClean(node, d.name, node.__svPresetCat);
+      svToast(`Updated “${d.name}”`);
+      node.__lflRender?.();
+    } catch (err) { svToast(String(err.message || err), true); }
+  });
+  item("Duplicate…", "Save a copy of this preset under a new name", false, () => {
+    node.__svDupSource = node.__svPresetName;
+    node.__svPresetMode = "duplicate"; node.__lflRender?.();
+  });
+  item("Rename…", "", false, () => { node.__svPresetMode = "rename"; node.__lflRender?.(); });
+  item("Delete preset", "", true, () => { node.__svPresetMode = "delete"; node.__lflRender?.(); });
+  document.body.appendChild(menu);
+  const away = (ev) => { if (!menu.contains(ev.target)) closePresetActions(); };
+  setTimeout(() => window.addEventListener("pointerdown", away, true), 0);
+  openPresetActions = { dispose: () => { window.removeEventListener("pointerdown", away, true); menu.remove(); } };
+}
+
+// The stack as it should be stored, honouring any pending "freeze randomizers"
+// choice made in the save form.
+function svPresetLoras(node, freezeRandom) {
+  return (node.__loraStack || []).map(e => {
+    const out = { on: e.on !== false, name: e.name || "", model: Number(e.model ?? 1), clip: Number(e.clip ?? e.model ?? 1) };
+    if (e.targets && typeof e.targets === "object") out.targets = e.targets;
+    if (e.random && !freezeRandom) {
+      out.random = true; out.locked = !!e.locked; out.autoRoll = !!e.autoRoll;
+      out.folders = Array.isArray(e.folders) ? e.folders : null;
+    }
+    return out;
+  });
+}
+
+function svPresetSaveForm(node, wrap) {
+  const tag = document.createElement("span"); tag.textContent = "SAVE AS";
+  tag.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};flex:none;`;
+  wrap.appendChild(tag);
+  const cats = [...new Set((svPresets || []).map(p => p.category).filter(Boolean))].sort();
+  const catHooks = {};
+  const catField = svCategoryField(cats, node.__svPresetCat || "", catHooks);
+  wrap.appendChild(catField.el);
+  const nameIn = svSmallInput("preset name…", node.__svPresetName || "");
+  nameIn.style.cssText += "flex:1;min-width:170px;";
+  wrap.appendChild(nameIn);
+
+  const randCount = (node.__loraStack || []).filter(e => e.random).length;
+  let freeze = !!node.__svFreezeRandom;
+
+  const cancelSave = () => { node.__svPresetMode = null; node.__svFreezeRandom = false; node.__lflRender?.(); };
+  const doSave = async (overwrite) => {
+    const name = nameIn.value.trim();
+    if (!name) { svToast("Give the preset a name.", true); nameIn.focus(); return; }
+    try {
+      const d = await svPresetApi("/save", {
+        name, category: catField.value(), overwrite: !!overwrite,
+        loras: svPresetLoras(node, freeze),
+        enabledFolders: effectiveEnabledFoldersArray(node),
+        chains: flgChainCount(node),
+      });
+      svPresets = d.presets || svPresets;
+      svMarkClean(node, d.name, catField.value());
+      node.__svPresetMode = null; node.__svFreezeRandom = false;
+      svToast(`Saved “${d.name}” (${d.count} lora${d.count === 1 ? "" : "s"})`);
+      node.__lflRender?.();
+    } catch (err) {
+      const msg = String(err.message || err);
+      if (err.code === "exists") {
+        node.__svOverwritePrompt = nameIn.value.trim();
+        node.__svPresetCat = catField.value();
+        node.__svPresetMode = "overwrite"; node.__lflRender?.();
+      } else svToast(msg, true);
+    }
+  };
+  catHooks.submit = () => doSave(false); catHooks.cancel = cancelSave;
+  nameIn.addEventListener("keydown", e => { if (e.key === "Enter") doSave(false); if (e.key === "Escape") cancelSave(); });
+
+  const ok = svBtn("Save", "Save this preset", () => doSave(false)); ok.style.padding = "3px 10px";
+  wrap.appendChild(ok);
+  const cancel = svBtn("Cancel", "", cancelSave); cancel.style.padding = "3px 10px";
+  wrap.appendChild(cancel);
+
+  if (randCount) {
+    const line = document.createElement("div");
+    line.style.cssText = `flex-basis:100%;display:flex;align-items:center;gap:7px;margin-top:6px;padding:5px 8px;background:${SV.inset};border:1px solid ${SV.purpleBorder};border-radius:5px;`;
+    const txt = document.createElement("span");
+    txt.textContent = `🎲 ${randCount} randomizer slot${randCount === 1 ? "" : "s"} — convert to static for this preset?`;
+    txt.style.cssText = `flex:1;min-width:0;font-size:11px;color:${SV.dim};`;
+    line.appendChild(txt);
+    const mk = (label, val, title) => {
+      const b = document.createElement("span"); b.dataset.ctl = "1";
+      b.textContent = label; b.title = title;
+      const on = freeze === val;
+      b.style.cssText = `flex:none;cursor:pointer;font-size:11px;border-radius:4px;padding:2px 9px;` +
+        (on ? `background:${SV.btnBorder};border:1px solid ${SV.accent};color:${SV.text};`
+            : `background:${SV.btn};border:1px solid ${SV.btnBorder};color:${SV.mut};`);
+      b.addEventListener("pointerdown", e => e.stopPropagation());
+      b.addEventListener("click", (e) => { e.stopPropagation(); freeze = val; node.__svFreezeRandom = val; node.__lflRender?.(); });
+      return b;
+    };
+    line.appendChild(mk("Keep random", false, "Store them as randomizer slots that re-roll"));
+    line.appendChild(mk("Yes, convert", true, "Store the currently selected lora as a normal lora, at the same strength"));
+    wrap.appendChild(line);
+  }
+  setTimeout(() => nameIn.focus(), 0);
+  return wrap;
+}
+
+function svPresetOverwriteForm(node, wrap) {
+  const name = node.__svOverwritePrompt || "";
+  const q = document.createElement("span");
+  q.textContent = `“${name}” already exists — overwrite it?`;
+  q.style.cssText = `font-size:12px;color:#e0a94c;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+  wrap.appendChild(q);
+  const yes = svBtn("Overwrite", "Replace the saved preset with the current stack", async () => {
+    try {
+      const d = await svPresetApi("/save", {
+        name, category: node.__svPresetCat || "", overwrite: true,
+        loras: svPresetLoras(node, !!node.__svFreezeRandom),
+        enabledFolders: effectiveEnabledFoldersArray(node),
+        chains: flgChainCount(node),
+      });
+      svPresets = d.presets || svPresets;
+      svMarkClean(node, d.name, node.__svPresetCat);
+      node.__svPresetMode = null; node.__svFreezeRandom = false;
+      svToast(`Updated “${d.name}”`);
+      node.__lflRender?.();
+    } catch (err) { svToast(String(err.message || err), true); }
+  });
+  yes.style.padding = "3px 10px"; yes.style.borderColor = "#e0a94c"; yes.style.color = "#e0a94c";
+  wrap.appendChild(yes);
+  const back = svBtn("Rename", "Go back and pick a different name", () => { node.__svPresetMode = "save"; node.__lflRender?.(); });
+  back.style.padding = "3px 10px"; wrap.appendChild(back);
+  const no = svBtn("Cancel", "", () => { node.__svPresetMode = null; node.__svFreezeRandom = false; node.__lflRender?.(); });
+  no.style.padding = "3px 10px"; wrap.appendChild(no);
+  return wrap;
+}
+
+function svPresetDuplicateForm(node, wrap) {
+  const src = node.__svDupSource || node.__svPresetName || "";
+  const tag = document.createElement("span"); tag.textContent = "COPY OF";
+  tag.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};flex:none;`;
+  wrap.appendChild(tag);
+  const from = document.createElement("span"); from.textContent = src;
+  from.style.cssText = `flex:none;max-width:130px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:${SV.dim};`;
+  wrap.appendChild(from);
+
+  const cats = [...new Set((svPresets || []).map(p => p.category).filter(Boolean))].sort();
+  const hooks = {};
+  const catField = svCategoryField(cats, node.__svPresetCat || "", hooks);
+  wrap.appendChild(catField.el);
+
+  // Pre-fill with a name that won't collide, so Enter just works.
+  const taken = new Set((svPresets || []).map(p => p.name));
+  let suggestion = `${src} copy`;
+  for (let i = 2; taken.has(suggestion); i++) suggestion = `${src} copy ${i}`;
+  const nameIn = svSmallInput("name for the copy…", suggestion);
+  nameIn.style.cssText += "flex:1;min-width:170px;";
+  wrap.appendChild(nameIn);
+
+  const cancel = () => { node.__svPresetMode = null; node.__svDupSource = null; node.__lflRender?.(); };
+  const apply = async () => {
+    const nn = nameIn.value.trim();
+    if (!nn) { svToast("Give the copy a name.", true); nameIn.focus(); return; }
+    if (nn === src) { svToast("Pick a different name for the copy.", true); nameIn.focus(); return; }
+    try {
+      const d = await svPresetApi("/duplicate", { name: src, newName: nn, category: catField.value() });
+      svPresets = d.presets || svPresets;
+      // Select the copy. The stack is untouched, so its clean/dirty state
+      // carries over unchanged — the copy has identical contents.
+      node.__svPresetName = d.name; node.__svPresetCat = catField.value();
+      node.__svPresetMode = null; node.__svDupSource = null;
+      svToast(`Duplicated as “${d.name}”`);
+      node.__lflRender?.();
+    } catch (err) {
+      svToast(err.code === "exists" ? `“${nn}” already exists — pick another name.` : String(err.message || err), true);
+      nameIn.focus();
+    }
+  };
+  hooks.submit = apply; hooks.cancel = cancel;
+  nameIn.addEventListener("keydown", e => { if (e.key === "Enter") apply(); if (e.key === "Escape") cancel(); });
+  const ok = svBtn("Duplicate", "Save the copy", apply); ok.style.padding = "3px 10px"; wrap.appendChild(ok);
+  const no = svBtn("Cancel", "", cancel); no.style.padding = "3px 10px"; wrap.appendChild(no);
+  setTimeout(() => { nameIn.focus(); nameIn.select(); }, 0);
+  return wrap;
+}
+
+function svPresetRenameForm(node, wrap) {
+  const tag = document.createElement("span"); tag.textContent = "RENAME";
+  tag.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};flex:none;`;
+  wrap.appendChild(tag);
+  const cats = [...new Set((svPresets || []).map(p => p.category).filter(Boolean))].sort();
+  const hooks = {};
+  const catField = svCategoryField(cats, node.__svPresetCat || "", hooks);
+  wrap.appendChild(catField.el);
+  const nameIn = svSmallInput("preset name…", node.__svPresetName || "");
+  nameIn.style.cssText += "flex:1;min-width:170px;";
+  wrap.appendChild(nameIn);
+  const cancel = () => { node.__svPresetMode = null; node.__lflRender?.(); };
+  const apply = async () => {
+    const nn = nameIn.value.trim();
+    if (!nn) { svToast("Give the preset a name.", true); return; }
+    try {
+      const d = await svPresetApi("/update", { name: node.__svPresetName, newName: nn, category: catField.value() });
+      svPresets = d.presets || svPresets;
+      // carry the favourite across a rename
+      const f = svPresetFavs();
+      if (f.has(node.__svPresetName) && d.name !== node.__svPresetName) {
+        f.delete(node.__svPresetName); f.add(d.name); savePrefs({ favoritePresets: [...f] });
+      }
+      node.__svPresetName = d.name; node.__svPresetCat = catField.value();
+      node.__svPresetMode = null;
+      svToast(`Renamed to “${d.name}”`);
+      node.__lflRender?.();
+    } catch (err) { svToast(String(err.message || err), true); }
+  };
+  hooks.submit = apply; hooks.cancel = cancel;
+  nameIn.addEventListener("keydown", e => { if (e.key === "Enter") apply(); if (e.key === "Escape") cancel(); });
+  const ok = svBtn("Rename", "", apply); ok.style.padding = "3px 10px"; wrap.appendChild(ok);
+  const no = svBtn("Cancel", "", cancel); no.style.padding = "3px 10px"; wrap.appendChild(no);
+  setTimeout(() => nameIn.focus(), 0);
+  return wrap;
+}
+
+function svPresetDeleteForm(node, wrap) {
+  const q = document.createElement("span");
+  q.textContent = `Delete preset “${node.__svPresetName}”?`;
+  q.style.cssText = `font-size:12px;color:${SV.danger};flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+  wrap.appendChild(q);
+  const yes = svBtn("Delete", "Delete permanently", async () => {
+    const name = node.__svPresetName;
+    try {
+      const d = await svPresetApi("/delete", { name });
+      svPresets = d.presets || [];
+      const f = svPresetFavs(); if (f.delete(name)) savePrefs({ favoritePresets: [...f] });
+      node.__svPresetName = ""; node.__svCleanSig = null; node.__svPresetMode = null;
+      svToast(`Deleted “${name}”`);
+      node.__lflRender?.();
+    } catch (err) { svToast(String(err.message || err), true); node.__svPresetMode = null; node.__lflRender?.(); }
+  });
+  yes.style.padding = "3px 10px"; yes.style.color = SV.danger; yes.style.borderColor = "#4a2a2a";
+  wrap.appendChild(yes);
+  const no = svBtn("Cancel", "", () => { node.__svPresetMode = null; node.__lflRender?.(); });
+  no.style.padding = "3px 10px"; wrap.appendChild(no);
+  return wrap;
+}
+
+// Plotter controls row: strength-mode segment, global-strengths editor, the
+// control-image toggle, and the Global Lora node spawn/connected state.
+function svPlotControlsRow(node, globalMode) {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;align-items:center;gap:7px;flex-wrap:wrap;";
+
+  const tag = document.createElement("span"); tag.textContent = "SWEEP";
+  tag.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};flex:none;`;
+  wrap.appendChild(tag);
+
+  // -- mode segment: Per-line | Global --
+  const seg = document.createElement("span"); seg.dataset.ctl = "1";
+  seg.style.cssText = `flex:none;display:inline-flex;border:1px solid ${SV.btnBorder};border-radius:6px;overflow:hidden;`;
+  const mkSeg = (label, mode, title) => {
+    const b = document.createElement("span");
+    const on = (node.__plotMode === "global") === (mode === "global");
+    b.textContent = label; b.title = title;
+    b.style.cssText = `padding:3px 10px;font-size:12px;cursor:pointer;user-select:none;` +
+      (on ? `background:${SV.btnBorder};color:${SV.text};` : `background:${SV.btn};color:${SV.mut};`);
+    b.addEventListener("pointerdown", e => e.stopPropagation());
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if ((node.__plotMode === "global") === (mode === "global")) return;
+      node.__plotMode = mode;
+      syncData(node); node.__lflRender?.(); node.setDirtyCanvas(true, true);
+    });
+    return b;
+  };
+  seg.appendChild(mkSeg("Per-line", "perline", "Each lora line sweeps at its own strength"));
+  seg.appendChild(mkSeg("Global", "global", "Every lora line runs once at each global strength"));
+  wrap.appendChild(seg);
+
+  // -- global strengths editor (only meaningful in global mode) --
+  const gs = node.__globalStrengths || [];
+  const gsBtn = svBtn(
+    "🎚 " + (gs.length ? gs.join(", ") : "set strengths…"),
+    globalMode ? "The strengths every lora is tested at (loras × strengths = images)" : "Switch to Global mode to use shared strengths",
+    (e) => { if (globalMode) showGlobalStrengthsPanel(node, e); }
+  );
+  gsBtn.style.padding = "3px 10px";
+  if (!globalMode) { gsBtn.style.opacity = ".4"; gsBtn.style.cursor = "default"; }
+  wrap.appendChild(gsBtn);
+
+  const sp = document.createElement("span"); sp.style.flex = "1"; wrap.appendChild(sp);
+
+  // -- control image toggle (disabled while a Global Lora node drives it) --
+  const glConnected = !!node.__globalLoraConnected;
+  const ctrl = document.createElement("span"); ctrl.dataset.ctl = "1";
+  const ctrlOn = !!node.__controlImage && !glConnected;
+  ctrl.style.cssText = `flex:none;display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:6px;font-size:12px;user-select:none;` +
+    (glConnected
+      ? `border:1px dashed ${SV.dashed};color:${SV.ghost};cursor:default;`
+      : `border:1px solid ${ctrlOn ? SV.accent : SV.btnBorder};background:${SV.btn};color:${ctrlOn ? SV.text : SV.mut};cursor:pointer;`);
+  const cd = document.createElement("span"); cd.textContent = "●";
+  cd.style.cssText = `font-size:11px;color:${glConnected ? SV.ghost : (ctrlOn ? SV.green : SV.mut)};`;
+  ctrl.appendChild(cd);
+  const cl = document.createElement("span");
+  cl.textContent = glConnected ? "Control via Global node" : "Control image";
+  ctrl.appendChild(cl);
+  ctrl.title = glConnected
+    ? "The connected Global Lora node decides the control images"
+    : "Adds one baseline image with no loras applied (the raw base model)";
+  if (!glConnected) {
+    ctrl.addEventListener("pointerdown", e => e.stopPropagation());
+    ctrl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      node.__controlImage = !node.__controlImage;
+      syncData(node); node.__lflRender?.(); node.setDirtyCanvas(true, true);
+    });
+  }
+  wrap.appendChild(ctrl);
+
+  // -- global lora spawn / status --
+  const gl = svBtn(
+    glConnected ? "🌐 Global Lora connected" : "🌐 Add Global Lora",
+    glConnected
+      ? "A Global Lora node is wired into global_loras — its loras apply on top of every image"
+      : "Adds a Global Lora node and wires it in; its loras apply on top of every plotted image",
+    () => { if (!glConnected) { try { spawnConnectedGlobalLora(node); } catch (err) { console.warn("[FantasticLoraLoader] add global lora failed", err); } } }
+  );
+  gl.style.padding = "3px 10px";
+  if (glConnected) { gl.style.opacity = ".55"; gl.style.cursor = "default"; }
+  wrap.appendChild(gl);
+
+  return wrap;
+}
+
+// Whether lora filenames keep their .safetensors/.ckpt/etc extension on screen.
+// Browser preference, shared by every node, like the theme.
+function svShowExt() { return !!FLL_PREFS.showExt; }
+function svSetShowExt(on) { savePrefs({ showExt: !!on }); repaintSlotNodes(); }
+// A lora's display filename, honouring the extension preference.
+function svFileLabel(name) {
+  const i = (name || "").lastIndexOf("/");
+  const file = i >= 0 ? name.slice(i + 1) : (name || "");
+  return svShowExt() ? file : file.replace(/\.(safetensors|ckpt|sft|pt|pth|gguf|bin)$/i, "");
+}
+
+// A strict fingerprint of everything a preset stores: the lora list (order,
+// strengths, enable states, routing, randomizer flags), the folder filter, and
+// the chain count. Load applies all three, so all three have to count towards
+// "modified" — otherwise changing the folder filter after loading would be
+// written silently on the next Save with no warning.
+function svStackSignature(stack) {
+  return JSON.stringify((stack || []).map(e => [
+    e.name || "", e.on !== false, Number(e.model ?? 1),
+    e.targets && typeof e.targets === "object"
+      ? Object.keys(e.targets).sort().map(k => [k, Number(e.targets[k])])
+      : null,
+    !!e.random, !!e.locked, !!e.autoRoll,
+  ]));
+}
+
+function svStateSignature(node) {
+  let folders = null;
+  try {
+    const arr = effectiveEnabledFoldersArray(node);
+    folders = arr == null ? null : [...arr].map(normPath).sort();
+  } catch (_) {}
+  let chains = 1;
+  try { chains = flgChainCount(node); } catch (_) {}
+  return JSON.stringify([svStackSignature(node.__loraStack), folders, chains]);
+}
+
+function svMarkClean(node, name, category) {
+  node.__svPresetName = name || "";
+  node.__svPresetCat = category || "";
+  node.__svCleanSig = svStateSignature(node);
+}
+function svIsDirty(node) {
+  // No preset selected, or one selected but never loaded/saved: there's no
+  // baseline to differ from, so nothing is "modified".
+  if (!node.__svPresetName || node.__svCleanSig == null) return false;
+  return node.__svCleanSig !== svStateSignature(node);
+}
+
+// Merge a preset's loras into the current stack without disturbing anything
+// else. Skips loras already present, clamps routing to the chains that exist,
+// and stops at the slot cap.
+function svMergeIntoStack(node, loras) {
+  const stack = node.__loraStack || (node.__loraStack = []);
+  const chains = flgChainCount(node);
+  const have = new Set(stack.filter(e => !e.random && e.name).map(e => e.name));
+  let added = 0, dupes = 0, dropped = 0, retargeted = 0;
+
+  for (const src of (loras || [])) {
+    if (!src || typeof src !== "object") continue;
+    if (stack.length >= SLOT_MAX) { dropped++; continue; }
+    if (!src.random && src.name && have.has(src.name)) { dupes++; continue; }
+
+    const strength = Number(src.model ?? 1);
+    const e = { on: src.on !== false, name: src.name || "", model: strength, clip: strength };
+
+    // Routing: keep only chains that exist here. Chains the preset never
+    // mentioned default to 1.0 rather than being left unrouted.
+    if (src.targets && typeof src.targets === "object") {
+      const t = {};
+      let kept = 0;
+      for (const k of Object.keys(src.targets)) {
+        const c = Number(k);
+        if (c >= 1 && c <= chains) { t[c] = Number(src.targets[k]); kept++; }
+      }
+      if (!kept) { retargeted++; }        // nothing survived -> uniform
+      else {
+        for (let c = 1; c <= chains; c++) if (t[c] == null) { t[c] = 1.0; retargeted++; }
+        e.targets = t;
+      }
+    }
+
+    if (src.random) {
+      e.random = true; e.locked = !!src.locked; e.autoRoll = !!src.autoRoll;
+      e.folders = Array.isArray(src.folders) ? src.folders : null;
+    } else if (src.name) {
+      have.add(src.name);
+    }
+    stack.push(e); added++;
+  }
+  return { added, dupes, dropped, retargeted };
+}
+
+function svSlotRows(node) { return Math.ceil(SLOT_MAX / SLOT_COLS); }
+const SV_SLOT_H = 60, SV_GAP = 7;
+
+// The DOM widget's height. A static estimate can't account for fonts/wrapping,
+// so renderSlotView measures the real panel after paint and stores it here;
+// the estimate is only used for the very first layout pass.
+function svViewHeight(node) {
+  if (node.__svMeasuredH) return node.__svMeasuredH;
+  const chains = flgChainCount(node);
+  const rows = svSlotRows(node);
+  const grid = rows * SV_SLOT_H + (rows - 1) * SV_GAP;
+  const isPlot = !!node.__isPlotter;
+  const strip = 34, second = 33, folders = 35, header = 19, chrome = 24;
+  const extra = isPlot ? 33 : 0;                 // plotter has sweep AND preset rows
+  const footer = 24 + 14 + chains * 15 + (isPlot ? 15 : 0);   // plotter adds the sweep-count line
+  return strip + second + extra + folders + header + grid + footer + chrome;
+}
+
+function renderSlotView(node, root) {
+  root.textContent = "";
+  root.style.cssText = "display:flex;flex-direction:column;gap:0;font:12px Arial,sans-serif;color:#ddd;width:100%;box-sizing:border-box;padding:2px 0;";
+  const stack = node.__loraStack || (node.__loraStack = []);
+  const chains = flgChainCount(node);
+  const maxChains = 1 + MAX_EXTRA_MODELS;
+  const isPlot = !!node.__isPlotter;
+  const globalMode = isPlot && node.__plotMode === "global";
+
+  const panel = document.createElement("div");
+  panel.style.cssText = `background:${SV.panel};border:1px solid ${SV.border};border-radius:8px;padding:9px;box-sizing:border-box;`;
+  root.appendChild(panel);
+
+  // ---- top strip ----
+  const strip = document.createElement("div");
+  strip.style.cssText = "display:flex;align-items:center;gap:7px;margin-bottom:8px;";
+  const addBtn = svBtn("Add lora…", stack.length >= SLOT_MAX ? "All 12 slots are full" : "Pick a lora from the enabled folders", (e) => {
+    if (stack.length >= SLOT_MAX) return;
+    showLoraChooser(node, e, value => { stack.push({ on: true, name: value, model: 1.0, clip: 1.0 }); node.__lflCommit(); });
+  });
+  if (stack.length >= SLOT_MAX) { addBtn.style.opacity = ".4"; addBtn.style.cursor = "default"; }
+  strip.appendChild(addBtn);
+  const rndBtn = svBtn("🎲 Add random", stack.length >= SLOT_MAX ? "All 12 slots are full" : "Add a randomizer slot", async () => {
+    if (stack.length >= SLOT_MAX) return;
+    const ne = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, autoRoll: false, folders: null };
+    const pick = await pickRandomLora(node, ne); if (pick != null) ne.name = pick;
+    stack.push(ne); node.__lflCommit();
+  });
+  if (stack.length >= SLOT_MAX) { rndBtn.style.opacity = ".4"; rndBtn.style.cursor = "default"; }
+  strip.appendChild(rndBtn);
+  const sp = document.createElement("span"); sp.style.flex = "1"; strip.appendChild(sp);
+  const cnt = document.createElement("span");
+  cnt.textContent = `${stack.length} / ${SLOT_MAX}`;
+  cnt.style.cssText = `font:11px ui-monospace,monospace;color:${SV.mut};flex:none;`;
+  strip.appendChild(cnt);
+  const sdot = document.createElement("span"); sdot.textContent = "·"; sdot.style.cssText = `color:${SV.mut};flex:none;`; strip.appendChild(sdot);
+  const ch = document.createElement("span");
+  ch.innerHTML = `chains <span style="font-family:ui-monospace,monospace;color:${SV.dim}">${chains}/${maxChains}</span>`;
+  ch.style.cssText = `font-size:11px;color:${SV.mut};flex:none;`;
+  strip.appendChild(ch);
+  const minus = svBtn("−", "Remove last chain", () => { if (chains > 1) removeModelPair(node); });
+  minus.style.padding = "1px 7px"; if (chains <= 1) { minus.style.opacity = ".35"; minus.style.cursor = "default"; }
+  strip.appendChild(minus);
+  const plus = svBtn("+", "Add a model chain", () => { if (chains < maxChains) addModelPair(node); });
+  plus.style.padding = "1px 7px"; if (chains >= maxChains) { plus.style.opacity = ".35"; plus.style.cursor = "default"; }
+  strip.appendChild(plus);
+  strip.appendChild(svExtButton());
+  strip.appendChild(svThemeButton());
+  panel.appendChild(strip);
+
+  // ---- folder chip bar ----
+  // ---- preset row (loader) / plot controls (plotter) ----
+  if (!isPlot) {
+    const pr = svPresetRow(node);
+    pr.style.marginBottom = "7px";
+    panel.appendChild(pr);
+  } else {
+    const pc = svPlotControlsRow(node, globalMode);
+    pc.style.marginBottom = "6px";
+    panel.appendChild(pc);
+    const pr = svPresetRow(node);
+    pr.style.marginBottom = "7px";
+    panel.appendChild(pr);
+  }
+
+  const fb = svFolderBar(node);
+  fb.style.marginBottom = "9px";
+  panel.appendChild(fb);
+
+  // ---- section header ----
+  const sh = document.createElement("div");
+  sh.style.cssText = "display:flex;align-items:baseline;gap:8px;margin:0 2px 5px;";
+  const st = document.createElement("span"); st.textContent = "LORAS";
+  st.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};`;
+  sh.appendChild(st);
+  const ss = document.createElement("span"); ss.style.flex = "1"; sh.appendChild(ss);
+  const sc = document.createElement("span"); sc.textContent = `${stack.length}/${SLOT_MAX}`;
+  sc.style.cssText = `font:11px ui-monospace,monospace;color:${SV.faint};`;
+  sh.appendChild(sc);
+  panel.appendChild(sh);
+
+  // ---- slot grid ----
+  const grid = document.createElement("div");
+  grid.style.cssText = `display:grid;grid-template-columns:repeat(${SLOT_COLS},minmax(0,1fr));gap:${SV_GAP}px;`;
+  panel.appendChild(grid);
+  const slotEls = [];
+
+  const fillChip = (e, idx) => {
+    const isOn = e.on !== false;
+    const cell = document.createElement("div");
+    cell.dataset.slot = String(idx);
+    cell.style.cssText = `border:1px ${isOn ? "solid" : "dashed"} ${e.random ? SV.purpleBorder : SV.border2};border-radius:6px;background:${SV.inset};` +
+      `height:${SV_SLOT_H}px;box-sizing:border-box;padding:5px 8px;display:flex;flex-direction:column;justify-content:center;gap:3px;${isOn ? "" : "opacity:.45;"}`;
+
+    const fol = (e.name || "").includes("/") ? e.name.slice(0, e.name.lastIndexOf("/") + 1) : "";
+    const fil = e.name ? svFileLabel(e.name) : "random";
+    const routed = svChainsRouted(e, chains);
+
+    // ---- row 1: power · order · folder path · M-tags · ⋮ ----
+    const r1 = document.createElement("div");
+    r1.style.cssText = "display:flex;align-items:center;gap:6px;min-width:0;";
+    const dot = document.createElement("span"); dot.dataset.ctl = "1"; dot.textContent = "●";
+    dot.title = isOn ? "Enabled — click to disable" : "Disabled — click to enable";
+    dot.style.cssText = `cursor:pointer;font-size:17px;line-height:1;color:${isOn ? SV.green : SV.mut};flex:none;user-select:none;padding:0 1px;`;
+    dot.addEventListener("mouseenter", () => dot.style.color = isOn ? SV.greenHov : SV.dim);
+    dot.addEventListener("mouseleave", () => dot.style.color = isOn ? SV.green : SV.mut);
+    dot.addEventListener("pointerdown", ev => ev.stopPropagation());
+    dot.addEventListener("click", (ev) => { ev.stopPropagation(); e.on = !isOn; node.__lflCommit(); });
+    r1.appendChild(dot);
+
+    const ob = document.createElement("span"); ob.textContent = String(idx + 1);
+    ob.title = "Apply order (slot order) — drag the chip to reorder";
+    ob.style.cssText = `flex:none;width:16px;height:16px;border-radius:4px;background:${SV.badgeBg};color:${SV.badgeFg};font:10px ui-monospace,monospace;display:inline-flex;align-items:center;justify-content:center;`;
+    r1.appendChild(ob);
+
+    const fp = document.createElement("span");
+    fp.textContent = e.random ? ("🎲 random" + (fol ? " · " + fol : "")) : (fol || "—");
+    fp.title = e.name || "";
+    fp.style.cssText = `flex:1;min-width:0;font-size:10px;color:${e.random ? SV.purple : SV.faint};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+    r1.appendChild(fp);
+
+    const tags = document.createElement("span");
+    tags.style.cssText = "flex:none;display:flex;gap:3px;align-items:center;";
+    // The plotter applies every lora to every connected model, so its tags show
+    // the chains rather than a per-lora routing choice.
+    const tagChains = isPlot ? Array.from({ length: chains }, (_, i) => i + 1) : routed;
+    tags.innerHTML = tagChains.map(c => `<span style="font:10px ui-monospace,monospace;color:${SV_CHAIN_TEXT[c] || SV.dim};border:1px solid ${SV_CHAIN_BORDER[c] || SV.border2};border-radius:3px;padding:0 3px;">M${c}</span>`).join("") +
+      (!isPlot && routed.length === 0 ? `<span style="font-size:10px;color:${SV.ghost};font-style:italic;">off</span>` : "") +
+      (e.random && e.autoRoll ? `<span style="font-size:10px;color:${SV.purple};border:1px solid ${SV.purpleBorder};border-radius:3px;padding:0 3px;">auto</span>` : "");
+    if (isPlot) tags.title = "Swept against every connected model";
+    r1.appendChild(tags);
+
+    // Randomizer chips get a dice + lock right on the chip — no need to open
+    // the modal just to reroll. Locked slots never re-roll, by dice or auto.
+    if (e.random) {
+      const dice = document.createElement("span"); dice.dataset.ctl = "1";
+      dice.textContent = "🎲";
+      dice.title = e.locked ? "Locked — unlock to reroll" : "Roll a new random lora now";
+      dice.style.cssText = `flex:none;cursor:${e.locked ? "default" : "pointer"};font-size:13px;line-height:1;padding:0 1px;user-select:none;` +
+        (e.locked ? "opacity:.3;" : "opacity:.8;");
+      if (!e.locked) {
+        dice.addEventListener("mouseenter", () => dice.style.opacity = "1");
+        dice.addEventListener("mouseleave", () => dice.style.opacity = ".8");
+        dice.addEventListener("pointerdown", ev => ev.stopPropagation());
+        dice.addEventListener("click", async (ev) => {
+          ev.stopPropagation(); hideTip();
+          if (e.locked) return;
+          const pick = await pickRandomLora(node, e);
+          if (pick != null) { e.name = pick; node.__lflCommit(); }
+          else svToast("No loras available in this slot's folder scope.", true);
+        });
+      }
+      r1.appendChild(dice);
+
+      const lk = document.createElement("span"); lk.dataset.ctl = "1";
+      lk.textContent = e.locked ? "🔒" : "🔓";
+      lk.title = e.locked ? "Locked — won't re-roll. Click to unlock." : "Unlocked — click to lock this pick.";
+      lk.style.cssText = `flex:none;cursor:pointer;font-size:12px;line-height:1;padding:0 1px;user-select:none;` +
+        (e.locked ? "" : "opacity:.45;");
+      lk.addEventListener("mouseenter", () => { if (!e.locked) lk.style.opacity = ".8"; });
+      lk.addEventListener("mouseleave", () => { if (!e.locked) lk.style.opacity = ".45"; });
+      lk.addEventListener("pointerdown", ev => ev.stopPropagation());
+      lk.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        e.locked = !e.locked;
+        if (e.locked) e.autoRoll = false;   // a frozen line can't auto-roll
+        node.__lflCommit();
+      });
+      r1.appendChild(lk);
+    }
+    const cog = document.createElement("span"); cog.dataset.ctl = "1"; cog.textContent = "⚙";
+    cog.title = "Options" + (node.__isPlotter ? "" : ": model routing, per-chain strengths") + (e.random ? ", randomizer" : "");
+    cog.style.cssText = `cursor:pointer;color:${SV.cog};font-size:16px;line-height:1;padding:0 1px;flex:none;user-select:none;`;
+    cog.addEventListener("mouseenter", () => cog.style.color = SV.cogHov);
+    cog.addEventListener("mouseleave", () => cog.style.color = SV.cog);
+    cog.addEventListener("pointerdown", ev => ev.stopPropagation());
+    cog.addEventListener("click", (ev) => { ev.stopPropagation(); hideTip(); svShowLoraModal(node, e); });
+    r1.appendChild(cog);
+    const grip = document.createElement("span"); grip.dataset.grip = "1"; grip.textContent = "☰";
+    grip.title = "Drag to reorder";
+    grip.style.cssText = `cursor:grab;color:${SV.mut};font-size:13px;line-height:1;padding:0 1px;flex:none;user-select:none;`;
+    grip.addEventListener("mouseenter", () => grip.style.color = SV.text);
+    grip.addEventListener("mouseleave", () => grip.style.color = SV.mut);
+    r1.appendChild(grip);
+    const rm = document.createElement("span"); rm.dataset.ctl = "1"; rm.textContent = "✕";
+    rm.title = "Remove this lora";
+    rm.style.cssText = `cursor:pointer;color:${SV.danger};font-size:13px;line-height:1;padding:0 2px;flex:none;user-select:none;`;
+    rm.addEventListener("mouseenter", () => rm.style.color = SV.dangerHov);
+    rm.addEventListener("mouseleave", () => rm.style.color = SV.danger);
+    rm.addEventListener("pointerdown", ev => ev.stopPropagation());
+    rm.addEventListener("click", (ev) => {
+      ev.stopPropagation(); hideTip();
+      const i = stack.indexOf(e);
+      if (i >= 0) { stack.splice(i, 1); node.__lflCommit(); }
+    });
+    r1.appendChild(rm);
+    // Strength sits last on the top row: pinned to the right edge, so adding
+    // M-tags or other icons never moves it, and the whole bottom row is free
+    // for the lora name.
+    const sIn = svStrengthInput(Number(e.model ?? 1), (v) => { svSetBaseStrength(e, v); node.__lflCommit(); }, true, globalMode);
+    if (globalMode) {
+      if (sIn.__input) sIn.__input.disabled = true;
+      sIn.style.opacity = ".35";
+      sIn.title = "Per-line strength ignored — Global strengths are in use";
+    }
+    r1.appendChild(sIn);
+    cell.appendChild(r1);
+
+    // ---- row 2: lora name (full width) · strength ----
+    const r2 = document.createElement("div");
+    r2.style.cssText = "display:flex;align-items:center;gap:8px;min-width:0;";
+    const nm = document.createElement("div"); nm.dataset.ctl = "1";
+    nm.textContent = fil;
+    nm.style.cssText = `flex:1;min-width:0;font-size:12.5px;color:${isOn ? SV.text : SV.dim};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;${isOn ? "" : "text-decoration:line-through;"}`;
+    nm.title = e.random ? (e.name || "not rolled yet") + " — click for randomizer options" : (e.name || "") + " — click to swap";
+    nm.addEventListener("pointerdown", ev => ev.stopPropagation());
+    nm.addEventListener("click", (ev) => {
+      ev.stopPropagation(); hideTip();
+      if (e.random) svShowLoraModal(node, e);
+      else showLoraChooser(node, ev, value => { e.name = value; node.__lflCommit(); });
+    });
+    r2.appendChild(nm);
+    cell.appendChild(r2);
+
+    // Drag to reorder — only from the ☰ grip.
+    grip.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      const fromIdx = idx;
+      let moved = false, targetIdx = fromIdx;
+      grip.style.cursor = "grabbing";
+      cell.style.opacity = ".75"; cell.style.outline = `1px solid ${SV.accent}`;
+      const clear = () => slotEls.forEach(s => { if (s !== cell) s.style.outline = ""; });
+      const mv = (e2) => {
+        moved = true;
+        clear(); targetIdx = fromIdx;
+        for (let i = 0; i < slotEls.length; i++) {
+          const rct = slotEls[i].getBoundingClientRect();
+          if (e2.clientX >= rct.left && e2.clientX <= rct.right && e2.clientY >= rct.top && e2.clientY <= rct.bottom) {
+            targetIdx = Math.min(i, stack.length - 1);
+            if (i !== fromIdx) slotEls[i].style.outline = `1px dashed ${SV.accent}`;
+            break;
+          }
+        }
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", mv); window.removeEventListener("pointerup", up);
+        clear();
+        if (moved && targetIdx !== fromIdx) {
+          const [it] = stack.splice(fromIdx, 1);
+          stack.splice(targetIdx, 0, it);
+        }
+        node.__lflCommit();
+      };
+      window.addEventListener("pointermove", mv); window.addEventListener("pointerup", up);
+    });
+
+    // The chip body is inert: options live on the ⚙, reordering on the ☰ grip.
+    // Clicking the body used to open the modal, which fired on every stray
+    // click while aiming for a control.
+    cell.addEventListener("pointerdown", (ev) => {
+      if (ev.target.closest("[data-ctl],[data-grip]")) return;
+      ev.stopPropagation();
+    });
+    return cell;
+  };
+
+  for (let i = 0; i < SLOT_MAX; i++) {
+    let cell;
+    if (i < stack.length) cell = fillChip(stack[i], i);
+    else {
+      cell = document.createElement("div");
+      cell.dataset.slot = String(i);
+      cell.style.cssText = `border:1px dashed ${SV.dashed};border-radius:6px;background:${SV.slotEmpty};height:${SV_SLOT_H}px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;cursor:pointer;`;
+      const lb = document.createElement("span"); lb.textContent = "lora " + (i + 1);
+      lb.style.cssText = `font-size:11px;color:${SV.ghost};`;
+      cell.appendChild(lb);
+      cell.title = "Click to add a lora in this slot";
+      cell.addEventListener("mouseenter", () => { cell.style.borderColor = SV.accent; lb.style.color = SV.badgeFg; });
+      cell.addEventListener("mouseleave", () => { cell.style.borderColor = SV.dashed; lb.style.color = SV.ghost; });
+      cell.addEventListener("pointerdown", ev => ev.stopPropagation());
+      cell.addEventListener("click", (ev) => {
+        ev.stopPropagation(); hideTip();
+        showLoraChooser(node, ev, value => { stack.push({ on: true, name: value, model: 1.0, clip: 1.0 }); node.__lflCommit(); });
+      });
+    }
+    slotEls.push(cell);
+    grid.appendChild(cell);
+  }
+
+  // ---- footer: sweep summary (plotter) / load order (loader) ----
+  const foot = document.createElement("div");
+  foot.style.cssText = `margin-top:9px;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;padding:7px 10px;`;
+  const fh = document.createElement("div");
+  fh.textContent = isPlot ? "SWEEP" : "LOAD ORDER SENT TO EACH CHAIN";
+  fh.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};margin-bottom:3px;`;
+  foot.appendChild(fh);
+  if (isPlot) {
+    const lines = stack.filter(e => e.on !== false).length;
+    const gs = node.__globalStrengths || [];
+    const perLora = globalMode ? gs.length : 1;
+    const cells = lines * perLora;
+    const ctrl = (!node.__globalLoraConnected && node.__controlImage) ? 1 : 0;
+    const l1 = document.createElement("div");
+    l1.style.cssText = `font:11px ui-monospace,monospace;color:${SV.dim};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+    if (!lines) l1.innerHTML = `<span style="color:${SV.ghost}">no lora lines yet</span>`;
+    else if (globalMode && !gs.length) l1.innerHTML = `${lines} lora line${lines === 1 ? "" : "s"} × <span style="color:${SV.danger}">no global strengths set</span>`;
+    else l1.textContent = `${lines} lora line${lines === 1 ? "" : "s"} × ${perLora} strength${perLora === 1 ? "" : "s"}` +
+      ` = ${cells} image${cells === 1 ? "" : "s"}` + (ctrl ? " + 1 control" : "") +
+      (chains > 1 ? `  ·  ×${chains} model chains` : "");
+    foot.appendChild(l1);
+    // Which models the sweep runs against — the plotter has no per-lora
+    // routing, so this belongs on the panel rather than on every chip.
+    for (let c = 1; c <= chains; c++) {
+      const ml = document.createElement("div");
+      ml.style.cssText = `font:11px ui-monospace,monospace;color:${SV.dim};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;`;
+      const resolved = flgModelLabel(node, c);
+      ml.innerHTML = `<span style="color:${SV_CHAIN_TEXT[c] || SV.dim}">M${c}:</span> ` +
+        (resolved ? flgEscape(resolved) : `<span style="color:${SV.ghost};font-style:italic">not connected</span>`);
+      foot.appendChild(ml);
+    }
+    panel.appendChild(foot);
+    svMeasurePanel(node, panel);
+    return;
+  }
+  for (let c = 1; c <= chains; c++) {
+    const names = stack.filter(e => e.on !== false && svChainStrength(e, c) != null)
+      .map(e => (e.random ? "🎲" : "") + (e.name ? svFileLabel(e.name) : "random"));
+    const line = document.createElement("div");
+    line.style.cssText = `font:11px ui-monospace,monospace;color:${SV.dim};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+    line.innerHTML = `<span style="color:${SV_CHAIN_TEXT[c] || SV.dim}">M${c}:</span> ` + (names.length ? names.map(flgEscape).join(" → ") : `<span style="color:${SV.ghost}">nothing routed</span>`);
+    foot.appendChild(line);
+  }
+  panel.appendChild(foot);
+  svMeasurePanel(node, panel);
+}
+
+// Measure what actually rendered and correct the node height. Static estimates
+// drift with fonts/wrapping (which is what made the panel overflow the node's
+// bottom edge). offsetHeight, NOT getBoundingClientRect: both renderers
+// CSS-transform the DOM-widget container by the canvas zoom, so a rect
+// measurement returns zoom-scaled pixels; offsetHeight is layout px.
+function svMeasurePanel(node, panel) {
+  requestAnimationFrame(() => {
+    try {
+      if (!panel.isConnected) return;
+      const h = panel.offsetHeight + 8;
+      if (h <= 8) return;                       // not laid out yet
+      const needW = node.size[0] < SV_MIN_W;
+      const needH = Math.abs((node.__svMeasuredH || 0) - h) > 2;
+      if (!needW && !needH) return;
+      if (needH) node.__svMeasuredH = h;
+      const want = node.computeSize();
+      node.setSize([Math.max(node.size[0], SV_MIN_W), want[1]]);
+      node.setDirtyCanvas(true, true);
+    } catch (_) {}
+  });
+}
 
 function buildCoreUI(node) {
   hideWidget(node, getDataWidget(node));
   loadStackFromData(node);
+  const cls = node.comfyClass || node.type;
+  const isLoader = cls === MULTI_NODE_NAME;
+  const isPlotterNode = cls === PLOT_NODE_NAME;
+  const isSlotNode = isLoader || isPlotterNode;   // both use the slot panel
+  // Nodes that get the chip folder bar as their own DOM widget above the rows.
+  // (Slot-panel nodes host the same bar inside their panel instead.)
+  const isBarNode = cls === GLOBAL_NODE_NAME;
+  if (isSlotNode) node.__lflView = "slots";
 
-  const folderBtn = node.addWidget("button", "lfl_folders", null, (_v, _c, _n, _p, event) => showFolderFilterPanel(node, event));
-  folderBtn.serialize = false; if (folderBtn.options) folderBtn.options.serialize = false; folderBtn.serializeValue = () => undefined;
-  node.__plffUpdateFolderBtn = () => { folderBtn.label = `📁 Folders: ${folderButtonSuffix(node)}`; node.setDirtyCanvas(true, false); };
+  // Every node now uses the chip combobox, so the old node-wide folder tree
+  // button is never created. Creating-then-hiding it is not enough under
+  // Nodes 2.0, where a hidden widget can still occupy layout and intercept
+  // clicks meant for the UI underneath.
+  let addBtn = null;
+
+  if (isBarNode) {
+    const fbDom = document.createElement("div");
+    fbDom.style.cssText = "padding:2px 0 4px;box-sizing:border-box;width:100%;";
+    node.__lflFolderBarEl = fbDom;
+    const fbW = node.addDOMWidget("lfl_folderbar", "div", fbDom, { serialize: false });
+    fbW.serializeValue = () => undefined;
+    fbW.computeSize = function (width) { return [width, 30]; };
+    node.__lflRenderFolderBar = () => {
+      if (!node.__lflFolderBarEl) return;
+      node.__lflFolderBarEl.textContent = "";
+      node.__lflFolderBarEl.appendChild(svFolderBar(node));
+    };
+    node.__lflRenderFolderBar();
+  }
+
+  node.__plffUpdateFolderBtn = () => {
+    if (isSlotNode) node.__lflRender?.();
+    if (isBarNode) node.__lflRenderFolderBar?.();
+    node.setDirtyCanvas(true, false);
+  };
   node.__plffUpdateFolderBtn(); getLoraFiles().then(() => node.__plffUpdateFolderBtn());
 
   const dom = buildRowDOM(node);
   const domWidget = node.addDOMWidget("lfl_rows", "div", dom, { serialize: false });
   domWidget.serializeValue = () => undefined;
   domWidget.computeSize = function (width) {
+    if (node.__lflView === "slots") {
+      return [width, svViewHeight(node)];
+    }
     const rows = node.__loraStack?.length || 0;
     return [width, rows === 0 ? 28 : rows * 26 + 6];
   };
 
-  const addBtn = node.addWidget("button", "lfl_add", null, (_v, _c, _n, _p, event) => {
-    showLoraChooser(node, event, value => { node.__loraStack.push({ on: true, name: value, model: 1.0, clip: 1.0 }); node.__lflCommit(); });
-  });
-  addBtn.label = "➕ Add Lora"; addBtn.serialize = false;
-  if (addBtn.options) addBtn.options.serialize = false; addBtn.serializeValue = () => undefined;
+  if (!isSlotNode) {
+    addBtn = node.addWidget("button", "lfl_add", null, (_v, _c, _n, _p, event) => {
+      showLoraChooser(node, event, value => { node.__loraStack.push({ on: true, name: value, model: 1.0, clip: 1.0 }); node.__lflCommit(); });
+    });
+    addBtn.label = "➕ Add Lora"; addBtn.serialize = false;
+    if (addBtn.options) addBtn.options.serialize = false; addBtn.serializeValue = () => undefined;
+  } else {
+    if (!node.size || node.size[0] < SV_MIN_W) node.size = [Math.max(node.size?.[0] || 0, SV_MIN_W), node.size?.[1] || 0];
+  }
 }
 
 // ===========================================================================
 // Single-model node UI
 // ===========================================================================
-
-function addUI(node) {
-  if (node.__lflBuilt) return;
-  node.__lflBuilt = true;
-  buildCoreUI(node);
-
-  // 🎲 Add Lora Randomizer — single-model node only (for now)
-  const randBtn = node.addWidget("button", "lfl_add_rand", null, async () => {
-    const entry = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, folders: null };
-    const pick = await pickRandomLora(node, entry);
-    if (pick != null) entry.name = pick;
-    node.__loraStack.push(entry);
-    node.__lflCommit();
-  });
-  randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
-  if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
-
-  node.__lflLastRandCount = (node.__loraStack || []).filter(e => e.random).length;
-  snapHeight(node);
-}
 
 // ===========================================================================
 // Global Lora node UI — stack (no randomizer) + two control toggles
@@ -940,20 +2911,11 @@ function addGlobalLoraUI(node) {
 function updatePlotterControlState(node) {
   const gIn = (node.inputs || []).find(i => i?.name === "global_loras");
   const connected = !!(gIn && gIn.link != null);
+  const changed = node.__globalLoraConnected !== connected;
   node.__globalLoraConnected = connected;
-  const w = node.__lflPlotControlBtn;
-  if (w) {
-    if (connected) { node.__controlImage = false; w.value = false; w.disabled = true; }
-    else { w.disabled = false; w.value = !!node.__controlImage; }
-  }
-  if (node.__lflAddGlobalBtn) {
-    node.__lflAddGlobalBtn.disabled = connected;
-    node.__lflAddGlobalBtn.label = connected
-      ? "\uD83C\uDF10 Global Lora node connected"
-      : "\uD83C\uDF10 Add Global Lora node";
-  }
-  updatePlotterLabels(node);
+  if (connected) node.__controlImage = false;   // control is driven from the Global node
   syncData(node);
+  if (changed) node.__lflRender?.();            // panel shows connected/disabled states
   node.setDirtyCanvas(true, true);
 }
 
@@ -965,12 +2927,16 @@ function stripAutoExtraSlots(node) {
   for (let i = node.inputs.length - 1; i >= 0; i--)
     if (/^model_[2-5]$/.test(node.inputs[i]?.name)) node.removeInput(i);
   for (let i = node.outputs.length - 1; i >= 0; i--)
-    if (/^MODEL [2-5]$/.test(node.outputs[i]?.name)) node.removeOutput(i);
+    if (/^(MODEL|CLIP) [2-5]$/.test(node.outputs[i]?.name)) node.removeOutput(i);
 }
 
 function countExtraModelInputs(node) {
   return node.inputs.filter(i => /^model_[2-5]$/.test(i?.name)).length;
 }
+
+// The loader emits a patched CLIP per chain (all from the single CLIP input);
+// the plotter (shares this UI) is model-only on the extra outputs.
+const nodeUsesClipChains = (node) => (node?.comfyClass || node?.type) === MULTI_NODE_NAME;
 
 function addModelPair(node) {
   const count = countExtraModelInputs(node);
@@ -978,25 +2944,27 @@ function addModelPair(node) {
   const n = count + 2;
   node.addInput(`model_${n}`, "MODEL");
   node.addOutput(`MODEL ${n}`, "MODEL");
+  if (nodeUsesClipChains(node)) node.addOutput(`CLIP ${n}`, "CLIP");
   node.properties.extra_model_count = count + 1;
-  updateModelBar(node); snapHeight(node); node.setDirtyCanvas(true, true);
+  updateModelBar(node); node.__lflRender?.(); snapHeight(node); node.setDirtyCanvas(true, true);
 }
 
 function removeModelPair(node) {
   const count = countExtraModelInputs(node);
   if (count <= 0) return;
-  let li = -1; for (let i = node.inputs.length - 1; i >= 0; i--) { if (/^model_[2-5]$/.test(node.inputs[i]?.name)) { li = i; break; } }
-  if (li !== -1) node.removeInput(li);
-  let lo = -1; for (let i = node.outputs.length - 1; i >= 0; i--) { if (/^MODEL [2-5]$/.test(node.outputs[i]?.name)) { lo = i; break; } }
-  if (lo !== -1) node.removeOutput(lo);
+  const dropInput = (re) => { for (let i = node.inputs.length - 1; i >= 0; i--) { if (re.test(node.inputs[i]?.name)) { node.removeInput(i); return; } } };
+  const dropOutput = (re) => { for (let i = node.outputs.length - 1; i >= 0; i--) { if (re.test(node.outputs[i]?.name)) { node.removeOutput(i); return; } } };
+  dropInput(/^model_[2-5]$/);
+  dropOutput(/^CLIP [2-5]$/);
+  dropOutput(/^MODEL [2-5]$/);
   node.properties.extra_model_count = count - 1;
-  updateModelBar(node); snapHeight(node); node.setDirtyCanvas(true, true);
+  updateModelBar(node); node.__lflRender?.(); snapHeight(node); node.setDirtyCanvas(true, true);
 }
 
 function updateModelBar(node) {
   if (!node.__lflModelBarEl) return;
   const count = countExtraModelInputs(node);
-  node.__lflModelBarEl.querySelector(".lfl-mbar-count").textContent = `Model paths: ${count + 1} / ${MAX_EXTRA_MODELS + 1}`;
+  node.__lflModelBarEl.querySelector(".lfl-mbar-count").textContent = `Chains: ${count + 1} / ${MAX_EXTRA_MODELS + 1}`;
   node.__lflModelBarEl.querySelector(".lfl-mbar-add").style.opacity = count >= MAX_EXTRA_MODELS ? ".3" : ".8";
   node.__lflModelBarEl.querySelector(".lfl-mbar-rem").style.opacity = count <= 0 ? ".3" : ".8";
 }
@@ -1014,8 +2982,8 @@ function buildModelBar(node) {
     b.addEventListener("click", fn); b.addEventListener("pointerdown", e => e.stopPropagation());
     bar.appendChild(b); return b;
   };
-  mkBtn("lfl-mbar-add", "➕", "Add a model path", () => addModelPair(node));
-  mkBtn("lfl-mbar-rem", "➖", "Remove last model path", () => removeModelPair(node));
+  mkBtn("lfl-mbar-add", "➕", "Add a model + clip chain", () => addModelPair(node));
+  mkBtn("lfl-mbar-rem", "➖", "Remove last chain", () => removeModelPair(node));
   node.__lflModelBarEl = bar; return bar;
 }
 
@@ -1208,29 +3176,39 @@ function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
   stripAutoExtraSlots(node);
   buildCoreUI(node);
 
-  // 🎲 Add Lora Randomizer (same as single-model node)
-  const randBtn = node.addWidget("button", "lfl_add_rand", null, async () => {
-    const entry = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, autoRoll: false, folders: null };
-    const pick = await pickRandomLora(node, entry);
-    if (pick != null) entry.name = pick;
-    node.__loraStack.push(entry);
-    node.__lflCommit();
-  });
-  randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
-  if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
+  // Slot-panel nodes (loader + plotter) host these controls inside the panel.
+  const isSlotLoader = ((node.comfyClass || node.type) === MULTI_NODE_NAME) || isPlotter;
 
-  // Plotter-only: strength-mode toggle + global-strengths popup.
-  if (isPlotter) addPlotterControls(node);
+  // 🎲 Add Lora Randomizer (same as single-model node). The slot-grid loader has
+  // its own in-panel button, so it never creates this widget — see buildCoreUI.
+  let randBtn = null;
+  if (!isSlotLoader) {
+    randBtn = node.addWidget("button", "lfl_add_rand", null, async () => {
+      const entry = { on: true, name: "", model: 1.0, clip: 1.0, random: true, locked: false, autoRoll: false, folders: null };
+      const pick = await pickRandomLora(node, entry);
+      if (pick != null) entry.name = pick;
+      node.__loraStack.push(entry);
+      node.__lflCommit();
+    });
+    randBtn.label = "🎲 Add Lora Randomizer"; randBtn.serialize = false;
+    if (randBtn.options) randBtn.options.serialize = false; randBtn.serializeValue = () => undefined;
+  }
 
-  const barDom = buildModelBar(node);
-  const barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false });
-  barWidget.serializeValue = () => undefined;
-  barWidget.computeSize = function (width) { return [width, 26]; };
+  // Plotter state defaults (its controls render inside the slot panel now).
+  if (isPlotter && node.__globalStrengths == null) node.__globalStrengths = [];
 
-  // On fresh creation (count still 0 after stripAutoExtraSlots) optionally add
-  // one pair. The Multi-Model node starts with 2 paths (autoAddPair=true); the
-  // Plotter starts with a single path (autoAddPair=false). Workflow loads skip
-  // this because onConfigure syncs extra_model_count from restored slots.
+  let barWidget = null;
+  if (!isSlotLoader) {
+    const barDom = buildModelBar(node);
+    barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false });
+    barWidget.serializeValue = () => undefined;
+    barWidget.computeSize = function (width) { return [width, 26]; };
+  }
+
+  // On fresh creation the loader and plotter both start with zero extra paths
+  // (autoAddPair=false), so this just draws the model bar. The autoAddPair hook
+  // is kept for callers that want a path pre-added. Workflow loads skip the add
+  // because onConfigure syncs extra_model_count from restored slots.
   if (autoAddPair && node.properties.extra_model_count === 0) addModelPair(node);
   else updateModelBar(node);
 
@@ -1241,70 +3219,6 @@ function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
 // ===========================================================================
 // Plotter controls — strength-mode toggle + global-strengths popup
 // ===========================================================================
-
-function updatePlotterLabels(node) {
-  const global = node.__plotMode === "global";
-  if (node.__lflPlotModeBtn) node.__lflPlotModeBtn.label = `📊 Strength mode: ${global ? "Global (applied to all loras)" : "Per-line"}`;
-  if (node.__lflPlotGsBtn) {
-    const list = node.__globalStrengths || [];
-    node.__lflPlotGsBtn.label = `🎚 Global strengths: ${list.length ? list.join(", ") : "(none)"}`;
-    node.__lflPlotGsBtn.disabled = !global;
-  }
-  if (node.__lflPlotControlBtn) {
-    node.__lflPlotControlBtn.label = node.__globalLoraConnected
-      ? "Set control on Global Lora Node"
-      : "Control Image (no loras applied)";
-  }
-  node.setDirtyCanvas?.(true, false);
-}
-
-function addPlotterControls(node) {
-  const modeBtn = node.addWidget("button", "lfl_plot_mode", null, () => {
-    node.__plotMode = node.__plotMode === "global" ? "perline" : "global";
-    syncData(node);
-    updatePlotterLabels(node);
-    node.__lflRender?.();                 // re-render rows to grey/ungrey strengths
-    node.setDirtyCanvas(true, true);
-  });
-  modeBtn.serialize = false; if (modeBtn.options) modeBtn.options.serialize = false; modeBtn.serializeValue = () => undefined;
-  node.__lflPlotModeBtn = modeBtn;
-
-  const gsBtn = node.addWidget("button", "lfl_plot_gs", null, (_v, _c, _n, _p, event) => {
-    if (node.__plotMode !== "global") return;  // disabled in Per-line mode
-    showGlobalStrengthsPanel(node, event);
-  });
-  gsBtn.tooltip = "Set the strengths to test. Every lora in your list runs once at each "
-    + "strength you enter here — e.g. 2 loras \u00d7 3 strengths = 6 images.";
-  gsBtn.serialize = false; if (gsBtn.options) gsBtn.options.serialize = false; gsBtn.serializeValue = () => undefined;
-  node.__lflPlotGsBtn = gsBtn;
-
-  const ctrlToggle = node.addWidget("toggle", "lfl_plot_control", !!node.__controlImage, (v) => {
-    if (node.__globalLoraConnected) return;   // disabled while a Global Lora node drives control
-    node.__controlImage = !!v;
-    syncData(node);
-    node.setDirtyCanvas(true, true);
-  }, { on: "On", off: "Off" });
-  ctrlToggle.tooltip = "Adds one extra baseline image with no loras applied at all (the raw "
-    + "base model), so you can compare every swept result against an untouched generation.";
-  ctrlToggle.serialize = false; if (ctrlToggle.options) ctrlToggle.options.serialize = false; ctrlToggle.serializeValue = () => undefined;
-  node.__lflPlotControlBtn = ctrlToggle;
-
-  const addGlobalBtn = node.addWidget("button", "lfl_add_global", null, () => {
-    if (node.__globalLoraConnected) return;   // greyed out when one is already connected
-    try { spawnConnectedGlobalLora(node); }
-    catch (err) { console.warn("[FantasticLoraLoader] add global lora failed", err); }
-  });
-  addGlobalBtn.label = "\uD83C\uDF10 Add Global Lora node";
-  addGlobalBtn.tooltip = "Adds a Fantastic Plotter Global Lora node and connects it here. "
-    + "Any loras you select in that node apply globally — they're added on top of every image "
-    + "the plotter generates, in addition to each swept cell's own lora.";
-  addGlobalBtn.serialize = false;
-  if (addGlobalBtn.options) addGlobalBtn.options.serialize = false;
-  addGlobalBtn.serializeValue = () => undefined;
-  node.__lflAddGlobalBtn = addGlobalBtn;
-
-  updatePlotterLabels(node);
-}
 
 let openStrengthsPanel = null;
 function closeStrengthsPanel() { if (openStrengthsPanel) { openStrengthsPanel.dispose(); openStrengthsPanel = null; } }
@@ -1346,7 +3260,6 @@ function showGlobalStrengthsPanel(node, event) {
   const apply = () => {
     node.__globalStrengths = collect();
     syncData(node);
-    updatePlotterLabels(node);
     node.__lflRender?.();
     closeStrengthsPanel();
   };
@@ -1418,6 +3331,22 @@ app.registerExtension({
 
     nodeType.color   = NODE_COLOR;
     nodeType.bgcolor = NODE_BGCOLOR;
+
+    // ...and on the instance, which is the only place the Vue renderer looks.
+    const origColorONC = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = origColorONC?.apply(this, arguments);
+      try { svApplyNodeColors(this); } catch (_) {}
+      return r;
+    };
+    const origColorCfg = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = origColorCfg?.apply(this, arguments);
+      // A saved workflow restores whatever colour it stored; only restyle if
+      // that colour is one of ours (i.e. the user hasn't picked a custom one).
+      try { svApplyNodeColors(this); } catch (_) {}
+      return r;
+    };
 
     // Global Lora node: stack UI (no randomizer) + two control toggles.
     if (isGlobal) {
@@ -1494,15 +3423,16 @@ app.registerExtension({
       return;
     }
 
-    const isMulti   = isMultiLike(nm);
     const isPlotter = nm === PLOT_NODE_NAME;
 
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       origOnNodeCreated?.apply(this, arguments);
       this.size = [DEFAULT_WIDTH, 180];
-      // Plotter uses the multi-model UI but starts with a single model path.
-      try { isMulti ? addMultiUI(this, { autoAddPair: !isPlotter, isPlotter }) : addUI(this); }
+      // Loader and plotter both use the multi-model UI and start with zero
+      // extra model paths — pixel-identical to a plain single-model loader
+      // until the user adds paths via the ➕ bar.
+      try { addMultiUI(this, { autoAddPair: false, isPlotter }); }
       catch (err) { console.warn("[FantasticLoraLoader] UI build failed", err); }
     };
 
@@ -1519,18 +3449,16 @@ app.registerExtension({
     nodeType.prototype.onConfigure = function (info) {
       origOnConfigure?.apply(this, arguments);
       try {
-        if (isMulti) {
-          if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: !isPlotter, isPlotter });
-          this.properties.extra_model_count = countExtraModelInputs(this);
-          updateModelBar(this);
-        } else {
-          if (!this.__lflBuilt) addUI(this);
-        }
+        if (!this.__lflBuilt) addMultiUI(this, { autoAddPair: false, isPlotter });
+        this.properties.extra_model_count = countExtraModelInputs(this);
+        updateModelBar(this);
         loadStackFromData(this);
-        if (isPlotter) { updatePlotterLabels(this); updatePlotterControlState(this); }
+        if (isPlotter) updatePlotterControlState(this);
         // Serialized node width already reflects any randomizer bump — sync the
         // counter so the next commit doesn't add it again.
         this.__lflLastRandCount = (this.__loraStack || []).filter(e => e.random).length;
+        const svCls = this.comfyClass || this.type;
+        if (svCls === MULTI_NODE_NAME || svCls === PLOT_NODE_NAME) this.__lflView = "slots";
         this.__lflRender?.();
         this.__plffUpdateFolderBtn?.();
         snapHeight(this);
