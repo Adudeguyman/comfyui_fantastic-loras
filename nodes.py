@@ -1641,6 +1641,7 @@ _PREFS_DEFAULT = {
     "favoriteLoras": [],
     "favoriteFolders": [],
     "favoritePresets": [],
+    "collapsedFolders": [],
     "theme": "teal",
     "showExt": False,
 }
@@ -1656,7 +1657,7 @@ def _read_prefs():
         with open(_prefs_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            for k in ("favoriteLoras", "favoriteFolders", "favoritePresets"):
+            for k in ("favoriteLoras", "favoriteFolders", "favoritePresets", "collapsedFolders"):
                 v = data.get(k)
                 if isinstance(v, list):
                     cfg[k] = [str(x) for x in v]
@@ -1671,7 +1672,7 @@ def _read_prefs():
 def _write_prefs(patch):
     cfg = _read_prefs()
     if isinstance(patch, dict):
-        for k in ("favoriteLoras", "favoriteFolders", "favoritePresets"):
+        for k in ("favoriteLoras", "favoriteFolders", "favoritePresets", "collapsedFolders"):
             v = patch.get(k)
             if isinstance(v, list):
                 cfg[k] = [str(x) for x in v]
@@ -2168,6 +2169,55 @@ class FantasticAnySelector:
         return (str(name),)
 
 
+# ===========================================================================
+# Fantastic Seeds 🌱
+# ===========================================================================
+# A seed source with three modes and a short history. Rolling happens in the
+# FRONTEND at queue time (same as the lora randomiser) so what the node shows
+# is exactly what was submitted, and the execution path stays identical to a
+# hand-typed seed.
+
+SEED_MAX = 1125899906842624          # 2^50 — comfortably inside JS safe ints
+
+
+class FantasticSeeds:
+    """Outputs a seed. Fixed, re-rolled every queue, or a locked random."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seed": ("INT", {"default": 0, "min": 0, "max": SEED_MAX}),
+                # Frontend-managed; hidden on the node face.
+                "mode": ("STRING", {"default": "fixed", "multiline": False}),
+                "history": ("STRING", {"default": "[]", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("seed",)
+    FUNCTION = "emit"
+    CATEGORY = "loaders"
+    TITLE = "Fantastic Seeds"
+
+    @classmethod
+    def IS_CHANGED(cls, seed=0, mode="fixed", history="[]", **kwargs):
+        # The frontend writes a fresh seed before submitting in randomize mode,
+        # so the value itself is enough to decide whether to re-run.
+        return float(seed)
+
+    def emit(self, seed=0, mode="fixed", history="[]", **kwargs):
+        try:
+            s = int(seed)
+        except Exception:
+            s = 0
+        if s < 0:
+            s = 0
+        if s > SEED_MAX:
+            s = s % (SEED_MAX + 1)
+        return (s,)
+
+
 NODE_CLASS_MAPPINGS = {
     "FantasticLoraLoaderMulti": FantasticLoraLoaderMulti,
     "FantasticLoraPlotter":     FantasticLoraPlotter,
@@ -2177,6 +2227,7 @@ NODE_CLASS_MAPPINGS = {
     "FantasticLoraMimic":       FantasticLoraMimic,
     "FantasticLoraMimicSubgraphCompanion": FantasticLoraMimicSubgraphCompanion,
     "FantasticAnySelector":     FantasticAnySelector,
+    "FantasticSeeds":           FantasticSeeds,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraLoaderMulti": "Fantastic Lora Loader 📁",
@@ -2187,6 +2238,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FantasticLoraMimic":       "Fantastic Lora Mimic 🪞",
     "FantasticLoraMimicSubgraphCompanion": "Fantastic Lora Mimic Subgraph Companion 🧩",
     "FantasticAnySelector":     "Fantastic Any Selector 🎯",
+    "FantasticSeeds":           "Fantastic Seeds 🌱",
 }
 
 

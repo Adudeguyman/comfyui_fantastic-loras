@@ -2,7 +2,7 @@
 
 A LoRA toolkit for ComfyUI: pick which LoRA subfolders a node draws from so you're only ever searching the models you're working with, stack up to 12 LoRAs across several models from one node, and run a proper XY LoRA test bench in a single queue.
 
-![version](https://img.shields.io/badge/version-2.1.0-0a6166) ![nodes 2.0](https://img.shields.io/badge/Nodes%202.0-compatible-7ec87e) ![license](https://img.shields.io/badge/license-MIT-blue)
+![version](https://img.shields.io/badge/version-2.2.0-0a6166) ![nodes 2.0](https://img.shields.io/badge/Nodes%202.0-compatible-7ec87e) ![license](https://img.shields.io/badge/license-MIT-blue)
 
 <p align="center">
   <img src="screenshots/main_loader.png" alt="The Fantastic Lora Loader node, showing its 12 lora slots and preset bar" width="760"><br>
@@ -98,6 +98,7 @@ That's the whole basic loop. Everything below is optional.
 | **Fantastic Plotter Grid Viewer 🔍** | Browse the results interactively, zoom, and pick winners. |
 | **Fantastic Lora Mimic 🪞** | Mirror a LoRA list authored in another loader onto an independent model path. |
 | **Fantastic Any Selector 🎯** | A filename picker with folder filtering, for any loader. |
+| **Fantastic Seeds 🌱** | A seed source with fixed / randomize / locked modes and a history. |
 
 All of them appear under **loaders** in the add-node menu.
 
@@ -167,7 +168,9 @@ Click it to open the picker: type to search, use **all** / **none** for bulk cha
 
 The filter controls what the LoRA picker offers *and* what the randomizer draws from, so the two never disagree. It's saved per node, with the workflow.
 
-One thing to know: folders are exact. Picking `flux` gives you LoRAs sitting directly in `flux`, not everything nested beneath it — tick the subfolders you want too.
+The picker shows your folders as an indented tree. Any folder with subfolders gets a **▣ / ▨ / ▢ branch toggle** showing whether all, some, or none of the folders beneath it are enabled, with an `on/total` count — click it to select or clear that whole branch, at any depth. Clicking anywhere on a branch row cycles it: **this folder and everything beneath it** (▣) → **just this folder** (◧) → **off** (▢) → back again. A folder that holds no loras of its own skips the middle step, since there's nothing to select there. Folders that hold only subfolders show in italic, since there's nothing to select in them directly. Each branch has a **▾ / ▸ expander** to fold it away, plus **collapse all** / **expand all** in the picker header — handy once you have a few levels of nesting. Collapsed branches are remembered across sessions. Searching switches to a flat list of full paths so matches are unambiguous.
+
+Otherwise folders are exact: picking `flux` by name gives you LoRAs sitting directly in `flux`, not everything nested beneath it — use its branch toggle if you want the subfolders too.
 
 ---
 
@@ -451,6 +454,12 @@ The first three follow your ComfyUI install, so they're the same in every workfl
 **A new LoRA folder isn't showing up.** Open the FOLDERS picker — it re-reads the disk each time it opens. If you have an explicit folder selection, tick the new folder to include it.
 
 **The comparison grid is enormous.** Check the SWEEP footer count before queueing; LoRAs × strengths multiplies fast.
+
+## What's new in 2.2
+
+- **Fantastic Seeds 🌱** — a seed source with fixed, randomize-every-queue, and locked-random modes, plus a history of the last 10 seeds you queued.
+- The folder picker is now a **collapsible tree**. Branches cycle between the whole branch, just that folder, and off; expanders and a collapse-all remember their state.
+- The loader and Plotter footers show how many loras your folder filter is letting through.
 
 ## What's new in 2.1
 

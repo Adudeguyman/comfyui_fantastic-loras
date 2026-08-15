@@ -25,7 +25,7 @@ const GLOBAL_NODE_NAME = "FantasticPlotterGlobalLora";
 const VIEWER_NODE_NAME = "FantasticPlotterGridViewer";
 const ALL_NODE_NAMES  = [MULTI_NODE_NAME, PLOT_NODE_NAME];
 // Every node in the pack that the theme picker recolours.
-const SV_THEMED_NODES = new Set([MULTI_NODE_NAME, PLOT_NODE_NAME, SAVER_NODE_NAME, GLOBAL_NODE_NAME, VIEWER_NODE_NAME, "FantasticAnySelector"]);
+const SV_THEMED_NODES = new Set([MULTI_NODE_NAME, PLOT_NODE_NAME, SAVER_NODE_NAME, GLOBAL_NODE_NAME, VIEWER_NODE_NAME, "FantasticAnySelector", "FantasticSeeds"]);
 
 const DATA_WIDGET          = "lora_data";
 const NODE_COLOR           = "#0f848a";
@@ -43,7 +43,7 @@ const PREFS_CACHE_KEY      = "fll_prefs_cache";  // mirrors the server copy
 // are synchronous off that, writes go to both.
 // ===========================================================================
 
-const PREFS_DEFAULT = { favoriteLoras: [], favoriteFolders: [], favoritePresets: [], theme: "teal", showExt: false };
+const PREFS_DEFAULT = { favoriteLoras: [], favoriteFolders: [], favoritePresets: [], theme: "teal", showExt: false, collapsedFolders: [] };
 let FLL_PREFS = (() => {
   try { return Object.assign({}, PREFS_DEFAULT, JSON.parse(localStorage.getItem(PREFS_CACHE_KEY) || "{}")); }
   catch (_) { return Object.assign({}, PREFS_DEFAULT); }
@@ -83,6 +83,7 @@ function repaintSlotNodes() {
     for (const n of (app.graph?._nodes || [])) {
       if (n.__lflView === "slots") n.__lflRender?.();
       n.__asRender?.();          // Any Selector panels show filenames too
+      n.__sdRender?.();          // ...and the seed panel
     }
   } catch (_) {}
 }
@@ -1116,6 +1117,7 @@ function svSetTheme(name) {
       svApplyNodeColors(n);
       if (n.__lflView === "slots") n.__lflRender?.();
       n.__asRender?.();
+      n.__sdRender?.();
     }
     app.graph?.setDirtyCanvas?.(true, true);
   } catch (_) {}
@@ -1222,6 +1224,11 @@ function svStrengthInput(value, onSet, wide, disabled) {
 let openFolderCombo = null;
 function closeFolderCombo() { if (openFolderCombo) { openFolderCombo.dispose(); openFolderCombo = null; } }
 
+// Which branches are collapsed in the folder picker. A browser-level pref, so
+// a deep tree stays tidy across nodes and sessions.
+function loadCollapsed() { return new Set(FLL_PREFS.collapsedFolders || []); }
+function saveCollapsed(set) { savePrefs({ collapsedFolders: [...set] }); }
+
 function loadFolderFavs() { return new Set(FLL_PREFS.favoriteFolders || []); }
 function saveFolderFavs(set) { savePrefs({ favoriteFolders: [...set] }); }
 
@@ -1232,9 +1239,9 @@ async function svOpenFolderDropdown(node, anchor) {
   const favs = loadFolderFavs();
 
   const panel = document.createElement("div");
-  panel.style.cssText = `position:fixed;z-index:10001;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;min-width:300px;max-width:420px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;max-height:340px;`;
+  panel.style.cssText = `position:fixed;z-index:10001;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;min-width:320px;max-width:520px;font:12px Arial,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.5);display:flex;flex-direction:column;max-height:340px;`;
   const r = anchor.getBoundingClientRect();
-  panel.style.left = Math.round(Math.min(r.left, window.innerWidth - 430)) + "px";
+  panel.style.left = Math.round(Math.min(r.left, window.innerWidth - 540)) + "px";
   panel.style.top = Math.round(r.bottom + 4) + "px";
 
   // ---- search box ----
@@ -1251,12 +1258,42 @@ async function svOpenFolderDropdown(node, anchor) {
   allBtn.addEventListener("pointerdown", e => e.stopPropagation());
   allBtn.addEventListener("click", (e) => { e.stopPropagation(); setEnabledFolders(node, null); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); rebuild(); });
   sbar.appendChild(allBtn);
+  // Expand / collapse every branch at once.
+  const foldBtn = document.createElement("span");
+  foldBtn.style.cssText = `flex:none;font-size:11px;color:${SV.mut};cursor:pointer;`;
+  const branches = () => {
+    const set = new Set();
+    for (const u of units) {
+      const parts = u.split("/");
+      for (let i = 1; i <= parts.length; i++) {
+        const pre = parts.slice(0, i).join("/");
+        if (units.some(x => x.startsWith(pre + "/"))) set.add(pre);
+      }
+    }
+    return set;
+  };
+  const paintFold = () => {
+    const all = branches();
+    const anyOpen = [...all].some(b => !collapsedSet.has(b));
+    foldBtn.textContent = anyOpen ? "collapse all" : "expand all";
+    foldBtn.title = anyOpen ? "Collapse every folder" : "Expand every folder";
+    foldBtn.dataset.act = anyOpen ? "collapse" : "expand";
+  };
+  foldBtn.addEventListener("pointerdown", e => e.stopPropagation());
+  foldBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const all = branches();
+    if (foldBtn.dataset.act === "collapse") all.forEach(b => collapsedSet.add(b));
+    else all.forEach(b => collapsedSet.delete(b));
+    saveCollapsed(collapsedSet); paintFold(); rebuild();
+  });
   const noneBtn = document.createElement("span");
   noneBtn.textContent = "none"; noneBtn.title = "Deselect every folder";
   noneBtn.style.cssText = `flex:none;font-size:11px;color:${SV.mut};cursor:pointer;text-decoration:underline;`;
   noneBtn.addEventListener("pointerdown", e => e.stopPropagation());
   noneBtn.addEventListener("click", (e) => { e.stopPropagation(); setEnabledFolders(node, new Set()); node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); rebuild(); });
   sbar.appendChild(noneBtn);
+  sbar.appendChild(foldBtn);
   panel.appendChild(sbar);
 
   const list = document.createElement("div");
@@ -1264,6 +1301,7 @@ async function svOpenFolderDropdown(node, anchor) {
   panel.appendChild(list);
 
   let query = "";
+  const collapsedSet = loadCollapsed();
   const rebuild = () => {
     list.textContent = "";
     const eff = getEffectiveEnabledSet(node, units); // null => all enabled
@@ -1279,10 +1317,11 @@ async function svOpenFolderDropdown(node, anchor) {
     const fav = matches.filter(u => favs.has(u));
     const rest = matches.filter(u => !favs.has(u));
 
-    const addRow = (u) => {
+    const addRow = (u, depth, leafOnly) => {
       const onIt = eff == null || eff.has(u);
+      const pad = 10 + (depth || 0) * 14 + (depth ? 19 : 0);   // clear the expander column
       const row = document.createElement("div");
-      row.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-bottom:1px solid ${SV.border2};color:${onIt ? SV.text : SV.mut};${onIt ? `background:${SV.rowOn};` : ""}`;
+      row.style.cssText = `display:flex;align-items:center;gap:8px;padding:5px 10px 5px ${pad}px;cursor:pointer;border-bottom:1px solid ${SV.border2};color:${onIt ? SV.text : SV.mut};${onIt ? `background:${SV.rowOn};` : ""}`;
       const star = document.createElement("span");
       star.textContent = favs.has(u) ? "★" : "☆";
       star.title = favs.has(u) ? "Unfavorite this folder" : "Favorite this folder (pins it to the top)";
@@ -1294,9 +1333,36 @@ async function svOpenFolderDropdown(node, anchor) {
         saveFolderFavs(favs); rebuild();
       });
       row.appendChild(star);
+      // Show the full path, but style the leading parent like the group
+      // heading above it and give the final segment the emphasis — that's the
+      // part you're actually picking.
       const lbl = document.createElement("span");
-      lbl.textContent = u === "" ? ROOT_LABEL : u;
-      lbl.style.cssText = "flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      lbl.title = u === "" ? ROOT_LABEL : u;      // full path on hover
+      if (u === "") {
+        lbl.style.cssText = "flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+        lbl.textContent = ROOT_LABEL;
+      } else {
+        const cut = u.lastIndexOf("/");
+        if (cut < 0 || leafOnly) {
+          lbl.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:${onIt ? SV.text : SV.mut};`;
+          lbl.textContent = leafOnly ? u.slice(cut + 1) : u;
+        } else {
+          // Flex row so the PARENT truncates when space runs short, not the
+          // final segment — the tail is the part being selected, so it must
+          // stay readable. The parent shrinks first (tail has flex-shrink 0).
+          lbl.style.cssText = "flex:1;min-width:0;display:flex;align-items:baseline;white-space:nowrap;overflow:hidden;";
+          const lead = document.createElement("span");
+          lead.textContent = u.slice(0, cut + 1);
+          lead.style.cssText = `flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;` +
+            `font-size:10px;letter-spacing:.06em;color:${SV.faint};`;
+          lbl.appendChild(lead);
+          const tail = document.createElement("span");
+          tail.textContent = u.slice(cut + 1);
+          tail.style.cssText = `flex:0 0 auto;max-width:100%;overflow:hidden;text-overflow:ellipsis;` +
+            `font-size:12px;color:${onIt ? SV.text : SV.mut};`;
+          lbl.appendChild(tail);
+        }
+      }
       row.appendChild(lbl);
       if (onIt) { const ck = document.createElement("span"); ck.textContent = "✓"; ck.style.cssText = "color:#4cc3e0;font-size:11px;flex:none;"; row.appendChild(ck); }
       row.addEventListener("mouseenter", () => row.style.background = SV.rowHover);
@@ -1321,18 +1387,129 @@ async function svOpenFolderDropdown(node, anchor) {
       list.appendChild(h);
     };
 
-    if (fav.length) { hdr("★ FAVORITES"); fav.forEach(addRow); }
-    if (rest.length) {
-      if (q) { if (fav.length) hdr("ALL FOLDERS"); rest.forEach(addRow); }
-      else {
-        // group by top-level folder when not searching
-        let lastTop = null;
-        if (fav.length) hdr("ALL FOLDERS");
-        for (const u of rest) {
-          const top = u.includes("/") ? u.split("/")[0] : ROOT_LABEL;
-          if (top !== lastTop) { lastTop = top; hdr(top); }
-          addRow(u);
+    // A group header stands for a whole branch of the tree — including parent
+    // folders that hold no loras themselves and so never appear as a row.
+    // Clicking it selects (or clears) everything beneath.
+    const branchRow = (prefix, depth, isUnit) => {
+      const below = units.filter(u => u === prefix || u.startsWith(prefix + "/"));
+      const kids = below.filter(u => u !== prefix);
+      const isOn = (u) => eff == null || eff.has(u);
+      const onCount = below.filter(isOn).length;
+      const selfOn = isUnit && isOn(prefix);
+      const kidsOn = kids.filter(isOn).length;
+
+      // Three states, cycled by clicking: the whole branch, just this folder
+      // (only where the folder holds loras itself), then off.
+      const state = (onCount === below.length && below.length > 0) ? "all"
+        : (isUnit && selfOn && kidsOn === 0) ? "self"
+        : (onCount === 0) ? "none" : "mixed";
+      const nextState = state === "all" ? (isUnit ? "self" : "none")
+        : state === "self" ? "none"
+        : "all";
+
+      const pad = 10 + depth * 14;
+      const h = document.createElement("div");
+      h.style.cssText = `display:flex;align-items:center;gap:7px;padding:5px 10px 5px ${pad}px;cursor:pointer;` +
+        `border-bottom:1px solid ${SV.border2};background:${SV.inset};`;
+
+      const apply = (to) => {
+        const cur = getEffectiveEnabledSet(node, units);
+        const next = new Set(cur == null ? units : cur);
+        below.forEach(u => next.delete(u));
+        if (to === "all") below.forEach(u => next.add(u));
+        else if (to === "self") next.add(prefix);
+        setEnabledFolders(node, next.size === units.length ? null : next);
+        node.__plffUpdateFolderBtn?.(); node.__lflCommit?.(); rebuild();
+      };
+
+      // Expander — its own target, so it never competes with the row's cycle.
+      const collapsed = collapsedSet.has(prefix);
+      const exp = document.createElement("span"); exp.dataset.stop = "1";
+      exp.textContent = collapsed ? "▸" : "▾";
+      exp.title = collapsed ? `Show what's inside ${prefix}` : `Collapse ${prefix}`;
+      exp.style.cssText = `flex:none;width:12px;text-align:center;font-size:10px;cursor:pointer;color:${SV.mut};`;
+      exp.addEventListener("mouseenter", () => exp.style.color = SV.text);
+      exp.addEventListener("mouseleave", () => exp.style.color = SV.mut);
+      exp.addEventListener("pointerdown", ev => ev.stopPropagation());
+      exp.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        collapsed ? collapsedSet.delete(prefix) : collapsedSet.add(prefix);
+        saveCollapsed(collapsedSet); paintFold(); rebuild();
+      });
+      h.appendChild(exp);
+
+      const glyph = { all: "▣", self: "◧", mixed: "▨", none: "▢" }[state];
+      const colour = { all: SV.accent, self: SV.badgeFg, mixed: SV.dim, none: SV.ghost }[state];
+      const box = document.createElement("span");
+      box.textContent = glyph;
+      box.style.cssText = `flex:none;font-size:12px;color:${colour};`;
+      h.appendChild(box);
+
+      const lb = document.createElement("span");
+      lb.textContent = prefix.slice(prefix.lastIndexOf("/") + 1);
+      lb.style.cssText = `flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;` +
+        (isUnit ? `color:${selfOn ? SV.text : SV.mut};` : `color:${SV.faint};font-style:italic;`);
+      h.appendChild(lb);
+
+      const now = { all: "this folder and all beneath it", self: "just this folder",
+                    mixed: "some folders beneath", none: "nothing here" }[state];
+      const then = { all: `enable ${prefix} and all ${kids.length} beneath`,
+                     self: `enable only ${prefix}`, none: "turn everything here off" }[nextState];
+      h.title = `${prefix} — ${now}. Click to ${then}.`;
+      h.addEventListener("mouseenter", () => h.style.background = SV.rowHover);
+      h.addEventListener("mouseleave", () => h.style.background = SV.inset);
+      h.addEventListener("pointerdown", ev => ev.stopPropagation());
+      h.addEventListener("click", (ev) => { ev.stopPropagation(); apply(nextState); });
+
+      const cnt = document.createElement("span");
+      cnt.textContent = `${onCount}/${below.length}`;
+      cnt.style.cssText = `flex:none;font:10px ui-monospace,monospace;color:${SV.ghost};`;
+      h.appendChild(cnt);
+      list.appendChild(h);
+    };
+
+    if (fav.length) { hdr("★ FAVORITES"); fav.forEach(u => addRow(u, 0, false)); }
+
+    if (q) {
+      // Searching: flat list, full paths, so matches are unambiguous.
+      if (fav.length) hdr("ALL FOLDERS");
+      rest.forEach(u => addRow(u, 0, false));
+    } else if (matches.length) {
+      // Not searching: a real tree. Every level that has children gets its own
+      // branch toggle, including intermediate folders that hold no loras of
+      // their own and so never appear as a selectable row.
+      if (fav.length) hdr("ALL FOLDERS");
+      const tree = new Set();
+      for (const u of matches) {
+        if (u === "") continue;
+        tree.add(u);
+        const parts = u.split("/");
+        for (let i = 1; i < parts.length; i++) tree.add(parts.slice(0, i).join("/"));
+      }
+      if (matches.includes("")) addRow("", 0, false);            // (root)
+      // Case-insensitive, segment-aware: keeps a branch's children directly
+      // under it and stops uppercase names sorting above lowercase ones.
+      const treeSorted = [...tree].sort((a, b) => {
+        const A = a.split("/"), B = b.split("/");
+        for (let i = 0; i < Math.max(A.length, B.length); i++) {
+          const x = (A[i] || "").toLowerCase(), y = (B[i] || "").toLowerCase();
+          if (x !== y) return x < y ? -1 : 1;
         }
+        return 0;
+      });
+      for (const pathStr of treeSorted) {
+        // Hidden if any ancestor is collapsed.
+        const parts = pathStr.split("/");
+        let buried = false;
+        for (let i = 1; i < parts.length; i++) {
+          if (collapsedSet.has(parts.slice(0, i).join("/"))) { buried = true; break; }
+        }
+        if (buried) continue;
+        const depth = parts.length - 1;
+        const isUnit = units.includes(pathStr);
+        const hasKids = units.some(u => u.startsWith(pathStr + "/"));
+        if (hasKids) branchRow(pathStr, depth, isUnit);
+        else addRow(pathStr, depth, true);
       }
     }
   };
@@ -1341,6 +1518,7 @@ async function svOpenFolderDropdown(node, anchor) {
     e.stopPropagation();
     if (e.key === "Escape") closeFolderCombo();
   });
+  paintFold();
   rebuild();
   document.body.appendChild(panel);
   setTimeout(() => sin.focus(), 0);
@@ -2756,8 +2934,35 @@ function renderSlotView(node, root) {
   const foot = document.createElement("div");
   foot.style.cssText = `margin-top:9px;background:${SV.inset};border:1px solid ${SV.border2};border-radius:6px;padding:7px 10px;`;
   const fh = document.createElement("div");
-  fh.textContent = isPlot ? "SWEEP" : "LOAD ORDER SENT TO EACH CHAIN";
-  fh.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};margin-bottom:3px;`;
+  fh.style.cssText = `display:flex;align-items:baseline;gap:10px;margin-bottom:3px;`;
+  const fhl = document.createElement("span");
+  fhl.textContent = isPlot ? "SWEEP" : "LOAD ORDER SENT TO EACH CHAIN";
+  fhl.style.cssText = `flex:1;min-width:0;font-size:10px;letter-spacing:.08em;color:${SV.faint};` +
+    `white-space:nowrap;overflow:hidden;text-overflow:ellipsis;`;
+  fh.appendChild(fhl);
+
+  // Library counters, right-aligned: how many loras the folder filter is
+  // letting through, out of everything on disk.
+  const tally = document.createElement("span");
+  tally.style.cssText = `flex:none;font:10px ui-monospace,monospace;color:${SV.ghost};white-space:nowrap;`;
+  tally.textContent = "…";
+  fh.appendChild(tally);
+  getLoraFiles().then((files) => {
+    try {
+      if (!tally.isConnected) return;
+      const total = files.length;
+      const units = [...collectUnits(files).keys()].map(normPath);
+      const en = getEffectiveEnabledSet(node, units);
+      const inFolders = en == null ? total : files.filter(f => en.has(folderOf(f))).length;
+      tally.innerHTML = en == null
+        ? `<span style="color:${SV.faint}">${total}</span> total loras available`
+        : `<span style="color:${SV.dim}">${inFolders}</span> of <span style="color:${SV.faint}">${total}</span> total loras in your selected folders`;
+      tally.title = en == null
+        ? `All ${total} loras are available — no folder filter set`
+        : `${inFolders} of ${total} loras pass the current folder filter`;
+    } catch (_) { tally.textContent = ""; }
+  }).catch(() => { tally.textContent = ""; });
+
   foot.appendChild(fh);
   if (isPlot) {
     const lines = stack.filter(e => e.on !== false).length;
@@ -4451,6 +4656,309 @@ app.registerExtension({
         try { for (const el of flDomEls(this)) flBindRaise(this, el); } catch (_) {}
       }, 0);
       return r;
+    };
+  },
+});
+
+// ===========================================================================
+// Fantastic Seeds 🌱
+// ---------------------------------------------------------------------------
+// Three modes plus a history of the last five seeds actually queued. Rolling
+// happens here at queue time — the same reason the lora randomiser does: a
+// value generated during execution takes a different code path, and what the
+// node shows must match what was submitted.
+// ===========================================================================
+
+const SEED_NODE_NAME = "FantasticSeeds";
+const SEED_MAX = 1125899906842624;      // 2^50 — inside JS's safe integer range
+const SEED_HISTORY_MAX = 10;
+
+function sdWidget(node, name) { return (node.widgets || []).find(w => w.name === name); }
+function sdGet(node, name, dflt) { const w = sdWidget(node, name); return w ? w.value : dflt; }
+function sdSet(node, name, v) { const w = sdWidget(node, name); if (w) w.value = v; }
+
+function sdMode(node) {
+  const m = String(sdGet(node, "mode", "fixed") || "fixed");
+  return (m === "randomize" || m === "locked") ? m : "fixed";
+}
+function sdNewSeed() { return Math.floor(Math.random() * (SEED_MAX + 1)); }
+
+function sdHistory(node) {
+  try {
+    const h = JSON.parse(String(sdGet(node, "history", "[]") || "[]"));
+    return Array.isArray(h) ? h.filter(n => Number.isFinite(n)) : [];
+  } catch (_) { return []; }
+}
+function sdPushHistory(node, seed) {
+  const h = sdHistory(node).filter(n => n !== seed);
+  h.unshift(seed);
+  sdSet(node, "history", JSON.stringify(h.slice(0, SEED_HISTORY_MAX)));
+}
+
+// Called from the queue wrapper: roll if the mode says so, then record.
+function sdOnQueue(node) {
+  try {
+    if (sdMode(node) === "randomize") sdSet(node, "seed", sdNewSeed());
+    const cur = Number(sdGet(node, "seed", 0)) || 0;
+    sdPushHistory(node, cur);
+    node.__sdRender?.();
+  } catch (_) {}
+}
+
+function sdPanel(node, root) {
+  root.textContent = "";
+  root.style.cssText = "display:flex;flex-direction:column;font:12px Arial,sans-serif;width:100%;box-sizing:border-box;padding:2px 0;";
+  const panel = document.createElement("div");
+  panel.style.cssText = `background:${SV.panel};border:1px solid ${SV.border};border-radius:8px;padding:9px;` +
+    `box-sizing:border-box;width:100%;max-width:100%;min-width:0;`;
+  root.appendChild(panel);
+
+  const mode = sdMode(node);
+  const seed = Number(sdGet(node, "seed", 0)) || 0;
+
+  // ---- seed field ----
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;align-items:center;gap:6px;margin-bottom:8px;";
+  const lab = document.createElement("span"); lab.textContent = "SEED";
+  lab.style.cssText = `flex:none;font-size:10px;letter-spacing:.08em;color:${SV.faint};`;
+  row.appendChild(lab);
+
+  const inp = document.createElement("input");
+  inp.type = "text"; inp.inputMode = "numeric"; inp.dataset.stop = "1";
+  inp.value = mode === "randomize" ? "random each queue" : String(seed);
+  inp.readOnly = mode === "randomize";
+  inp.style.cssText = `flex:1;min-width:0;background:${SV.field};border:1px solid ${SV.border2};` +
+    `color:${mode === "randomize" ? SV.ghost : SV.text};border-radius:5px;padding:4px 8px;` +
+    `font:12px ui-monospace,monospace;outline:none;${mode === "randomize" ? "font-style:italic;" : ""}`;
+  inp.addEventListener("pointerdown", e => e.stopPropagation());
+  inp.addEventListener("focus", () => { if (!inp.readOnly) { inp.style.borderColor = SV.accent; inp.select(); } });
+  inp.addEventListener("blur", () => { inp.style.borderColor = SV.border2; });
+  inp.addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") inp.blur(); });
+  inp.addEventListener("change", () => {
+    const v = parseInt(inp.value.replace(/[^0-9]/g, ""), 10);
+    if (!isNaN(v)) {
+      sdSet(node, "seed", Math.max(0, Math.min(SEED_MAX, v)));
+      if (mode === "randomize") sdSet(node, "mode", "fixed");   // typing means you want it
+    }
+    node.__sdRender?.(); node.setDirtyCanvas(true, true);
+  });
+  row.appendChild(inp);
+
+  const copy = document.createElement("span"); copy.dataset.stop = "1"; copy.textContent = "⧉";
+  copy.title = "Copy this seed";
+  copy.style.cssText = `flex:none;cursor:pointer;color:${SV.mut};font-size:13px;padding:0 2px;`;
+  copy.addEventListener("mouseenter", () => copy.style.color = SV.text);
+  copy.addEventListener("mouseleave", () => copy.style.color = SV.mut);
+  copy.addEventListener("pointerdown", e => e.stopPropagation());
+  copy.addEventListener("click", (e) => {
+    e.stopPropagation();
+    try { navigator.clipboard?.writeText(String(seed)); svToast("Seed copied"); } catch (_) {}
+  });
+  row.appendChild(copy);
+  panel.appendChild(row);
+
+  // ---- mode segment ----
+  const seg = document.createElement("div");
+  seg.style.cssText = `display:flex;border:1px solid ${SV.btnBorder};border-radius:6px;overflow:hidden;margin-bottom:8px;`;
+  const mk = (label, key, title) => {
+    const b = document.createElement("span"); b.dataset.stop = "1";
+    const on = mode === key;
+    b.textContent = label; b.title = title;
+    b.style.cssText = `flex:1;text-align:center;padding:4px 6px;font-size:12px;cursor:pointer;user-select:none;` +
+      (on ? `background:${SV.btnBorder};color:${SV.text};` : `background:${SV.btn};color:${SV.mut};`);
+    b.addEventListener("pointerdown", e => e.stopPropagation());
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      sdSet(node, "mode", key);
+      if (key === "locked") sdSet(node, "seed", sdNewSeed());   // a fresh one to lock
+      node.__sdRender?.(); node.setDirtyCanvas(true, true);
+    });
+    return b;
+  };
+  seg.appendChild(mk("Fixed", "fixed", "Always use the seed shown"));
+  seg.appendChild(mk("Randomize", "randomize", "A new seed every time you queue"));
+  seg.appendChild(mk("Locked random", "locked", "Roll once, then keep it until you roll again"));
+  panel.appendChild(seg);
+
+  // ---- roll button ----
+  const roll = svBtn("🎲 New random seed", "Roll a new seed now and keep it", () => {
+    sdSet(node, "seed", sdNewSeed());
+    if (sdMode(node) === "randomize") sdSet(node, "mode", "locked");
+    node.__sdRender?.(); node.setDirtyCanvas(true, true);
+  });
+  roll.style.cssText += "width:100%;justify-content:center;margin-bottom:8px;";
+  panel.appendChild(roll);
+
+  // ---- bottom row: history (takes the space) + theme ----
+  const bottom = document.createElement("div");
+  bottom.style.cssText = "display:flex;align-items:center;gap:6px;";
+  const hist = sdHistory(node);
+  const hb = svBtn(`🕘 History${hist.length ? ` (${hist.length})` : ""}`,
+    hist.length ? "The last seeds you queued" : "Seeds you queue will be listed here",
+    (e) => sdShowHistory(node, e.currentTarget));
+  hb.dataset.stop = "1";
+  hb.style.cssText += "flex:1;justify-content:center;";
+  if (!hist.length) { hb.style.opacity = ".5"; }
+  const theme = svThemeButton();
+  theme.dataset.stop = "1";
+  theme.style.padding = "3px 8px";
+  bottom.appendChild(theme);
+  bottom.appendChild(hb);
+  panel.appendChild(bottom);
+
+  sdMeasure(node, panel);
+}
+
+// ---- history modal --------------------------------------------------------
+let sdOpenHistory = null;
+function sdCloseHistory() { if (sdOpenHistory) { sdOpenHistory.dispose(); sdOpenHistory = null; } }
+
+function sdShowHistory(node, anchor) {
+  sdCloseHistory();
+  const hist = sdHistory(node);
+  const cur = Number(sdGet(node, "seed", 0)) || 0;
+  const mode = sdMode(node);
+
+  const panel = document.createElement("div");
+  panel.style.cssText = `position:fixed;z-index:10004;background:${SV.inset};border:1px solid ${SV.border};` +
+    `border-radius:8px;min-width:280px;max-width:380px;font:12px Arial,sans-serif;` +
+    `box-shadow:0 10px 30px rgba(0,0,0,.55);display:flex;flex-direction:column;max-height:60vh;`;
+  const r = anchor.getBoundingClientRect();
+  panel.style.left = Math.round(Math.min(r.left, window.innerWidth - 400)) + "px";
+  panel.style.top = Math.round(Math.min(r.bottom + 5, window.innerHeight - 260)) + "px";
+
+  const head = document.createElement("div");
+  head.style.cssText = `display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid ${SV.border2};background:${SV.header};border-radius:8px 8px 0 0;`;
+  const ttl = document.createElement("span"); ttl.textContent = "Recent seeds";
+  ttl.style.cssText = `flex:1;font-size:12px;color:${SV.text};`;
+  head.appendChild(ttl);
+  const x = document.createElement("span"); x.textContent = "✕";
+  x.style.cssText = `cursor:pointer;color:${SV.mut};font-size:12px;`;
+  x.addEventListener("click", (e) => { e.stopPropagation(); sdCloseHistory(); });
+  head.appendChild(x);
+  panel.appendChild(head);
+
+  const list = document.createElement("div");
+  list.style.cssText = "overflow:auto;flex:1;padding:5px;";
+  if (!hist.length) {
+    const em = document.createElement("div");
+    em.textContent = "Nothing queued yet — seeds appear here after you run.";
+    em.style.cssText = `padding:12px;font-size:11px;color:${SV.ghost};font-style:italic;`;
+    list.appendChild(em);
+  }
+  for (const h of hist) {
+    const isCur = h === cur && mode !== "randomize";
+    const row = document.createElement("div");
+    row.style.cssText = `display:flex;align-items:center;gap:7px;padding:5px 7px;border-radius:5px;margin-bottom:3px;` +
+      `${isCur ? `background:${SV.rowOn};` : ""}`;
+    const n = document.createElement("span"); n.textContent = String(h);
+    n.style.cssText = `flex:1;min-width:0;font:12px ui-monospace,monospace;color:${isCur ? SV.text : SV.dim};overflow:hidden;text-overflow:ellipsis;`;
+    row.appendChild(n);
+    if (isCur) {
+      const tag = document.createElement("span"); tag.textContent = "current";
+      tag.style.cssText = `flex:none;font-size:10px;color:${SV.accent};`;
+      row.appendChild(tag);
+    }
+    const use = svBtn("Use", "Use this seed (switches to Locked random)", (e) => {
+      e.stopPropagation();
+      sdSet(node, "seed", h); sdSet(node, "mode", "locked");
+      sdCloseHistory(); node.__sdRender?.(); node.setDirtyCanvas(true, true);
+    });
+    use.style.padding = "2px 9px"; use.style.fontSize = "11px";
+    row.appendChild(use);
+    const cp = svBtn("Copy", "Copy this seed to the clipboard", (e) => {
+      e.stopPropagation();
+      try { navigator.clipboard?.writeText(String(h)); svToast("Seed copied"); } catch (_) {}
+    });
+    cp.style.padding = "2px 9px"; cp.style.fontSize = "11px";
+    row.appendChild(cp);
+    list.appendChild(row);
+  }
+  panel.appendChild(list);
+
+  document.body.appendChild(panel);
+  const away = (ev) => { if (!panel.contains(ev.target) && !anchor.contains(ev.target)) sdCloseHistory(); };
+  const onKey = (ev) => { if (ev.key === "Escape") sdCloseHistory(); };
+  setTimeout(() => { window.addEventListener("pointerdown", away, true); window.addEventListener("keydown", onKey, true); }, 0);
+  sdOpenHistory = { dispose: () => {
+    window.removeEventListener("pointerdown", away, true);
+    window.removeEventListener("keydown", onKey, true);
+    panel.remove();
+  } };
+}
+
+const SD_MIN_W = 320;
+function sdMeasure(node, panel) {
+  const sig = panel.textContent.length;
+  if (node.__sdFitSig === sig && node.__sdMeasuredH && node.size[0] >= SD_MIN_W) return;
+  if (node.size[0] < SD_MIN_W) { node.setSize([SD_MIN_W, node.size[1]]); node.setDirtyCanvas(true, true); }
+  requestAnimationFrame(() => {
+    try {
+      if (!panel.isConnected) return;
+      const h = panel.offsetHeight;
+      if (h <= 0) return;
+      node.__sdFitSig = sig;
+      node.__sdMeasuredH = h + 14;
+      const want = node.computeSize();
+      if (Math.abs(node.size[1] - want[1]) > 2) { node.setSize([node.size[0], want[1]]); node.setDirtyCanvas(true, true); }
+    } catch (_) {}
+  });
+}
+
+app.registerExtension({
+  name: "fantastic.seeds",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData?.name !== SEED_NODE_NAME) return;
+    nodeType.color = NODE_COLOR;
+    nodeType.bgcolor = NODE_BGCOLOR;
+
+    const build = function () {
+      try {
+        svApplyNodeColors(this);
+        // ComfyUI auto-attaches a control_after_generate widget to any INT
+        // widget called "seed". It would fight our own modes (and re-roll
+        // behind our back), so pin it to fixed and drop it from the node.
+        const cag = (this.widgets || []).find(w => /control_after_generate/i.test(w.name || ""));
+        if (cag) {
+          try { cag.value = "fixed"; } catch (_) {}
+          const i = this.widgets.indexOf(cag);
+          if (i >= 0) this.widgets.splice(i, 1);
+        }
+        for (const n of ["seed", "mode", "history"]) hideWidget(this, sdWidget(this, n));
+        if (!this.__sdEl) {
+          const dom = document.createElement("div");
+          this.__sdEl = dom;
+          this.__sdRender = () => sdPanel(this, dom);
+          const w = this.addDOMWidget("sd_panel", "div", dom, { serialize: false });
+          w.serializeValue = () => undefined;
+          w.computeSize = (width) => [width, this.__sdMeasuredH || 190];
+          if (!this.size || this.size[0] < SD_MIN_W) this.size = [Math.max(this.size?.[0] || 0, SD_MIN_W), this.size?.[1] || 0];
+        }
+        if (!Number(sdGet(this, "seed", 0))) sdSet(this, "seed", sdNewSeed());
+        this.__sdRender();
+      } catch (err) { console.warn("[FantasticSeeds] init failed", err); }
+    };
+
+    const origONC = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = origONC?.apply(this, arguments); build.call(this); return r;
+    };
+    const origCfg = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = origCfg?.apply(this, arguments); build.call(this); return r;
+    };
+  },
+
+  async setup() {
+    // Roll + record at queue time, before the prompt is serialised.
+    const origQueue = app.queuePrompt;
+    app.queuePrompt = async function (...args) {
+      try {
+        for (const n of (app.graph?._nodes || [])) {
+          if ((n.comfyClass || n.type) === SEED_NODE_NAME) sdOnQueue(n);
+        }
+      } catch (_) {}
+      return origQueue.apply(this, args);
     };
   },
 });
