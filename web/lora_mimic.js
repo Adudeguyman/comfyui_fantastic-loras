@@ -86,6 +86,11 @@ function shortName(name) {
   return String(name).split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
 }
 
+// Escape text for HTML templates — lora filenames are whatever is on disk.
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
+}
+
 // --- stock-style loader (incl. pysssss) by widget shape, not just by type -----
 function isStockLora(node) {
   if (STOCK_LORA_TYPES.includes(node.type)) return true;
@@ -498,7 +503,7 @@ async function openCompanionPanel(node, anchor, entry) {
           `color:${cand.side === "low" ? "#7fd6ff" : "#ffb454"};border:1px solid ${cand.side === "low" ? "#7fd6ff" : "#ffb454"}">` +
           cand.side + "</span>"
         : "";
-      row.innerHTML = `<span style="flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${cand.name}">${shortName(cand.name)}</span>` + sideTag;
+      row.innerHTML = `<span style="flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(cand.name)}">${escHtml(shortName(cand.name))}</span>` + sideTag;
       row.onclick = (ev) => {
         ev.stopPropagation();
         entry.companion = { name: cand.name, model: entry.model, clip: entry.clip };
@@ -945,7 +950,7 @@ function buildMimicUI(node) {
   node.__mimicOuter = outer;
   node.__mimicRoot = inner;                 // renderMimic writes here
   node.__mimicWidget = node.addDOMWidget("mimic_ui", "fl_mimic_ui", outer, {
-    serialize: false, getValue: () => "", setValue: () => {},
+    serialize: false, hideInPanel: true, getValue: () => "", setValue: () => {},
   });
   // measure the INNER content (not the height-forced outer) so it can shrink too
   node.__mimicWidget.computeSize = function (width) {
@@ -1038,7 +1043,7 @@ function buildSnifferUI(node) {
   outer.appendChild(inner);
   node.__snifRoot = inner;
   node.__snifWidget = node.addDOMWidget("snif_ui", "fl_snif_ui", outer, {
-    serialize: false, getValue: () => "", setValue: () => {},
+    serialize: false, hideInPanel: true, getValue: () => "", setValue: () => {},
   });
   node.__snifWidget.computeSize = function (width) {
     const h = node.__snifRoot ? node.__snifRoot.scrollHeight : 40;

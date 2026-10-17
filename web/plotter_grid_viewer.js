@@ -46,6 +46,12 @@ function apiPath(path) {
   try { return api.apiURL(path); } catch (_) { return path; }
 }
 
+// Escape text for HTML templates. Cell metadata and global lines arrive as plain
+// STRING inputs (any upstream node can feed them), so they never go in raw.
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m]));
+}
+
 const CONTROL_LABELS = { control: "control", control_global: "Control (with global loras)" };
 
 function parseMeta(meta) {
@@ -809,13 +815,13 @@ class GridViewer {
       const extra = c.name === "control_global"
         ? `<span style="opacity:.8">&nbsp;(base + global loras only)</span>`
         : `<span style="opacity:.8">&nbsp;(base model — no loras)</span>`;
-      return `<b style="color:${ACCENT}">${c.label}</b>${extra}` +
-        (this.globalLines.length ? `<span style="opacity:.7">&nbsp;|&nbsp;Globals: ${this.globalLines.join(", ")}</span>` : "");
+      return `<b style="color:${ACCENT}">${escHtml(c.label)}</b>${extra}` +
+        (this.globalLines.length ? `<span style="opacity:.7">&nbsp;|&nbsp;Globals: ${this.globalLines.map(escHtml).join(", ")}</span>` : "");
     }
     const rows = [
-      `<b style="color:${ACCENT}">Lora:</b> ${c.name}`,
+      `<b style="color:${ACCENT}">Lora:</b> ${escHtml(c.name)}`,
       c.strength != null ? `<b style="color:${ACCENT}">Strength:</b> ${fmtStrength(c.strength)}` : "",
-      this.globalLines.length ? `<b style="color:${ACCENT}">Globals:</b> ${this.globalLines.join(", ")}` : "",
+      this.globalLines.length ? `<b style="color:${ACCENT}">Globals:</b> ${this.globalLines.map(escHtml).join(", ")}` : "",
     ].filter(Boolean);
     return rows.join(" &nbsp;|&nbsp; ");
   }
@@ -825,16 +831,16 @@ class GridViewer {
   _metaCaptionHTML(c) {
     if (c.control) {
       const extra = c.name === "control_global" ? " (base + global loras only)" : " (base model — no loras)";
-      return `<b style="color:${ACCENT}">${c.label}</b><span style="opacity:.8">${extra}</span>`;
+      return `<b style="color:${ACCENT}">${escHtml(c.label)}</b><span style="opacity:.8">${extra}</span>`;
     }
-    let s = `<b style="color:${ACCENT}">Lora:</b> ${c.name}`;
+    let s = `<b style="color:${ACCENT}">Lora:</b> ${escHtml(c.name)}`;
     if (c.strength != null) s += `&nbsp;&nbsp;&nbsp;&nbsp;<b style="color:${ACCENT}">Strength:</b> ${fmtStrength(c.strength)}`;
     return s;
   }
 
   _globalsHTML() {
     if (!this.globalLines.length) return "";
-    const items = this.globalLines.map((g) => `<div style="opacity:.9;word-break:break-word;">${g}</div>`).join("");
+    const items = this.globalLines.map((g) => `<div style="opacity:.9;word-break:break-word;">${escHtml(g)}</div>`).join("");
     return `<div style="font-weight:600;color:${ACCENT};margin-bottom:3px;">Global loras</div>${items}`;
   }
 
@@ -1435,6 +1441,7 @@ app.registerExtension({
       this.__flViewer = viewer;
       this.addDOMWidget(VIEWER_NODE_NAME, "fl_grid", viewer.root, {
         serialize: false,
+        hideInPanel: true,
         hideOnZoom: false,
         getValue: () => "",
         setValue: () => {},

@@ -84,6 +84,56 @@ def _apply_lora_to(model, clip, path: str, model_s: float, clip_s: float):
         return comfy.sd.load_lora_for_models(model, clip, sd, model_s, clip_s)
 
 
+def _split_audio_sd(sd):
+    """Partition a lora state dict into (audio_keys, rest_keys): a key is audio
+    when its name contains "audio". Returns (None, None) when the lora has no
+    audio-named keys, so callers fall back to a single pass."""
+    audio, rest = {}, {}
+    for k, v in sd.items():
+        if "audio" in str(k).lower():
+            audio[k] = v
+        else:
+            rest[k] = v
+    if not audio:
+        return None, None
+    return audio, rest
+
+
+def _apply_lora_split(model, clip, path: str, model_s: float, clip_s: float, audio_s: float):
+    """Apply a lora in two passes so audio-named keys take a different strength.
+
+    Both passes go through the same stock load_lora_for_models call as the
+    normal path — only the key subset and strength differ. A lora with no audio
+    keys falls back to a single ordinary pass.
+    """
+    sd, meta = _load_lora_sd(path)
+    audio_sd, rest_sd = _split_audio_sd(sd)
+    if audio_sd is None:
+        # An audio weight was set but no key in this file matched the known
+        # audio-side naming. Print a sample so unrecognised layouts can be
+        # identified rather than silently ignored.
+        sample = sorted(sd.keys())[:6]
+        print(f"[FantasticLoraLoader] NOTE: audio weight set on '{os.path.basename(path)}' "
+              f"but no audio-side keys matched; applying uniformly.")
+        print(f"[FantasticLoraLoader]   {len(sd)} keys, sample: {sample}")
+        return _apply_lora_to(model, clip, path, model_s, clip_s)
+
+    def _one(m, c, part, s_m, s_c):
+        if not part or (s_m == 0 and s_c == 0):
+            return m, c
+        try:
+            return comfy.sd.load_lora_for_models(m, c, part, s_m, s_c, lora_metadata=meta)
+        except TypeError:
+            return comfy.sd.load_lora_for_models(m, c, part, s_m, s_c)
+
+    audio_c = audio_s if clip is not None else 0.0
+    model, clip = _one(model, clip, rest_sd, model_s, clip_s)
+    model, clip = _one(model, clip, audio_sd, audio_s, audio_c)
+    print(f"[FantasticLoraLoader]   audio split: {len(rest_sd)} keys @ {model_s} / "
+          f"{len(audio_sd)} audio keys @ {audio_s}")
+    return model, clip
+
+
 def _folder_of(f: str) -> str:
     f = str(f).replace("\\", "/")
     return f.rsplit("/", 1)[0] if "/" in f else _ROOT_LABEL
@@ -129,6 +179,9 @@ def _parse_payload(lora_data: str):
         item = {"on": bool(e.get("on", True)), "name": name,
                 "model": model_s, "clip": clip_s,
                 "targets": _normalize_targets(e.get("targets"))}
+        a = _normalize_audio(e.get("audio"))
+        if a is not None:
+            item["audio"] = a
         if is_random:
             item["random"] = True
             item["autoRoll"] = bool(e.get("autoRoll"))
@@ -197,6 +250,45 @@ def _normalize_targets(raw):
     return out
 
 
+def _normalize_audio(raw):
+    """Normalize the optional per-entry audio weight.
+
+    Accepts a bare number (uniform across every chain) or a map
+    {"1": 0.4, "2": 0.8} (path index -> audio weight), mirroring `targets`.
+    Returns None (no override -> audio follows the model strength), a float,
+    or {int: float}.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        out = {}
+        for k, v in raw.items():
+            try:
+                idx = int(k)
+                val = float(v)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= idx <= 5:
+                out[idx] = max(-10.0, min(10.0, val))
+        return out or None
+    try:
+        return max(-10.0, min(10.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _entry_audio_for_path(e, path_index: int, model_s: float):
+    """Audio weight for this entry on the given 1-based path, or None when the
+    audio keys should just follow `model_s` (no separate pass needed)."""
+    a = e.get("audio")
+    if a is None:
+        return None
+    if isinstance(a, dict):
+        v = a.get(path_index)
+        return None if v is None else float(v)
+    return float(a)
+
+
 def _entry_strength_for_path(e, path_index: int):
     """Model strength this entry applies at on the given 1-based path index, or
     None if the entry does not target that path."""
@@ -263,7 +355,11 @@ def _apply_chain_collect(model, clip, entries, chain_index: int):
         applied_paths.add(path)
 
         print(f"[FantasticLoraLoader] applying {name}  chain={chain_index} M={model_s} C={clip_s}")
-        model, clip = _apply_lora_to(model, clip, path, model_s, clip_s)
+        audio_o = _entry_audio_for_path(e, chain_index, model_s)
+        if audio_o is not None and audio_o != model_s:
+            model, clip = _apply_lora_split(model, clip, path, model_s, clip_s, audio_o)
+        else:
+            model, clip = _apply_lora_to(model, clip, path, model_s, clip_s)
         applied.append((name, model_s, clip_s))
 
     return model, clip, applied
@@ -1330,9 +1426,10 @@ _ARCHIVE_DIRNAME = "fantastic-loras-grids"
 _RUN_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 
 
-def _grid_archive_root():
+def _grid_archive_root(create=True):
     root = os.path.join(folder_paths.get_output_directory(), _ARCHIVE_DIRNAME)
-    os.makedirs(root, exist_ok=True)
+    if create:
+        os.makedirs(root, exist_ok=True)
     return root
 
 
@@ -1340,8 +1437,8 @@ def _safe_run_id(rid):
     return bool(rid) and bool(_RUN_ID_RE.match(str(rid)))
 
 
-def _run_dir(rid):
-    return os.path.join(_grid_archive_root(), str(rid))
+def _run_dir(rid, create=True):
+    return os.path.join(_grid_archive_root(create), str(rid))
 
 
 def _new_run_id():
@@ -1405,7 +1502,7 @@ def _run_label(metadata_list, global_lines=None):
 def _read_manifest(rid):
     if not _safe_run_id(rid):
         return None
-    path = os.path.join(_run_dir(rid), "manifest.json")
+    path = os.path.join(_run_dir(rid, create=False), "manifest.json")
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
@@ -1441,7 +1538,7 @@ def _cells_as_refs(rid, cells):
 
 
 def _list_runs():
-    root = _grid_archive_root()
+    root = _grid_archive_root(create=False)
     out = []
     try:
         entries = os.listdir(root)
@@ -1616,7 +1713,7 @@ def _parse_archive_cfg(raw):
 # the user-directory API isn't available on this ComfyUI version.
 _USER_CFG_DIRNAME = "fantastic-loras"
 
-def _user_config_dir():
+def _user_config_dir(create=True):
     base = None
     try:
         base = folder_paths.get_user_directory()
@@ -1625,14 +1722,15 @@ def _user_config_dir():
     if not base:
         base = os.path.dirname(os.path.abspath(__file__))
     d = os.path.join(base, _USER_CFG_DIRNAME)
-    try:
-        os.makedirs(d, exist_ok=True)
-    except Exception:
-        pass
+    if create:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
     return d
 
-def _archive_defaults_path():
-    return os.path.join(_user_config_dir(), "archive_defaults.json")
+def _archive_defaults_path(create=True):
+    return os.path.join(_user_config_dir(create), "archive_defaults.json")
 
 
 # --- user prefs (favorites, theme, display toggles) -------------------------
@@ -1649,14 +1747,14 @@ _PREFS_DEFAULT = {
 }
 
 
-def _prefs_path():
-    return os.path.join(_user_config_dir(), "prefs.json")
+def _prefs_path(create=True):
+    return os.path.join(_user_config_dir(create), "prefs.json")
 
 
 def _read_prefs():
     cfg = dict(_PREFS_DEFAULT)
     try:
-        with open(_prefs_path(), "r", encoding="utf-8") as f:
+        with open(_prefs_path(create=False), "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             for k in ("favoriteLoras", "favoriteFolders", "favoritePresets", "collapsedFolders"):
@@ -1697,12 +1795,13 @@ def _write_prefs(patch):
 # Named snapshots of a loader's lora stack (+ folder filter), stored one JSON
 # file per preset so they're easy to inspect, back up, and hand-edit.
 
-def _preset_dir():
-    d = os.path.join(_user_config_dir(), "presets")
-    try:
-        os.makedirs(d, exist_ok=True)
-    except Exception:
-        pass
+def _preset_dir(create=True):
+    d = os.path.join(_user_config_dir(create), "presets")
+    if create:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
     return d
 
 
@@ -1726,13 +1825,13 @@ def _list_presets():
     """Return [{"name":..., "category":...}] sorted by category then name."""
     out = []
     try:
-        for fn in os.listdir(_preset_dir()):
+        for fn in os.listdir(_preset_dir(create=False)):
             if not fn.endswith(".json"):
                 continue
             name = fn[:-5]
             cat, count = "", None
             try:
-                with open(os.path.join(_preset_dir(), fn), "r", encoding="utf-8") as f:
+                with open(os.path.join(_preset_dir(create=False), fn), "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
                     cat = str(data.get("category") or "")
@@ -1748,7 +1847,7 @@ def _list_presets():
 
 def _read_archive_defaults():
     try:
-        with open(_archive_defaults_path(), "r", encoding="utf-8") as f:
+        with open(_archive_defaults_path(create=False), "r", encoding="utf-8") as f:
             return _parse_archive_cfg(json.load(f))
     except Exception:
         return _default_archive_cfg()
@@ -2080,18 +2179,19 @@ def _fl_files_for(category):
 # preset saved while wired to a VAE loader can never show up on a diffusion
 # model selector. Separate from the lora stack presets entirely.
 
-def _sel_preset_dir(category):
+def _sel_preset_dir(category, create=True):
     cat = str(category or "").strip()
     if not cat or cat not in _fl_categories():
         return None
     safe = re.sub(r"[^A-Za-z0-9_.-]", "", cat)      # categories are plain words
     if not safe:
         return None
-    d = os.path.join(_user_config_dir(), "selector_presets", safe)
-    try:
-        os.makedirs(d, exist_ok=True)
-    except Exception:
-        return None
+    d = os.path.join(_user_config_dir(create), "selector_presets", safe)
+    if create:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            return None
     return d
 
 
@@ -2110,7 +2210,7 @@ def _sel_preset_path(category, name):
 
 
 def _list_sel_presets(category):
-    d = _sel_preset_dir(category)
+    d = _sel_preset_dir(category, create=False)
     if not d:
         return []
     out = []

@@ -326,7 +326,7 @@ async function showFolderPanelCore(node, event, opts) {
 
   const panel = document.createElement("div"); panel.className = "lfl-panel";
   const header = document.createElement("div"); header.className = "lfl-header";
-  header.innerHTML = `<span class="lfl-title">${opts.title}</span>`;
+  header.innerHTML = `<span class="lfl-title">${flgEscape(opts.title)}</span>`;
   const close = document.createElement("span"); close.className = "lfl-close"; close.textContent = "✕";
   close.addEventListener("click", closeFolderPanel); header.appendChild(close); panel.appendChild(header);
 
@@ -610,6 +610,7 @@ function loadStackFromData(node) {
       const s = e.strength != null ? Number(e.strength) : Number(e.model ?? 1);
       const out = { on: e.on !== false, name: e.name || e.lora || "", model: s, clip: e.clip != null && e.strength == null ? Number(e.clip) : s };
       if (e.targets && typeof e.targets === "object") out.targets = e.targets;
+      if (e.audio != null) out.audio = svCleanAudio(e.audio);
       if (typeof e.gx === "number") out.gx = e.gx;
       if (typeof e.gy === "number") out.gy = e.gy;
       if (e.source) out.source = e.source;
@@ -1625,6 +1626,51 @@ function svFolderBar(node) {
 let openLoraModal = null;
 function closeLoraModal() { if (openLoraModal) { openLoraModal.dispose(); openLoraModal = null; } }
 
+// Audio weight: absent = follows the model strength, a number = uniform across
+// every chain, a map = per-chain. Mirrors how `targets` works for strengths.
+function svCleanAudio(raw) {
+  if (raw == null) return undefined;
+  if (typeof raw === "object") {
+    const out = {};
+    for (const k of Object.keys(raw)) {
+      const c = parseInt(k, 10), v = Number(raw[k]);
+      if (c >= 1 && c <= 5 && isFinite(v)) out[c] = v;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  const n = Number(raw);
+  return isFinite(n) ? n : undefined;
+}
+
+// Audio weight in effect on one chain, or null when it follows the strength.
+function svAudioFor(entry, chain) {
+  const a = entry.audio;
+  if (a == null) return null;
+  if (typeof a === "object") return a[chain] != null ? Number(a[chain]) : null;
+  return Number(a);
+}
+
+// Set the audio weight for one chain, promoting a uniform value to a map so
+// the other chains keep whatever they had.
+function svSetAudioFor(entry, chain, value, chains) {
+  let a = entry.audio;
+  if (a == null || typeof a !== "object") {
+    const seed = a == null ? null : Number(a);
+    a = {};
+    if (seed != null) for (let c = 1; c <= chains; c++) a[c] = seed;
+    entry.audio = a;
+  }
+  a[chain] = value;
+}
+
+function svClearAudioFor(entry, chain) {
+  const a = entry.audio;
+  if (a == null) return;
+  if (typeof a !== "object") { delete entry.audio; return; }
+  delete a[chain];
+  if (!Object.keys(a).length) delete entry.audio;
+}
+
 function svShowLoraModal(node, entry) {
   closeLoraModal(); closeFolderCombo(); closeChooserPanel(); closeLinePanel();
   const chains = flgChainCount(node);
@@ -1659,6 +1705,13 @@ function svShowLoraModal(node, entry) {
     const body = document.createElement("div"); body.style.cssText = "padding:10px 12px;";
     const sec = (t) => { const s = document.createElement("div"); s.textContent = t; s.style.cssText = `font-size:10px;letter-spacing:.08em;color:${SV.faint};margin:0 0 6px;`; return s; };
 
+    // Audio rows that are still following their model strength re-read it
+    // whenever a strength changes, so "follows" stays true on screen and not
+    // just in the label. Populated by the audio section further down; the
+    // routing callbacks below fire it after every strength edit.
+    const audioSync = [];
+    const syncAudio = () => { for (const f of audioSync) f(); };
+
     // -- model routing (loader only: the plotter has no per-lora routing) --
     if (node.__isPlotter) {
       // The plotter has no per-lora routing — every lora is tested against
@@ -1692,7 +1745,7 @@ function svShowLoraModal(node, entry) {
       slab.style.cssText = `flex:1;min-width:0;font-size:12px;color:${globalMode ? SV.ghost : SV.dim};${globalMode ? "font-style:italic;" : ""}`;
       srow.appendChild(slab);
       const sctl = svStrengthInput(Number(entry.model ?? 1), (v) => {
-        svSetBaseStrength(entry, v); node.__lflCommit();
+        svSetBaseStrength(entry, v); node.__lflCommit(); syncAudio();
       }, true, globalMode);
       if (globalMode) { if (sctl.__input) sctl.__input.disabled = true; sctl.style.opacity = ".35"; }
       srow.appendChild(sctl);
@@ -1711,7 +1764,7 @@ function svShowLoraModal(node, entry) {
       d.title = routed ? `Routed to Model ${c} — click to disconnect` : `Not routed — click to route to Model ${c}`;
       d.style.cssText = `cursor:pointer;font-size:11px;color:${routed ? SV.green : SV.ghost};flex:none;`;
       d.addEventListener("click", () => {
-        if (routed) { const t = flgEnsureTargets(entry, chains); delete t[c]; }
+        if (routed) { const t = flgEnsureTargets(entry, chains); delete t[c]; svClearAudioFor(entry, c); }
         else { const t = flgEnsureTargets(entry, chains); t[c] = Number(entry.model ?? 1); }
         node.__lflCommit(); rebuild();
       });
@@ -1726,7 +1779,7 @@ function svShowLoraModal(node, entry) {
       row.appendChild(mn);
       if (routed) {
         row.appendChild(svStrengthInput(svChainStrength(entry, c), (v) => {
-          flgEnsureTargets(entry, chains)[c] = v; node.__lflCommit();
+          flgEnsureTargets(entry, chains)[c] = v; node.__lflCommit(); syncAudio();
         }));
       } else {
         const dash = document.createElement("span"); dash.textContent = "—";
@@ -1734,6 +1787,94 @@ function svShowLoraModal(node, entry) {
       }
       body.appendChild(row);
     }
+    }
+
+    // -- audio weight -------------------------------------------------------
+    // Its own section rather than a second column on the routing rows: two
+    // numeric fields per row read ambiguously. The loader lists one row per
+    // routed model; the plotter has no per-lora routing, so it gets one value.
+    body.appendChild(sec("AUDIO WEIGHT"));
+    {
+      const audioRow = (label, tagColor, tagBorder, get, set, clear, follow) => {
+        const ar = document.createElement("div");
+        ar.style.cssText = `display:flex;align-items:center;gap:8px;border-radius:6px;` +
+          `padding:5px 9px;margin-bottom:5px;background:${SV.inset};border:1px solid ${SV.border2};`;
+        if (label) {
+          const tg = document.createElement("span"); tg.textContent = label;
+          tg.style.cssText = `flex:none;font:11px ui-monospace,monospace;color:${tagColor || SV.dim};` +
+            (tagBorder ? `border:1px solid ${tagBorder};border-radius:3px;padding:0 4px;` : "");
+          ar.appendChild(tg);
+        }
+        const al = document.createElement("span");
+        al.style.cssText = "flex:1;min-width:0;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+        ar.appendChild(al);
+
+        const rst = document.createElement("span");
+        rst.textContent = "↺";
+        rst.style.cssText = "flex:none;font-size:12px;line-height:1;padding:0 2px;user-select:none;cursor:pointer;";
+
+        // Painted in place rather than by rebuilding: re-rendering here would
+        // destroy the strength input mid-interaction and break its steppers.
+        const paint = () => {
+          const on = get() != null;
+          al.textContent = on ? "Set separately" : "Follows model strength";
+          al.style.color = on ? SV.dim : SV.ghost;
+          al.style.fontStyle = on ? "normal" : "italic";
+          rst.title = on ? "Clear — follow the model strength again" : "Following the model strength";
+          rst.style.color = on ? SV.dim : SV.ghost;
+          rst.style.opacity = on ? "1" : ".35";
+        };
+
+        const cur = get();
+        const inp = svStrengthInput(Number(cur != null ? cur : follow()), (v) => {
+          set(v); node.__lflCommit(); paint();
+        });
+        ar.appendChild(inp);
+        rst.addEventListener("click", () => {
+          if (get() == null) return;
+          clear();
+          if (inp.__input) inp.__input.value = Number(follow()).toFixed(2);
+          node.__lflCommit(); paint();
+        });
+        ar.appendChild(rst);
+        paint();
+        // While this row is following, keep its displayed value equal to the
+        // strength it follows. Registered for the routing inputs to call.
+        audioSync.push(() => {
+          if (get() == null && inp.__input) inp.__input.value = Number(follow()).toFixed(2);
+          paint();
+        });
+        body.appendChild(ar);
+      };
+
+      if (node.__isPlotter) {
+        audioRow(null, null, null,
+          () => svAudioFor(entry, 1),
+          (v) => { entry.audio = v; },
+          () => { delete entry.audio; },
+          () => entry.model ?? 1);
+      } else {
+        let any = false;
+        for (let c = 1; c <= chains; c++) {
+          if (svChainStrength(entry, c) == null) continue;   // not routed
+          any = true;
+          audioRow("M" + c, SV_CHAIN_TEXT[c] || SV.dim, SV_CHAIN_BORDER[c] || SV.border2,
+            () => svAudioFor(entry, c),
+            (v) => svSetAudioFor(entry, c, v, chains),
+            () => svClearAudioFor(entry, c),
+            () => svChainStrength(entry, c) ?? (entry.model ?? 1));
+        }
+        if (!any) {
+          const none = document.createElement("div");
+          none.textContent = "Route this lora to a model to set an audio weight.";
+          none.style.cssText = `font-size:11px;color:${SV.ghost};font-style:italic;margin:0 0 8px;`;
+          body.appendChild(none);
+        }
+      }
+
+      const sp = document.createElement("div");
+      sp.style.cssText = "height:5px;";
+      body.appendChild(sp);
     }
 
     // -- randomizer --
@@ -1777,9 +1918,11 @@ function svShowLoraModal(node, entry) {
   };
   rebuild();
 
+  const handle = { dispose: () => over.remove(), rebuild };
+
   over.addEventListener("pointerdown", (e) => { if (e.target === over) closeLoraModal(); });
   document.body.appendChild(over);
-  openLoraModal = { dispose: () => over.remove(), rebuild };
+  openLoraModal = handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -1819,6 +1962,7 @@ function svApplyPreset(node, data) {
   const stack = (data.loras || []).slice(0, SLOT_MAX).map(e => ({
     on: e.on !== false, name: e.name || "", model: Number(e.model ?? 1), clip: Number(e.clip ?? e.model ?? 1),
     ...(e.targets ? { targets: e.targets } : {}),
+    ...(e.audio != null ? { audio: svCleanAudio(e.audio) } : {}),
     ...(e.random ? { random: true, locked: !!e.locked, autoRoll: !!e.autoRoll, folders: e.folders ?? null } : {}),
   }));
   node.__loraStack = stack;
@@ -2235,6 +2379,7 @@ function svPresetLoras(node, freezeRandom) {
   return (node.__loraStack || []).map(e => {
     const out = { on: e.on !== false, name: e.name || "", model: Number(e.model ?? 1), clip: Number(e.clip ?? e.model ?? 1) };
     if (e.targets && typeof e.targets === "object") out.targets = e.targets;
+    if (e.audio != null) out.audio = svCleanAudio(e.audio);
     if (e.random && !freezeRandom) {
       out.random = true; out.locked = !!e.locked; out.autoRoll = !!e.autoRoll;
       out.folders = Array.isArray(e.folders) ? e.folders : null;
@@ -2625,6 +2770,17 @@ function svMergeIntoStack(node, loras) {
       }
     }
 
+    if (src.audio != null) {
+      const a = svCleanAudio(src.audio);
+      if (a != null && typeof a === "object") {
+        const keep = {};
+        for (const k of Object.keys(a)) if (Number(k) <= chains) keep[k] = a[k];
+        if (Object.keys(keep).length) e.audio = keep;
+      } else if (a != null) {
+        e.audio = a;
+      }
+    }
+
     if (src.random) {
       e.random = true; e.locked = !!src.locked; e.autoRoll = !!src.autoRoll;
       e.folders = Array.isArray(src.folders) ? src.folders : null;
@@ -2658,6 +2814,7 @@ function renderSlotView(node, root) {
   root.textContent = "";
   root.style.cssText = "display:flex;flex-direction:column;gap:0;font:12px Arial,sans-serif;color:#ddd;width:100%;box-sizing:border-box;padding:2px 0;";
   const stack = node.__loraStack || (node.__loraStack = []);
+
   const chains = flgChainCount(node);
   const maxChains = 1 + MAX_EXTRA_MODELS;
   const isPlot = !!node.__isPlotter;
@@ -2785,6 +2942,7 @@ function renderSlotView(node, root) {
       (e.random && e.autoRoll ? `<span style="font-size:10px;color:${SV.purple};border:1px solid ${SV.purpleBorder};border-radius:3px;padding:0 3px;">auto</span>` : "");
     if (isPlot) tags.title = "Swept against every connected model";
     r1.appendChild(tags);
+
 
     // Randomizer chips get a dice + lock right on the chip — no need to open
     // the modal just to reroll. Locked slots never re-roll, by dice or auto.
@@ -3061,7 +3219,7 @@ function buildCoreUI(node) {
     const fbDom = document.createElement("div");
     fbDom.style.cssText = "padding:2px 0 4px;box-sizing:border-box;width:100%;";
     node.__lflFolderBarEl = fbDom;
-    const fbW = node.addDOMWidget("lfl_folderbar", "div", fbDom, { serialize: false });
+    const fbW = node.addDOMWidget("lfl_folderbar", "div", fbDom, { serialize: false, hideInPanel: true });
     fbW.serializeValue = () => undefined;
     fbW.computeSize = function (width) { return [width, 30]; };
     node.__lflRenderFolderBar = () => {
@@ -3080,7 +3238,7 @@ function buildCoreUI(node) {
   node.__plffUpdateFolderBtn(); getLoraFiles().then(() => node.__plffUpdateFolderBtn());
 
   const dom = buildRowDOM(node);
-  const domWidget = node.addDOMWidget("lfl_rows", "div", dom, { serialize: false });
+  const domWidget = node.addDOMWidget("lfl_rows", "div", dom, { serialize: false, hideInPanel: true });
   domWidget.serializeValue = () => undefined;
   domWidget.computeSize = function (width) {
     if (node.__lflView === "slots") {
@@ -3465,7 +3623,7 @@ function addMultiUI(node, { autoAddPair = true, isPlotter = false } = {}) {
   let barWidget = null;
   if (!isSlotLoader) {
     const barDom = buildModelBar(node);
-    barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false });
+    barWidget = node.addDOMWidget("lfl_modelbar", "div", barDom, { serialize: false, hideInPanel: true });
     barWidget.serializeValue = () => undefined;
     barWidget.computeSize = function (width) { return [width, 26]; };
   }
@@ -4409,7 +4567,7 @@ app.registerExtension({
         hideWidget(this, asWidget(this, "category"));
         const dom = document.createElement("div");
         this.__asRender = () => asRenderPanel(this, dom);
-        const w = this.addDOMWidget("as_panel", "div", dom, { serialize: false });
+        const w = this.addDOMWidget("as_panel", "div", dom, { serialize: false, hideInPanel: true });
         w.serializeValue = () => undefined;
         w.computeSize = (width) => [width, node_asHeight(this)];
         if (!this.size || this.size[0] < AS_MIN_W) this.size = [Math.max(this.size?.[0] || 0, AS_MIN_W), this.size?.[1] || 0];
@@ -4972,7 +5130,7 @@ app.registerExtension({
           const dom = document.createElement("div");
           this.__sdEl = dom;
           this.__sdRender = () => sdPanel(this, dom);
-          const w = this.addDOMWidget("sd_panel", "div", dom, { serialize: false });
+          const w = this.addDOMWidget("sd_panel", "div", dom, { serialize: false, hideInPanel: true });
           w.serializeValue = () => undefined;
           w.computeSize = (width) => [width, this.__sdMeasuredH || 190];
           if (!this.size || this.size[0] < SD_MIN_W) this.size = [Math.max(this.size?.[0] || 0, SD_MIN_W), this.size?.[1] || 0];

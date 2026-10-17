@@ -43,6 +43,25 @@ All storage lives under `ComfyUI/user/fantastic-loras/` and
 requests from Python or JavaScript; the only network activity is the
 browser talking to the local ComfyUI server.
 
+## Directory creation
+
+An unauthenticated `GET` has no filesystem side effect at all: no read
+route creates, writes, renames or deletes anything. The storage helpers
+(`_grid_archive_root`, `_user_config_dir`, `_preset_dir`,
+`_sel_preset_dir`) take a `create` flag; only the guarded write paths
+create directories, and every read path passes `create=False` and treats
+a missing directory as empty.
+
+## Output escaping (XSS)
+
+Text that can come from outside the pack (lora and folder names, preset
+names, plotter metadata, global lora lines, run archive manifests) is
+HTML-escaped before it is placed in the page (`flgEscape` in
+`lora_folder_loader.js`, `escHtml` in `plotter_grid_viewer.js` and
+`lora_mimic.js`), or set via `textContent`. The Grid Viewer's `metadata`
+and `global_loras_info` inputs accept any string, so they are treated as
+untrusted.
+
 ## Reporting
 
 Open an issue at
