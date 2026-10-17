@@ -12,6 +12,11 @@ jobs:
   publish-node:
     name: Publish Custom Node to registry
     runs-on: ubuntu-latest
+    env:
+      COMFY_NODE_CHANGELOG: |
+        New: per-model audio weight. The lora cog menu has an AUDIO WEIGHT section with one row per model; each row follows that model's strength until you change it.
+        Fix: node contents no longer squeeze into a narrow column when ComfyUI's properties panel is open.
+        Security: read-only requests no longer create folders, and lora names and grid labels are escaped before they are displayed. See SECURITY.md.
     steps:
       - name: Check out code
         uses: actions/checkout@v4
